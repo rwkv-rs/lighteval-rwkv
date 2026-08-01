@@ -127,6 +127,9 @@ class ModelResponse:
     output_tokens: list[list[int]] = field(default_factory=list)  # Model generations
     text_post_processed: list[str] | None = None  # The text of the response postprocessed
     reasonings: list[str | None] = field(default_factory=list)  # The reasoning content of the response
+    finish_reasons: list[str | None] = field(default_factory=list)
+    stop_reasons: list[str | int | None] = field(default_factory=list)
+    terminal_token_ids: list[int | None] = field(default_factory=list)
 
     # Model logprob outputs
     logprobs: list[float] = field(default_factory=list)  # Log probabilities of the response
@@ -150,6 +153,10 @@ class ModelResponse:
             input_tokens=self.input_tokens,
             text=[self.text[index]],
             output_tokens=[self.output_tokens[index]] if self.output_tokens else [],
+            reasonings=[self.reasonings[index]] if self.reasonings else [],
+            finish_reasons=[self.finish_reasons[index]] if self.finish_reasons else [],
+            stop_reasons=[self.stop_reasons[index]] if self.stop_reasons else [],
+            terminal_token_ids=[self.terminal_token_ids[index]] if self.terminal_token_ids else [],
             logprobs=[self.logprobs[index]] if self.logprobs else [],
             argmax_logits_eq_gold=[self.argmax_logits_eq_gold[index]] if self.argmax_logits_eq_gold else [],
             logits=[self.logits[index]] if self.logits else None,
