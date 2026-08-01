@@ -66,6 +66,22 @@ def test_default_empty_replace_clears_instruction():
     assert render_naive_prompt(doc) == "Question?"
 
 
+def test_empty_replace_preserves_query_when_instruction_is_complete_task_input():
+    doc = Doc(
+        query="Classify the sentiment of this review.",
+        choices=["positive", "negative"],
+        gold_index=0,
+        instruction="Classify the sentiment of this review.",
+    )
+
+    identity = apply_task_prompt_override(doc, "", TaskPromptMode.REPLACE)
+
+    assert identity.original_instruction == "Classify the sentiment of this review."
+    assert doc.instruction is None
+    assert doc.query == "Classify the sentiment of this review."
+    assert render_naive_prompt(doc) == "Classify the sentiment of this review."
+
+
 def test_naive_prompt_preserves_effective_instruction_fewshots_query_and_choices():
     fewshot = Doc(
         query="Example?\n\nA. No\nB. Yes",

@@ -79,7 +79,9 @@ def apply_task_prompt_override(
 
     original = doc.instruction or ""
     if doc.instruction and doc.query.startswith(doc.instruction):
-        doc.query = doc.query[len(doc.instruction) :].strip()
+        query_without_instruction = doc.query[len(doc.instruction) :].strip()
+        if query_without_instruction:
+            doc.query = query_without_instruction
 
     match selected_mode:
         case TaskPromptMode.REPLACE:
