@@ -127,9 +127,6 @@ class ModelResponse:
     output_tokens: list[list[int]] = field(default_factory=list)  # Model generations
     text_post_processed: list[str] | None = None  # The text of the response postprocessed
     reasonings: list[str | None] = field(default_factory=list)  # The reasoning content of the response
-    finish_reasons: list[str | None] = field(default_factory=list)
-    stop_reasons: list[str | int | None] = field(default_factory=list)
-    terminal_token_ids: list[int | None] = field(default_factory=list)
 
     # Model logprob outputs
     logprobs: list[float] = field(default_factory=list)  # Log probabilities of the response
@@ -140,6 +137,11 @@ class ModelResponse:
     # Other metadata
     truncated_tokens_count: int = 0  # How many tokens truncated
     padded_tokens_count: int = 0  # How many tokens of padding
+
+    # HTTP generation termination evidence. Appended for positional compatibility.
+    finish_reasons: list[str | None] = field(default_factory=list)
+    stop_reasons: list[str | None] = field(default_factory=list)
+    terminal_token_ids: list[int | None] = field(default_factory=list)
 
     @property
     def final_text(self) -> list[str]:
