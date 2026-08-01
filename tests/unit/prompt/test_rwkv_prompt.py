@@ -66,20 +66,26 @@ def test_default_empty_replace_clears_instruction():
     assert render_naive_prompt(doc) == "Question?"
 
 
-def test_empty_replace_preserves_query_when_instruction_is_complete_task_input():
+@pytest.mark.parametrize("task_prompt", ["", "Answer with one choice only.\n"])
+def test_replace_preserves_gpqa_style_query_when_instruction_is_complete_task_input(
+    task_prompt: str,
+):
     doc = Doc(
-        query="Classify the sentiment of this review.",
-        choices=["positive", "negative"],
-        gold_index=0,
-        instruction="Classify the sentiment of this review.",
+        query="Which explanation is correct?",
+        choices=["first", "second", "third", "fourth"],
+        gold_index=2,
+        instruction="Which explanation is correct?",
     )
 
-    identity = apply_task_prompt_override(doc, "", TaskPromptMode.REPLACE)
+    identity = apply_task_prompt_override(doc, task_prompt, TaskPromptMode.REPLACE)
 
-    assert identity.original_instruction == "Classify the sentiment of this review."
-    assert doc.instruction is None
-    assert doc.query == "Classify the sentiment of this review."
-    assert render_naive_prompt(doc) == "Classify the sentiment of this review."
+    assert identity.original_instruction == "Which explanation is correct?"
+    assert doc.instruction == (task_prompt or None)
+    assert doc.query == "Which explanation is correct?"
+    assert doc.choices == ["first", "second", "third", "fourth"]
+    assert render_naive_prompt(doc) == (
+        f"{task_prompt}\n\n" if task_prompt else ""
+    ) + "Which explanation is correct?"
 
 
 def test_naive_prompt_preserves_effective_instruction_fewshots_query_and_choices():

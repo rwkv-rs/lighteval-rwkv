@@ -78,11 +78,6 @@ def apply_task_prompt_override(
         raise ValueError(f"task_prompt mode must be one of: {choices}") from error
 
     original = doc.instruction or ""
-    if doc.instruction and doc.query.startswith(doc.instruction):
-        query_without_instruction = doc.query[len(doc.instruction) :].strip()
-        if query_without_instruction:
-            doc.query = query_without_instruction
-
     match selected_mode:
         case TaskPromptMode.REPLACE:
             effective = task_prompt
@@ -92,6 +87,11 @@ def apply_task_prompt_override(
             effective = original + task_prompt
         case TaskPromptMode.INHERIT:
             effective = original
+
+    if doc.instruction and doc.query.startswith(doc.instruction):
+        query_without_instruction = doc.query[len(doc.instruction) :].strip()
+        if selected_mode is not TaskPromptMode.REPLACE or query_without_instruction:
+            doc.query = query_without_instruction
 
     canonical = json.dumps(
         {
