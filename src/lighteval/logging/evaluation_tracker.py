@@ -36,7 +36,13 @@ from datasets import Dataset, load_dataset
 from datasets.utils.metadata import MetadataConfigs
 from huggingface_hub import DatasetCard, DatasetCardData, HfApi, HFSummaryWriter, hf_hub_url
 
-from lighteval.logging.evaluation_artifact import EvaluationArtifact
+from lighteval.logging.evaluation_artifact import (
+    EvaluationArtifact,
+    EvaluationArtifactError,
+    atomic_write_bytes,
+    build_artifact_member,
+    load_evaluation_artifact,
+)
 from lighteval.logging.info_loggers import (
     DetailsLogger,
     GeneralConfigLogger,
@@ -253,6 +259,7 @@ class EvaluationTracker:
         cannot prevent standard results and details from being retained.
         """
         logger.info("Saving experiment tracker")
+        output_root = self._local_artifact_root()
         date_id = datetime.now().isoformat().replace(":", "-")
 
         results_dict = self.results
@@ -286,17 +293,32 @@ class EvaluationTracker:
             / date_id
             / "artifact.json"
         )
+        manifest_path = self._artifact_output_path(manifest_path)
+        manifest_relative_path = manifest_path.relative_to(output_root).as_posix()
+        members = [
+            build_artifact_member(
+                output_root,
+                results_path,
+                role="results",
+                media_type="application/json",
+            )
+        ]
+        members.extend(
+            build_artifact_member(
+                output_root,
+                details_path,
+                role="details",
+                media_type="application/vnd.apache.parquet",
+            )
+            for details_path in sorted(details_paths)
+        )
         artifact = EvaluationArtifact(
-            manifest_path=self._artifact_relative_path(manifest_path),
-            results_path=self._artifact_relative_path(results_path),
-            details_paths=tuple(
-                sorted(self._artifact_relative_path(path) for path in details_paths)
-            ),
+            manifest_path=manifest_relative_path,
+            members=tuple(members),
             publication_requested=publication_requested,
         )
-        self.fs.mkdirs(manifest_path.parent, exist_ok=True)
-        with self.fs.open(manifest_path, "wb") as artifact_file:
-            artifact_file.write(artifact.canonical_json() + b"\n")
+        atomic_write_bytes(manifest_path, artifact.canonical_json() + b"\n")
+        artifact = load_evaluation_artifact(output_root, manifest_relative_path)
 
         if self.should_push_to_hub:
             self.push_to_hub(
@@ -318,13 +340,23 @@ class EvaluationTracker:
 
         return artifact
 
-    def _artifact_relative_path(self, path: str | Path) -> str:
-        """Prefer portable paths while preserving custom output templates."""
-        artifact_path = Path(path)
+    def _local_artifact_root(self) -> Path:
+        """Return the local root required by the atomic artifact contract."""
+        protocol = self.fs.protocol
+        protocols = {protocol} if isinstance(protocol, str) else set(protocol)
+        if not protocols.intersection({"file", "local"}):
+            raise EvaluationArtifactError("atomic evaluation artifacts require a local output directory")
+        return Path(self.output_dir).resolve()
+
+    def _artifact_output_path(self, path: str | Path) -> Path:
+        """Resolve one output path and reject publication outside its root."""
+        output_root = self._local_artifact_root()
+        resolved = Path(path).resolve()
         try:
-            return artifact_path.relative_to(Path(self.output_dir)).as_posix()
-        except ValueError:
-            return artifact_path.as_posix()
+            resolved.relative_to(output_root)
+        except ValueError as error:
+            raise EvaluationArtifactError("evaluation artifact path escapes output directory") from error
+        return resolved
 
     def push_to_wandb(self, results_dict: dict, details_datasets: dict) -> None:
         # reformat the results key to replace ':' with '/'
@@ -344,11 +376,20 @@ class EvaluationTracker:
             output_dir_results = Path(self.results_path_template.format(output_dir=output_dir, org=org, model=model))
         else:
             output_dir_results = Path(self.output_dir) / "results" / self.general_config_logger.model_name.strip("/")
-        self.fs.mkdirs(output_dir_results, exist_ok=True)
-        output_results_file = output_dir_results / f"results_{date_id}.json"
+        output_results_file = self._artifact_output_path(output_dir_results / f"results_{date_id}.json")
         logger.info(f"Saving results to {output_results_file}")
-        with self.fs.open(output_results_file, "w") as f:
-            f.write(json.dumps(results_dict, cls=EnhancedJSONEncoder, indent=2, ensure_ascii=False))
+        try:
+            results_bytes = json.dumps(
+                results_dict,
+                cls=EnhancedJSONEncoder,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        except (TypeError, ValueError) as error:
+            raise EvaluationArtifactError("evaluation results are not canonical finite JSON") from error
+        atomic_write_bytes(output_results_file, results_bytes + b"\n")
         return output_results_file
 
     def _get_details_sub_folder(self, date_id: str):
@@ -390,13 +431,15 @@ class EvaluationTracker:
 
     def save_details(self, date_id: str, details_datasets: dict[str, Dataset]) -> tuple[Path, ...]:
         output_dir_details_sub_folder = self._get_details_sub_folder(date_id)
-        self.fs.mkdirs(output_dir_details_sub_folder, exist_ok=True)
         logger.info(f"Saving details to {output_dir_details_sub_folder}")
         output_files = []
         for task_name, dataset in details_datasets.items():
-            output_file_details = output_dir_details_sub_folder / f"details_{task_name}_{date_id}.parquet"
-            with self.fs.open(str(output_file_details), "wb") as f:
-                dataset.to_parquet(f)
+            output_file_details = self._artifact_output_path(
+                output_dir_details_sub_folder / f"details_{task_name}_{date_id}.parquet"
+            )
+            parquet_bytes = BytesIO()
+            dataset.to_parquet(parquet_bytes)
+            atomic_write_bytes(output_file_details, parquet_bytes.getvalue())
             output_files.append(output_file_details)
         return tuple(output_files)
 

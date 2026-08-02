@@ -31,6 +31,7 @@ from datasets import Dataset
 from huggingface_hub import HfApi
 
 from lighteval.logging.evaluation_tracker import EvaluationTracker
+from lighteval.logging.evaluation_artifact import EvaluationArtifactError, load_evaluation_artifact
 from lighteval.logging.info_loggers import DetailsLogger
 
 # ruff: noqa
@@ -110,10 +111,14 @@ class TestLogging:
         }
         manifest_path = Path(mock_evaluation_tracker.output_dir) / artifact.manifest_path
         assert json.loads(manifest_path.read_text(encoding="utf-8")) == artifact.as_dict()
+        loaded = load_evaluation_artifact(Path(mock_evaluation_tracker.output_dir), artifact.manifest_path)
+        assert loaded == artifact
+        assert loaded.members[0].role == "results"
+        assert loaded.members[0].media_type == "application/json"
+        assert loaded.members[0].size_bytes > 0
+        assert len(loaded.members[0].sha256) == 64
 
-    def test_publication_intent_is_explicit_and_never_claims_success(
-        self, mock_evaluation_tracker: EvaluationTracker
-    ):
+    def test_publication_intent_is_explicit_and_never_claims_success(self, mock_evaluation_tracker: EvaluationTracker):
         artifact = mock_evaluation_tracker.save(publication_requested=True)
 
         assert artifact.as_dict()["publication"] == {
@@ -121,6 +126,59 @@ class TestLogging:
             "status": "not_published",
         }
         assert artifact.results_path.startswith("results/test_model/results_")
+
+    def test_results_reject_non_finite_metrics_before_manifest_commit(
+        self, mock_evaluation_tracker: EvaluationTracker
+    ):
+        mock_evaluation_tracker.metrics_logger.metric_aggregated = {"task": {"accuracy": float("nan")}}
+
+        with pytest.raises(EvaluationArtifactError, match="finite JSON"):
+            mock_evaluation_tracker.save()
+
+        assert not list(Path(mock_evaluation_tracker.output_dir).glob("artifacts/**/artifact.json"))
+
+    def test_artifact_manifest_commits_last_and_save_is_retryable(
+        self,
+        mock_evaluation_tracker: EvaluationTracker,
+        mock_datetime,
+        monkeypatch,
+    ):
+        from lighteval.logging import evaluation_tracker as tracker_module
+
+        original_atomic_write = tracker_module.atomic_write_bytes
+        failed = False
+
+        def fail_first_manifest(path, content):
+            nonlocal failed
+            if Path(path).name == "artifact.json" and not failed:
+                failed = True
+                raise OSError("simulated manifest commit interruption")
+            original_atomic_write(path, content)
+
+        monkeypatch.setattr(tracker_module, "atomic_write_bytes", fail_first_manifest)
+        with pytest.raises(OSError, match="simulated manifest"):
+            mock_evaluation_tracker.save()
+
+        output_root = Path(mock_evaluation_tracker.output_dir)
+        assert len(list(output_root.glob("results/**/*.json"))) == 1
+        assert not list(output_root.glob("artifacts/**/artifact.json"))
+
+        monkeypatch.setattr(tracker_module, "atomic_write_bytes", original_atomic_write)
+        artifact = mock_evaluation_tracker.save()
+        assert load_evaluation_artifact(output_root, artifact.manifest_path) == artifact
+
+    def test_results_template_cannot_escape_artifact_root(
+        self,
+        mock_evaluation_tracker: EvaluationTracker,
+        tmp_path,
+    ):
+        outside = tmp_path / "outside"
+        mock_evaluation_tracker.results_path_template = str(outside)
+
+        with pytest.raises(EvaluationArtifactError, match="escapes output directory"):
+            mock_evaluation_tracker.save()
+
+        assert not outside.exists()
 
     def test_results_logging_template(self, mock_evaluation_tracker: EvaluationTracker):
         task_metrics = {
@@ -153,7 +211,7 @@ class TestLogging:
         }
         mock_evaluation_tracker.details_logger.details = task_details
 
-        mock_evaluation_tracker.save()
+        artifact = mock_evaluation_tracker.save()
 
         date_id = mock_datetime.isoformat().replace(":", "-")
         details_dir = Path(mock_evaluation_tracker.output_dir) / "details" / "test_model" / date_id
@@ -165,6 +223,11 @@ class TestLogging:
             assert len(dataset) == 1
             assert int(dataset[0]["truncated"]) == task_details[task][0].truncated
             assert int(dataset[0]["padded"]) == task_details[task][0].padded
+
+        loaded = load_evaluation_artifact(Path(mock_evaluation_tracker.output_dir), artifact.manifest_path)
+        details_members = [member for member in loaded.members if member.role == "details"]
+        assert len(details_members) == 2
+        assert all(member.media_type == "application/vnd.apache.parquet" for member in details_members)
 
     @pytest.mark.evaluation_tracker(save_details=False)
     def test_no_details_output(self, mock_evaluation_tracker: EvaluationTracker):
