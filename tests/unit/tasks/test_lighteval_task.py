@@ -21,6 +21,9 @@
 # SOFTWARE.
 
 
+from datasets import Dataset, DatasetDict
+
+import lighteval.tasks.lighteval_task as lighteval_task_module
 from lighteval.tasks.lighteval_task import LightevalTask, LightevalTaskConfig
 from lighteval.tasks.requests import Doc
 
@@ -29,8 +32,21 @@ def dummy_prompt_function(item, task_name):
     return Doc(query=item["text"], choices=["A", "B"], gold_index=0, task_name=task_name)
 
 
-def test_revision_check():
-    # Test with a different revision
+def two_row_dataset() -> DatasetDict:
+    return DatasetDict(
+        {"train": Dataset.from_dict({"text": ["hi", "how are you?"]})}
+    )
+
+
+def test_revision_check(monkeypatch):
+    calls = []
+
+    def load_dataset(**kwargs):
+        calls.append(kwargs)
+        return two_row_dataset()
+
+    monkeypatch.setattr(lighteval_task_module, "load_dataset", load_dataset)
+
     cfg_with_revision = LightevalTaskConfig(
         name="test_task_revision",
         prompt_function=dummy_prompt_function,
@@ -43,11 +59,26 @@ def test_revision_check():
     task_with_revision = LightevalTask(cfg_with_revision)
     docs = task_with_revision.eval_docs()
     queries = [doc.query for doc in docs]
+
+    assert calls == [
+        {
+            "path": "lighteval-tests-datasets/dataset-test-1",
+            "name": "default",
+            "revision": "25175defadfde48b131b7cd7573ad6f59f868306",
+            "data_files": None,
+        }
+    ]
+    assert task_with_revision.evaluation_split == ["train"]
     assert queries == ["hi", "how are you?"]
 
 
-def test_dataset_filter():
-    # Setup
+def test_dataset_filter(monkeypatch):
+    source = two_row_dataset()
+
+    def load_dataset(**_kwargs):
+        return source
+
+    monkeypatch.setattr(lighteval_task_module, "load_dataset", load_dataset)
 
     cfg = LightevalTaskConfig(
         name="test_task",
@@ -61,6 +92,9 @@ def test_dataset_filter():
     task = LightevalTask(cfg)
 
     filtered_docs = task.eval_docs()
+    assert source["train"].num_rows == 2
+    assert task.dataset is not None
+    assert task.dataset["train"].num_rows == 1
     assert len(filtered_docs) == 1
     assert filtered_docs[0].query == "hi"
 
