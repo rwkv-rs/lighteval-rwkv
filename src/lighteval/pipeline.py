@@ -23,6 +23,7 @@
 import ast
 import asyncio
 import collections
+import copy
 import os
 import random
 from dataclasses import dataclass
@@ -42,6 +43,10 @@ from lighteval.models.model_output import (
 from lighteval.tasks.lighteval_task import LightevalTask
 from lighteval.tasks.registry import Registry
 from lighteval.tasks.requests import SamplingMethod
+from lighteval.tasks.rwkv_prompt import (
+    TaskPromptMode,
+    apply_task_prompt_override,
+)
 from lighteval.utils.imports import is_package_available
 from lighteval.utils.parallelism import test_all_gather
 from lighteval.utils.utils import make_results_table, remove_reasoning_tags
@@ -95,8 +100,17 @@ class PipelineParameters:
     load_responses_from_details_date_id: str | None = None
     bootstrap_iters: int = 1000
     load_tasks_multilingual: bool = False
+    task_prompt: str = ""
+    task_prompt_mode: str | TaskPromptMode = TaskPromptMode.REPLACE
 
     def __post_init__(self):  # noqa C901
+        if not isinstance(self.task_prompt, str):
+            raise TypeError("task_prompt must be a string")
+        try:
+            self.task_prompt_mode = TaskPromptMode(self.task_prompt_mode)
+        except ValueError as error:
+            choices = ", ".join(item.value for item in TaskPromptMode)
+            raise ValueError(f"task_prompt mode must be one of: {choices}") from error
         if not isinstance(self.reasoning_tags, list):
             try:
                 self.reasoning_tags = ast.literal_eval(self.reasoning_tags)
@@ -223,6 +237,7 @@ class Pipeline:
         self.documents_dict = {
             task.full_name: task.get_docs(self.pipeline_parameters.max_samples) for _, task in self.tasks_dict.items()
         }
+        self._apply_task_prompt_override()
 
         self.sampling_docs = collections.defaultdict(list)
         for _, docs in self.documents_dict.items():
@@ -236,6 +251,23 @@ class Pipeline:
             self._update_num_samples(list(self.tasks_dict.values()))
 
         self.evaluation_tracker.task_config_logger.log(self.tasks_dict)
+
+    def _apply_task_prompt_override(self):
+        task_prompt = self.pipeline_parameters.task_prompt
+        for task in self.tasks_dict.values():
+            task.config = copy.copy(task.config)
+            identities = [
+                apply_task_prompt_override(
+                    doc,
+                    task_prompt,
+                    self.pipeline_parameters.task_prompt_mode,
+                )
+                for doc in self.documents_dict[task.full_name]
+            ]
+            task.config.configured_task_prompt = task_prompt
+            task.config.task_prompt_mode = self.pipeline_parameters.task_prompt_mode.value
+            task.config.task_prompt_digests = sorted({identity.digest for identity in identities})
+            task.config.experimental_identity = any(identity.experimental for identity in identities)
 
     def _update_num_samples(self, tasks: list[LightevalTask]):
         """Helper function to update the num_samples of a given metric via the yaml file.

@@ -7,6 +7,8 @@ from lighteval.tasks.requests import Doc
 from lighteval.tasks.rwkv_prompt import (
     RWKV_LIGHTEVAL_REPOSITORY,
     RWKV_LIGHTEVAL_UPSTREAM_COMMIT,
+    RWKV_LIGHTEVAL_UPSTREAM_RELEASE,
+    RWKV_LIGHTEVAL_UPSTREAM_RELEASE_COMMIT,
     TaskPromptMode,
     apply_task_prompt_override,
     render_naive_prompt,
@@ -83,9 +85,7 @@ def test_replace_preserves_gpqa_style_query_when_instruction_is_complete_task_in
     assert doc.instruction == (task_prompt or None)
     assert doc.query == "Which explanation is correct?"
     assert doc.choices == ["first", "second", "third", "fourth"]
-    assert render_naive_prompt(doc) == (
-        f"{task_prompt}\n\n" if task_prompt else ""
-    ) + "Which explanation is correct?"
+    assert render_naive_prompt(doc) == (f"{task_prompt}\n\n" if task_prompt else "") + "Which explanation is correct?"
 
 
 def test_naive_prompt_preserves_effective_instruction_fewshots_query_and_choices():
@@ -104,8 +104,7 @@ def test_naive_prompt_preserves_effective_instruction_fewshots_query_and_choices
     apply_task_prompt_override(doc, "Campaign instruction:\n", "replace")
 
     assert render_naive_prompt(doc) == (
-        "Campaign instruction:\n\n\nExample?\n\nA. No\nB. Yes Yes\n\n"
-        "Question?\n\nA. Left\nB. Right"
+        "Campaign instruction:\n\n\nExample?\n\nA. No\nB. Yes Yes\n\nQuestion?\n\nA. Left\nB. Right"
     )
 
 
@@ -120,4 +119,6 @@ def test_invalid_task_prompt_contract_fails_closed():
 
 def test_fork_source_identity_is_immutable():
     assert RWKV_LIGHTEVAL_REPOSITORY == "https://github.com/rwkv-rs/lighteval-rwkv"
+    assert RWKV_LIGHTEVAL_UPSTREAM_RELEASE == "v0.13.0"
+    assert RWKV_LIGHTEVAL_UPSTREAM_RELEASE_COMMIT == "7c1cd62716b0a198a630c26d781430c54726cd02"
     assert RWKV_LIGHTEVAL_UPSTREAM_COMMIT == "64f4f5ae173626509fad6e477ca4ee56ebb26129"
