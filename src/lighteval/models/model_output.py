@@ -59,6 +59,10 @@ class ModelResponse:
             Log probabilities of the generated tokens or sequences.
             **Required for**: loglikelihood and perplexity metrics.
 
+        token_logprobs (list[list[float | None]]):
+            Per-token log probabilities grouped by generated completion.
+            This preserves token-level evidence from HTTP generation APIs.
+
         argmax_logits_eq_gold (list[bool]):
             Whether the argmax logits match the gold/expected text.
             Used for accuracy calculations in multiple choice and classification tasks.
@@ -142,6 +146,7 @@ class ModelResponse:
     finish_reasons: list[str | None] = field(default_factory=list)
     stop_reasons: list[str | None] = field(default_factory=list)
     terminal_token_ids: list[int | None] = field(default_factory=list)
+    token_logprobs: list[list[float | None]] = field(default_factory=list)
 
     @property
     def final_text(self) -> list[str]:
@@ -160,6 +165,7 @@ class ModelResponse:
             stop_reasons=[self.stop_reasons[index]] if self.stop_reasons else [],
             terminal_token_ids=[self.terminal_token_ids[index]] if self.terminal_token_ids else [],
             logprobs=[self.logprobs[index]] if self.logprobs else [],
+            token_logprobs=[self.token_logprobs[index]] if self.token_logprobs else [],
             argmax_logits_eq_gold=[self.argmax_logits_eq_gold[index]] if self.argmax_logits_eq_gold else [],
             logits=[self.logits[index]] if self.logits else None,
             unconditioned_logprobs=[self.unconditioned_logprobs[index]] if self.unconditioned_logprobs else None,
