@@ -140,24 +140,30 @@ class TestLogging:
         assert not list(Path(mock_evaluation_tracker.output_dir).glob("artifacts/**/artifact.json"))
 
     @pytest.mark.parametrize(
-        "invalid_metric",
+        ("invalid_metric", "message"),
         [
-            float("nan"),
-            float("inf"),
-            float("-inf"),
-            np.float32("nan"),
-            np.float64("inf"),
-            np.float64("-inf"),
-            torch.tensor(float("nan")),
-            torch.tensor(float("inf")),
-            torch.tensor(float("-inf")),
+            (float("nan"), "non-finite"),
+            (float("inf"), "non-finite"),
+            (float("-inf"), "non-finite"),
+            (np.float32("nan"), "non-finite"),
+            (np.float64("inf"), "non-finite"),
+            (np.float64("-inf"), "non-finite"),
+            (np.longdouble("nan"), "non-finite"),
+            (np.longdouble("inf"), "non-finite"),
+            (np.finfo(np.longdouble).max, "non-finite"),
+            (np.complex128(1 + 2j), "unsupported NumPy scalar dtype"),
+            (np.array(object(), dtype=object), "unsupported NumPy scalar dtype"),
+            (torch.tensor(float("nan")), "non-finite"),
+            (torch.tensor(float("inf")), "non-finite"),
+            (torch.tensor(float("-inf")), "non-finite"),
         ],
     )
-    def test_non_finite_scalar_cannot_replace_existing_artifact(
+    def test_invalid_scalar_cannot_replace_existing_artifact(
         self,
         mock_evaluation_tracker: EvaluationTracker,
         mock_datetime,
         invalid_metric,
+        message,
     ):
         mock_evaluation_tracker.metrics_logger.metric_aggregated = {"task": {"accuracy": 1.0}}
         artifact = mock_evaluation_tracker.save()
@@ -167,7 +173,7 @@ class TestLogging:
         manifest_bytes = manifest_path.read_bytes()
 
         mock_evaluation_tracker.metrics_logger.metric_aggregated = {"task": {"accuracy": invalid_metric}}
-        with pytest.raises(EvaluationArtifactError, match="non-finite"):
+        with pytest.raises(EvaluationArtifactError, match=message):
             mock_evaluation_tracker.save()
 
         assert manifest_path.read_bytes() == manifest_bytes
@@ -183,6 +189,9 @@ class TestLogging:
             "task": {
                 "numpy_float": np.float32(1.25),
                 "numpy_int": np.int64(2),
+                "numpy_bool": np.bool_(True),
+                "numpy_longdouble": np.longdouble("1.5"),
+                "numpy_longdouble_array": np.array(np.longdouble("2.5")),
                 "nested": [
                     torch.tensor(3.5),
                     {"torch_int": torch.tensor(4), "torch_bool": torch.tensor(True)},
@@ -197,10 +206,16 @@ class TestLogging:
 
         assert metrics == {
             "nested": [3.5, {"torch_bool": True, "torch_int": 4}],
+            "numpy_bool": True,
             "numpy_float": 1.25,
             "numpy_int": 2,
+            "numpy_longdouble": 1.5,
+            "numpy_longdouble_array": 2.5,
         }
         assert isinstance(metrics["numpy_float"], float)
+        assert isinstance(metrics["numpy_bool"], bool)
+        assert isinstance(metrics["numpy_longdouble"], float)
+        assert isinstance(metrics["numpy_longdouble_array"], float)
         assert isinstance(metrics["nested"][1]["torch_bool"], bool)
 
     def test_save_results_directly_rejects_numpy_nan_without_output(self, mock_evaluation_tracker: EvaluationTracker):

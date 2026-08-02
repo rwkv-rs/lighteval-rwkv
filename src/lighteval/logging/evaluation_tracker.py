@@ -125,9 +125,9 @@ def _normalize_result_scalar(value: object) -> object:
     if isinstance(value, np.ndarray):
         if value.ndim != 0:
             raise EvaluationArtifactError("evaluation results cannot contain NumPy arrays")
-        return _normalize_results_tree(value.item())
+        return _normalize_numpy_scalar(value)
     if isinstance(value, np.generic):
-        return _normalize_results_tree(value.item())
+        return _normalize_numpy_scalar(value)
     if isinstance(value, torch.Tensor):
         if value.ndim != 0:
             raise EvaluationArtifactError("evaluation results cannot contain Torch tensors with dimensions")
@@ -137,6 +137,20 @@ def _normalize_result_scalar(value: object) -> object:
     if value is None or isinstance(value, str | bool | int | float):
         return value
     return _UNHANDLED_RESULT_VALUE
+
+
+def _normalize_numpy_scalar(value: np.ndarray | np.generic) -> bool | int | float:
+    scalar_kind = value.dtype.kind
+    if scalar_kind == "b":
+        return bool(value)
+    if scalar_kind in {"i", "u"}:
+        return int(value)
+    if scalar_kind == "f":
+        normalized = float(value)
+        if math.isfinite(normalized):
+            return normalized
+        raise EvaluationArtifactError("evaluation results contain a non-finite number")
+    raise EvaluationArtifactError(f"evaluation results contain unsupported NumPy scalar dtype {value.dtype}")
 
 
 class EvaluationTracker:
