@@ -144,7 +144,7 @@ class ModelResponse:
 
     # HTTP generation termination evidence. Appended for positional compatibility.
     finish_reasons: list[str | None] = field(default_factory=list)
-    stop_reasons: list[str | None] = field(default_factory=list)
+    stop_reasons: list[str | int | None] = field(default_factory=list)
     terminal_token_ids: list[int | None] = field(default_factory=list)
     token_logprobs: list[list[float | None]] = field(default_factory=list)
 

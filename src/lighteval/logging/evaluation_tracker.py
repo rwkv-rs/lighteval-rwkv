@@ -22,6 +22,7 @@
 
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -31,6 +32,7 @@ from enum import Enum
 from io import BytesIO
 from pathlib import Path
 
+import numpy as np
 import torch
 from datasets import Dataset, load_dataset
 from datasets.utils.metadata import MetadataConfigs
@@ -55,6 +57,7 @@ from lighteval.utils.utils import obj_to_markdown
 
 
 logger = logging.getLogger(__name__)
+_UNHANDLED_RESULT_VALUE = object()
 
 if is_package_available("nanotron"):
     from nanotron.config import GeneralArgs  # type: ignore
@@ -97,6 +100,43 @@ class EnhancedJSONEncoder(json.JSONEncoder):
         except TypeError:
             # For classes without json serialization
             return type(o).__name__
+
+
+def _normalize_results_tree(value: object) -> object:
+    """Convert finite scalar results to canonical JSON-native values.
+
+    NumPy and Torch arrays are accepted only when they are zero-dimensional
+    scalars. This prevents their string representations from turning invalid
+    numerical results into apparently valid publication artifacts.
+    """
+    scalar = _normalize_result_scalar(value)
+    if scalar is not _UNHANDLED_RESULT_VALUE:
+        return scalar
+    if isinstance(value, dict):
+        return {key: _normalize_results_tree(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_normalize_results_tree(item) for item in value]
+    if is_dataclass(value):
+        return _normalize_results_tree(asdict(value))
+    return value
+
+
+def _normalize_result_scalar(value: object) -> object:
+    if isinstance(value, np.ndarray):
+        if value.ndim != 0:
+            raise EvaluationArtifactError("evaluation results cannot contain NumPy arrays")
+        return _normalize_results_tree(value.item())
+    if isinstance(value, np.generic):
+        return _normalize_results_tree(value.item())
+    if isinstance(value, torch.Tensor):
+        if value.ndim != 0:
+            raise EvaluationArtifactError("evaluation results cannot contain Torch tensors with dimensions")
+        return _normalize_results_tree(value.item())
+    if isinstance(value, float) and not math.isfinite(value):
+        raise EvaluationArtifactError("evaluation results contain a non-finite number")
+    if value is None or isinstance(value, str | bool | int | float):
+        return value
+    return _UNHANDLED_RESULT_VALUE
 
 
 class EvaluationTracker:
@@ -262,7 +302,7 @@ class EvaluationTracker:
         output_root = self._local_artifact_root()
         date_id = datetime.now().isoformat().replace(":", "-")
 
-        results_dict = self.results
+        results_dict = _normalize_results_tree(self.results)
 
         # Create the details datasets for later upload
         details_datasets: dict[str, Dataset] = {}
@@ -368,6 +408,7 @@ class EvaluationTracker:
         self.wandb_run.finish()
 
     def save_results(self, date_id: str, results_dict: dict) -> Path:
+        results_dict = _normalize_results_tree(results_dict)
         if self.results_path_template is not None:
             org_model_parts = self.general_config_logger.model_name.split("/")
             org = org_model_parts[0] if len(org_model_parts) >= 2 else ""

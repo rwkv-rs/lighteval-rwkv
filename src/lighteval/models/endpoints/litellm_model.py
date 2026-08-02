@@ -28,7 +28,9 @@ from dataclasses import dataclass
 from json import JSONDecodeError
 from typing import Literal
 
+import httpx
 import requests
+from openai import OpenAI
 from tqdm import tqdm
 
 from lighteval.data import GenerativeTaskDataset
@@ -42,6 +44,39 @@ from lighteval.utils.imports import is_package_available, requires
 
 
 logger = logging.getLogger(__name__)
+
+
+class _OpenAIResponseCapture:
+    """Capture successful raw JSON before LiteLLM coerces response fields."""
+
+    def __init__(self, *, base_url: str | None, api_key: str | None, timeout: float | None):
+        self.status_code: int | None = None
+        self.payload: object = None
+        self._http_client = httpx.Client(timeout=timeout, event_hooks={"response": [self._capture]})
+        client_kwargs = {
+            "api_key": api_key,
+            "http_client": self._http_client,
+            "max_retries": 0,
+        }
+        if base_url is not None:
+            client_kwargs["base_url"] = base_url
+        self.client = OpenAI(**client_kwargs)
+
+    def reset(self) -> None:
+        self.status_code = None
+        self.payload = None
+
+    def close(self) -> None:
+        self.client.close()
+
+    def _capture(self, response: httpx.Response) -> None:
+        self.status_code = response.status_code
+        if response.is_success:
+            response.read()
+            try:
+                self.payload = response.json()
+            except ValueError:
+                self.payload = None
 
 
 @dataclass(frozen=True)
@@ -283,27 +318,58 @@ class LiteLLMClient(LightevalModel):
                 kwargs["max_tokens"] = configured_max_tokens
             completion = litellm.text_completion
 
-        return self._invoke_with_retries(
-            completion,
-            kwargs,
-            endpoint=request.endpoint,
-            num_samples=num_samples,
-            return_logits=return_logits,
-        )
+        response_capture = None
+        if self.provider == "openai":
+            response_capture = _OpenAIResponseCapture(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                timeout=self.timeout,
+            )
+            kwargs["client"] = response_capture.client
+        try:
+            return self._invoke_with_retries(
+                completion,
+                kwargs,
+                endpoint=request.endpoint,
+                num_samples=num_samples,
+                return_logits=return_logits,
+                response_capture=response_capture,
+            )
+        finally:
+            if response_capture is not None:
+                response_capture.close()
 
-    def _invoke_with_retries(self, completion, kwargs, *, endpoint, num_samples, return_logits):
+    def _invoke_with_retries(
+        self,
+        completion,
+        kwargs,
+        *,
+        endpoint,
+        num_samples,
+        return_logits,
+        response_capture,
+    ):
         if self.API_MAX_RETRY < 1:
             raise ValueError("api_max_retry must be at least one")
         for attempt in range(self.API_MAX_RETRY):
+            if response_capture is not None:
+                response_capture.reset()
             try:
                 response = completion(**kwargs)
+                self._validate_captured_response(response_capture, num_samples, return_logits)
                 self._validate_response(response, endpoint, num_samples, return_logits)
                 return response
-            except litellm.BadRequestError:
-                raise
-            except Exception as error:
-                if attempt + 1 == self.API_MAX_RETRY:
+            except Exception as original_error:
+                schema_error = self._captured_schema_error(
+                    response_capture,
+                    num_samples,
+                    return_logits,
+                )
+                if isinstance(original_error, litellm.BadRequestError) and schema_error is None:
                     raise
+                error = schema_error or original_error
+                if attempt + 1 == self.API_MAX_RETRY:
+                    raise error
                 wait_time = min(
                     64, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER**attempt)
                 )  # Exponential backoff with max 64s
@@ -313,6 +379,55 @@ class LiteLLMClient(LightevalModel):
                 time.sleep(wait_time)
 
         raise AssertionError("unreachable API retry state")
+
+    @classmethod
+    def _captured_schema_error(cls, response_capture, num_samples, return_logits):
+        try:
+            cls._validate_captured_response(response_capture, num_samples, return_logits)
+        except ValueError as error:
+            return error
+        return None
+
+    @classmethod
+    def _validate_captured_response(cls, response_capture, num_samples, return_logits) -> None:
+        if response_capture is None or response_capture.status_code is None or response_capture.status_code >= 300:
+            return
+        payload = response_capture.payload
+        if not isinstance(payload, dict):
+            raise ValueError("endpoint returned malformed raw JSON")
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or len(choices) != num_samples:
+            raise ValueError("endpoint returned malformed raw choices")
+        for choice in choices:
+            cls._validate_raw_choice(choice, return_logits)
+
+    @classmethod
+    def _validate_raw_choice(cls, choice, return_logits) -> None:
+        if not isinstance(choice, dict):
+            raise ValueError("endpoint returned a malformed raw completion choice")
+        cls._validate_raw_logprobs(choice.get("logprobs"), required=return_logits)
+        cls._validate_finish_reason(choice.get("finish_reason"))
+        cls._validate_stop_reason(choice.get("stop_reason"))
+        token_ids = choice.get("token_ids")
+        if token_ids is not None:
+            if not isinstance(token_ids, list):
+                raise ValueError("endpoint returned a malformed terminal token id")
+            if token_ids:
+                cls._validate_terminal_token_id(token_ids[-1])
+
+    @staticmethod
+    def _validate_raw_logprobs(logprobs, *, required: bool) -> None:
+        if logprobs is None:
+            if required:
+                raise ValueError("endpoint omitted requested token log probabilities")
+            return
+        if not isinstance(logprobs, dict) or not isinstance(logprobs.get("token_logprobs"), list):
+            raise ValueError("endpoint returned malformed token log probabilities")
+        for value in logprobs["token_logprobs"]:
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value)
+            ):
+                raise ValueError("endpoint returned malformed token log probabilities")
 
     @classmethod
     def _validate_response(cls, response, endpoint: str, num_samples: int, return_logits: bool) -> None:
@@ -329,6 +444,9 @@ class LiteLLMClient(LightevalModel):
                 token_logprobs = cls._choice_token_logprobs(choice)
                 if not token_logprobs:
                     raise ValueError("endpoint omitted requested token log probabilities")
+            cls._choice_finish_reason(choice)
+            cls._choice_stop_reason(choice)
+            cls._choice_terminal_token_id(choice)
 
     @staticmethod
     def _choice_content(choice, endpoint: str) -> str | None:
@@ -357,6 +475,8 @@ class LiteLLMClient(LightevalModel):
         for value in values:
             if value is None:
                 parsed.append(None)
+            elif isinstance(value, bool):
+                raise ValueError("endpoint returned malformed token log probabilities")
             elif isinstance(value, int | float) and math.isfinite(value):
                 parsed.append(float(value))
             else:
@@ -364,11 +484,34 @@ class LiteLLMClient(LightevalModel):
         return parsed
 
     @classmethod
+    def _choice_finish_reason(cls, choice) -> str | None:
+        return cls._validate_finish_reason(cls._response_field(choice, "finish_reason"))
+
+    @staticmethod
+    def _validate_finish_reason(finish_reason) -> str | None:
+        if finish_reason is not None and not isinstance(finish_reason, str):
+            raise ValueError("endpoint returned a malformed finish reason")
+        return finish_reason
+
+    @classmethod
+    def _choice_stop_reason(cls, choice) -> str | int | None:
+        return cls._validate_stop_reason(cls._response_field(choice, "stop_reason"))
+
+    @staticmethod
+    def _validate_stop_reason(stop_reason) -> str | int | None:
+        if isinstance(stop_reason, bool) or (stop_reason is not None and not isinstance(stop_reason, str | int)):
+            raise ValueError("endpoint returned a malformed stop reason")
+        return stop_reason
+
+    @classmethod
     def _choice_terminal_token_id(cls, choice) -> int | None:
         token_ids = cls._response_field(choice, "token_ids")
         if not isinstance(token_ids, list) or not token_ids:
             return None
-        terminal_token_id = token_ids[-1]
+        return cls._validate_terminal_token_id(token_ids[-1])
+
+    @staticmethod
+    def _validate_terminal_token_id(terminal_token_id) -> int | None:
         if terminal_token_id is None:
             return None
         if not isinstance(terminal_token_id, int) or isinstance(terminal_token_id, bool):
@@ -514,8 +657,8 @@ class LiteLLMClient(LightevalModel):
                     reasonings = [self._response_field(choice, "reasoning_content") for choice in response.choices]
 
                 token_logprobs = [self._choice_token_logprobs(choice) for choice in response.choices]
-                finish_reasons = [self._response_field(choice, "finish_reason") for choice in response.choices]
-                stop_reasons = [self._response_field(choice, "stop_reason") for choice in response.choices]
+                finish_reasons = [self._choice_finish_reason(choice) for choice in response.choices]
+                stop_reasons = [self._choice_stop_reason(choice) for choice in response.choices]
                 terminal_token_ids = [self._choice_terminal_token_id(choice) for choice in response.choices]
 
                 cur_response = ModelResponse(

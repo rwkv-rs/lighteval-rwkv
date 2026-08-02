@@ -27,6 +27,8 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+import numpy as np
+import torch
 from datasets import Dataset
 from huggingface_hub import HfApi
 
@@ -132,10 +134,80 @@ class TestLogging:
     ):
         mock_evaluation_tracker.metrics_logger.metric_aggregated = {"task": {"accuracy": float("nan")}}
 
-        with pytest.raises(EvaluationArtifactError, match="finite JSON"):
+        with pytest.raises(EvaluationArtifactError, match="non-finite"):
             mock_evaluation_tracker.save()
 
         assert not list(Path(mock_evaluation_tracker.output_dir).glob("artifacts/**/artifact.json"))
+
+    @pytest.mark.parametrize(
+        "invalid_metric",
+        [
+            float("nan"),
+            float("inf"),
+            float("-inf"),
+            np.float32("nan"),
+            np.float64("inf"),
+            np.float64("-inf"),
+            torch.tensor(float("nan")),
+            torch.tensor(float("inf")),
+            torch.tensor(float("-inf")),
+        ],
+    )
+    def test_non_finite_scalar_cannot_replace_existing_artifact(
+        self,
+        mock_evaluation_tracker: EvaluationTracker,
+        mock_datetime,
+        invalid_metric,
+    ):
+        mock_evaluation_tracker.metrics_logger.metric_aggregated = {"task": {"accuracy": 1.0}}
+        artifact = mock_evaluation_tracker.save()
+        output_root = Path(mock_evaluation_tracker.output_dir)
+        manifest_path = output_root / artifact.manifest_path
+        committed_bytes = {member.path: (output_root / member.path).read_bytes() for member in artifact.members}
+        manifest_bytes = manifest_path.read_bytes()
+
+        mock_evaluation_tracker.metrics_logger.metric_aggregated = {"task": {"accuracy": invalid_metric}}
+        with pytest.raises(EvaluationArtifactError, match="non-finite"):
+            mock_evaluation_tracker.save()
+
+        assert manifest_path.read_bytes() == manifest_bytes
+        assert {
+            member.path: (output_root / member.path).read_bytes() for member in artifact.members
+        } == committed_bytes
+        assert load_evaluation_artifact(output_root, artifact.manifest_path) == artifact
+
+    def test_finite_numpy_and_torch_scalars_remain_nested_json_values(
+        self, mock_evaluation_tracker: EvaluationTracker
+    ):
+        mock_evaluation_tracker.metrics_logger.metric_aggregated = {
+            "task": {
+                "numpy_float": np.float32(1.25),
+                "numpy_int": np.int64(2),
+                "nested": [
+                    torch.tensor(3.5),
+                    {"torch_int": torch.tensor(4), "torch_bool": torch.tensor(True)},
+                ],
+            }
+        }
+
+        artifact = mock_evaluation_tracker.save()
+        output_root = Path(mock_evaluation_tracker.output_dir)
+        results = json.loads((output_root / artifact.results_path).read_text(encoding="utf-8"))
+        metrics = results["results"]["task"]
+
+        assert metrics == {
+            "nested": [3.5, {"torch_bool": True, "torch_int": 4}],
+            "numpy_float": 1.25,
+            "numpy_int": 2,
+        }
+        assert isinstance(metrics["numpy_float"], float)
+        assert isinstance(metrics["nested"][1]["torch_bool"], bool)
+
+    def test_save_results_directly_rejects_numpy_nan_without_output(self, mock_evaluation_tracker: EvaluationTracker):
+        with pytest.raises(EvaluationArtifactError, match="non-finite"):
+            mock_evaluation_tracker.save_results("stamp", {"metric": np.float32("nan")})
+
+        assert not (Path(mock_evaluation_tracker.output_dir) / "results").exists()
 
     def test_artifact_manifest_commits_last_and_save_is_retryable(
         self,

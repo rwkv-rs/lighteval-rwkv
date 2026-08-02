@@ -337,6 +337,26 @@ def test_text_completion_rejects_empty_or_malformed_success_schema(payload):
 
 
 @pytest.mark.parametrize(
+    ("choice", "return_logits", "message"),
+    [
+        (_choice("bad-logprob", logprob=True), True, "token log probabilities"),
+        (_choice("bad-finish", finish_reason={"reason": "stop"}), False, "finish reason"),
+        (_choice("bad-stop-list", stop_reason=["END"]), False, "stop reason"),
+        (_choice("bad-stop-bool", stop_reason=True), False, "stop reason"),
+        (_choice("bad-token-id", token_id=True), False, "terminal token id"),
+    ],
+)
+def test_text_completion_retries_and_rejects_malformed_response_evidence(choice, return_logits, message):
+    payload = _completion_response(choice)
+    with _OpenAICompatibleServer([(200, payload), (200, payload)]) as server:
+        client = _transport_client(server.base_url, retries=2)
+        with pytest.raises(ValueError, match=message):
+            _call_text_completion(client, return_logits=return_logits)
+
+    assert len(server.requests) == 2
+
+
+@pytest.mark.parametrize(
     ("status", "expected_exception", "expected_requests"),
     [
         (400, "BadRequestError", 1),
