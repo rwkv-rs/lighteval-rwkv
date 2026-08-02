@@ -36,6 +36,7 @@ from datasets import Dataset, load_dataset
 from datasets.utils.metadata import MetadataConfigs
 from huggingface_hub import DatasetCard, DatasetCardData, HfApi, HFSummaryWriter, hf_hub_url
 
+from lighteval.logging.evaluation_artifact import EvaluationArtifact
 from lighteval.logging.info_loggers import (
     DetailsLogger,
     GeneralConfigLogger,
@@ -244,8 +245,13 @@ class EvaluationTracker:
             pprint(model_response.input)
             pprint(metrics)
 
-    def save(self) -> None:
-        """Saves the experiment information and results to files, and to the hub if requested."""
+    def save(self, *, publication_requested: bool = False) -> EvaluationArtifact:
+        """Save standard outputs and return their canonical local artifact.
+
+        ``publication_requested`` only records an explicit publication intent.
+        Network publication remains a separate caller-owned step and therefore
+        cannot prevent standard results and details from being retained.
+        """
         logger.info("Saving experiment tracker")
         date_id = datetime.now().isoformat().replace(":", "-")
 
@@ -267,10 +273,30 @@ class EvaluationTracker:
             details_datasets[task_name] = dataset
 
         # We save results at every case
-        self.save_results(date_id, results_dict)
+        results_path = self.save_results(date_id, results_dict)
 
+        details_paths: tuple[Path, ...] = ()
         if self.should_save_details:
-            self.save_details(date_id, details_datasets)
+            details_paths = self.save_details(date_id, details_datasets)
+
+        manifest_path = (
+            Path(self.output_dir)
+            / "artifacts"
+            / self.general_config_logger.model_name.strip("/")
+            / date_id
+            / "artifact.json"
+        )
+        artifact = EvaluationArtifact(
+            manifest_path=self._artifact_relative_path(manifest_path),
+            results_path=self._artifact_relative_path(results_path),
+            details_paths=tuple(
+                sorted(self._artifact_relative_path(path) for path in details_paths)
+            ),
+            publication_requested=publication_requested,
+        )
+        self.fs.mkdirs(manifest_path.parent, exist_ok=True)
+        with self.fs.open(manifest_path, "wb") as artifact_file:
+            artifact_file.write(artifact.canonical_json() + b"\n")
 
         if self.should_push_to_hub:
             self.push_to_hub(
@@ -290,6 +316,16 @@ class EvaluationTracker:
                 results=self.metrics_logger.metric_aggregated, details=self.details_logger.compiled_details
             )
 
+        return artifact
+
+    def _artifact_relative_path(self, path: str | Path) -> str:
+        """Prefer portable paths while preserving custom output templates."""
+        artifact_path = Path(path)
+        try:
+            return artifact_path.relative_to(Path(self.output_dir)).as_posix()
+        except ValueError:
+            return artifact_path.as_posix()
+
     def push_to_wandb(self, results_dict: dict, details_datasets: dict) -> None:
         # reformat the results key to replace ':' with '/'
         results_dict = {k.replace(":", "/"): v for k, v in results_dict["results"].items()}
@@ -299,7 +335,7 @@ class EvaluationTracker:
         )
         self.wandb_run.finish()
 
-    def save_results(self, date_id: str, results_dict: dict):
+    def save_results(self, date_id: str, results_dict: dict) -> Path:
         if self.results_path_template is not None:
             org_model_parts = self.general_config_logger.model_name.split("/")
             org = org_model_parts[0] if len(org_model_parts) >= 2 else ""
@@ -313,6 +349,7 @@ class EvaluationTracker:
         logger.info(f"Saving results to {output_results_file}")
         with self.fs.open(output_results_file, "w") as f:
             f.write(json.dumps(results_dict, cls=EnhancedJSONEncoder, indent=2, ensure_ascii=False))
+        return output_results_file
 
     def _get_details_sub_folder(self, date_id: str):
         output_dir_details = Path(self.output_dir) / "details" / self.general_config_logger.model_name.strip("/")
@@ -351,14 +388,17 @@ class EvaluationTracker:
                 )
         return details_datasets
 
-    def save_details(self, date_id: str, details_datasets: dict[str, Dataset]):
+    def save_details(self, date_id: str, details_datasets: dict[str, Dataset]) -> tuple[Path, ...]:
         output_dir_details_sub_folder = self._get_details_sub_folder(date_id)
         self.fs.mkdirs(output_dir_details_sub_folder, exist_ok=True)
         logger.info(f"Saving details to {output_dir_details_sub_folder}")
+        output_files = []
         for task_name, dataset in details_datasets.items():
             output_file_details = output_dir_details_sub_folder / f"details_{task_name}_{date_id}.parquet"
             with self.fs.open(str(output_file_details), "wb") as f:
                 dataset.to_parquet(f)
+            output_files.append(output_file_details)
+        return tuple(output_files)
 
     def generate_final_dict(self) -> dict:
         """Aggregates and returns all the logger's experiment information in a dictionary.

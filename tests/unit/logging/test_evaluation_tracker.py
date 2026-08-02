@@ -90,7 +90,7 @@ class TestLogging:
         }
         mock_evaluation_tracker.metrics_logger.metric_aggregated = task_metrics
 
-        mock_evaluation_tracker.save()
+        artifact = mock_evaluation_tracker.save()
 
         results_dir = Path(mock_evaluation_tracker.output_dir) / "results" / "test_model"
         assert results_dir.exists()
@@ -104,6 +104,23 @@ class TestLogging:
         assert "results" in saved_results
         assert saved_results["results"] == task_metrics
         assert saved_results["config_general"]["model_name"] == "test_model"
+        assert artifact.as_dict()["publication"] == {
+            "requested": False,
+            "status": "not_published",
+        }
+        manifest_path = Path(mock_evaluation_tracker.output_dir) / artifact.manifest_path
+        assert json.loads(manifest_path.read_text(encoding="utf-8")) == artifact.as_dict()
+
+    def test_publication_intent_is_explicit_and_never_claims_success(
+        self, mock_evaluation_tracker: EvaluationTracker
+    ):
+        artifact = mock_evaluation_tracker.save(publication_requested=True)
+
+        assert artifact.as_dict()["publication"] == {
+            "requested": True,
+            "status": "not_published",
+        }
+        assert artifact.results_path.startswith("results/test_model/results_")
 
     def test_results_logging_template(self, mock_evaluation_tracker: EvaluationTracker):
         task_metrics = {
@@ -300,6 +317,7 @@ class TestProperties(unittest.TestCase):
             "provider": None,
             "base_url": None,
             "api_key": None,
+            "use_chat_template": True,
             "system_prompt": ref_system_prompt,
             "generation_parameters": ref_generation_parameters,
         }  # ruff: noqa: E501

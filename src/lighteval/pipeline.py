@@ -455,10 +455,11 @@ class Pipeline:
 
         return model_responses
 
-    def save_and_push_results(self):
+    def save_and_push_results(self, *, publication_requested: bool = False):
         logger.info("--- SAVING AND PUSHING RESULTS ---")
         if self.is_main_process():
-            self.evaluation_tracker.save()
+            return self.evaluation_tracker.save(publication_requested=publication_requested)
+        return None
 
     def _init_final_dict(self):
         if self.is_main_process():
