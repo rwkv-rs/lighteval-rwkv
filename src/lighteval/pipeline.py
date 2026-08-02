@@ -266,7 +266,11 @@ class Pipeline:
             ]
             task.config.configured_task_prompt = task_prompt
             task.config.task_prompt_mode = self.pipeline_parameters.task_prompt_mode.value
-            task.config.task_prompt_digests = sorted({identity.digest for identity in identities})
+            identities_by_digest = {identity.digest: identity.as_dict() for identity in identities}
+            task.config.task_prompt_digests = sorted(identities_by_digest)
+            task.config.task_prompt_identities = [
+                identities_by_digest[digest] for digest in task.config.task_prompt_digests
+            ]
             task.config.experimental_identity = any(identity.experimental for identity in identities)
 
     def _update_num_samples(self, tasks: list[LightevalTask]):

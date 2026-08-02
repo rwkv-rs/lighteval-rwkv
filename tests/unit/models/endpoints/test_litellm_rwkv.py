@@ -42,6 +42,7 @@ def test_naive_request_uses_v1_completions_and_preserves_complete_task_input():
     )
 
     assert request.endpoint == "/v1/completions"
+    assert request.tokenization == "server"
     assert request.as_payload() == {
         "prompt": ("Campaign instruction:\n\n\nExample?\n\nA. No\nB. Yes Yes\n\nQuestion?\n\nA. Left\nB. Right")
     }
@@ -82,6 +83,18 @@ def test_naive_request_rejects_model_system_prompt():
             ),
             use_chat_template=False,
         )
+
+
+@pytest.mark.parametrize(
+    "openai_request",
+    [
+        OpenAICompatibleRequest(endpoint="/v1/completions", model_input=[{"role": "user", "content": "x"}]),
+        OpenAICompatibleRequest(endpoint="/v1/chat/completions", model_input="x"),
+    ],
+)
+def test_endpoint_payload_cannot_mix_text_and_chat_input(openai_request):
+    with pytest.raises(TypeError, match="text completions|chat completions"):
+        openai_request.as_payload()
 
 
 class _OpenAICompatibleServer:
@@ -188,6 +201,7 @@ def test_text_completion_uses_real_litellm_transport_and_preserves_payload_and_e
         temperature=0.4,
         top_p=0.8,
         seed=123,
+        stop_tokens=["MODEL_DEFAULT_STOP"],
         frequency_penalty=0.2,
         presence_penalty=0.3,
     )

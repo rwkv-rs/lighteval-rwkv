@@ -46,9 +46,9 @@ class TaskPromptMode(str, Enum):
 
 @dataclass(frozen=True)
 class TaskPromptIdentity:
-    """Stable provenance for the effective task instruction."""
+    """Stable upstream and effective task-instruction provenance."""
 
-    original_instruction: str
+    upstream_instruction: str
     effective_instruction: str
     mode: str
     digest: str
@@ -67,7 +67,7 @@ def apply_task_prompt_override(
     """Apply one campaign-level task prompt override before request creation.
 
     ``prepend`` and ``append`` concatenate the configured prompt verbatim so
-    callers retain control over whitespace. The original instruction prefix is
+    callers retain control over whitespace. The upstream instruction prefix is
     removed from ``Doc.query`` before the effective instruction is installed,
     matching :class:`PromptManager`'s upstream rendering behavior.
     """
@@ -79,16 +79,16 @@ def apply_task_prompt_override(
         choices = ", ".join(item.value for item in TaskPromptMode)
         raise ValueError(f"task_prompt mode must be one of: {choices}") from error
 
-    original = doc.instruction or ""
+    upstream = doc.instruction or ""
     match selected_mode:
         case TaskPromptMode.REPLACE:
             effective = task_prompt
         case TaskPromptMode.PREPEND:
-            effective = task_prompt + original
+            effective = task_prompt + upstream
         case TaskPromptMode.APPEND:
-            effective = original + task_prompt
+            effective = upstream + task_prompt
         case TaskPromptMode.INHERIT:
-            effective = original
+            effective = upstream
 
     if doc.instruction and doc.query.startswith(doc.instruction):
         query_without_instruction = doc.query[len(doc.instruction) :].strip()
@@ -99,14 +99,14 @@ def apply_task_prompt_override(
         {
             "effective_instruction": effective,
             "mode": selected_mode.value,
-            "original_instruction": original,
+            "upstream_instruction": upstream,
         },
         ensure_ascii=False,
         separators=(",", ":"),
         sort_keys=True,
     )
     identity = TaskPromptIdentity(
-        original_instruction=original,
+        upstream_instruction=upstream,
         effective_instruction=effective,
         mode=selected_mode.value,
         digest=hashlib.sha256(canonical.encode()).hexdigest(),

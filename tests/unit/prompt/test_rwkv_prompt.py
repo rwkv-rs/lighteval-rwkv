@@ -36,7 +36,7 @@ def test_task_prompt_modes(mode: str, task_prompt: str, expected: str):
 
     assert doc.query == "Question?"
     assert doc.instruction == expected
-    assert identity.original_instruction == "Upstream instruction: "
+    assert identity.upstream_instruction == "Upstream instruction: "
     assert identity.effective_instruction == expected
     assert identity.mode == mode
     assert identity.experimental is (mode != "inherit")
@@ -45,7 +45,7 @@ def test_task_prompt_modes(mode: str, task_prompt: str, expected: str):
         {
             "effective_instruction": expected,
             "mode": mode,
-            "original_instruction": "Upstream instruction: ",
+            "upstream_instruction": "Upstream instruction: ",
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -81,7 +81,7 @@ def test_replace_preserves_gpqa_style_query_when_instruction_is_complete_task_in
 
     identity = apply_task_prompt_override(doc, task_prompt, TaskPromptMode.REPLACE)
 
-    assert identity.original_instruction == "Which explanation is correct?"
+    assert identity.upstream_instruction == "Which explanation is correct?"
     assert doc.instruction == (task_prompt or None)
     assert doc.query == "Which explanation is correct?"
     assert doc.choices == ["first", "second", "third", "fourth"]

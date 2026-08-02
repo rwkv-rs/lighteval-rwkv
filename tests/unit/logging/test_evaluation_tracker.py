@@ -35,6 +35,8 @@ from huggingface_hub import HfApi
 from lighteval.logging.evaluation_tracker import EvaluationTracker
 from lighteval.logging.evaluation_artifact import EvaluationArtifactError, load_evaluation_artifact
 from lighteval.logging.info_loggers import DetailsLogger
+from lighteval.tasks.requests import Doc
+from lighteval.tasks.rwkv_prompt import apply_task_prompt_override
 
 # ruff: noqa
 from tests.fixtures import TESTING_EMPTY_HF_ORG_ID
@@ -119,6 +121,31 @@ class TestLogging:
         assert loaded.members[0].media_type == "application/json"
         assert loaded.members[0].size_bytes > 0
         assert len(loaded.members[0].sha256) == 64
+
+    def test_results_artifact_records_task_prompt_identity(self, mock_evaluation_tracker: EvaluationTracker):
+        doc = Doc(
+            query="Upstream instruction: Question?",
+            choices=["Answer"],
+            gold_index=0,
+            instruction="Upstream instruction: ",
+        )
+        prompt_identity = apply_task_prompt_override(doc, "Campaign instruction: ", "replace").as_dict()
+        mock_evaluation_tracker.task_config_logger.tasks_configs = {
+            "fixture|0": {
+                "configured_task_prompt": "Campaign instruction: ",
+                "task_prompt_mode": "replace",
+                "task_prompt_digests": [prompt_identity["digest"]],
+                "task_prompt_identities": [prompt_identity],
+                "experimental_identity": True,
+            }
+        }
+
+        artifact = mock_evaluation_tracker.save()
+        results = json.loads(
+            (Path(mock_evaluation_tracker.output_dir) / artifact.results_path).read_text(encoding="utf-8")
+        )
+
+        assert results["config_tasks"]["fixture|0"]["task_prompt_identities"] == [prompt_identity]
 
     def test_publication_intent_is_explicit_and_never_claims_success(self, mock_evaluation_tracker: EvaluationTracker):
         artifact = mock_evaluation_tracker.save(publication_requested=True)

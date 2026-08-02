@@ -19,6 +19,7 @@ def test_pipeline_applies_empty_task_prompt_and_persists_provenance(monkeypatch)
             configured_task_prompt=None,
             task_prompt_mode=None,
             task_prompt_digests=[],
+            task_prompt_identities=[],
             experimental_identity=False,
         ),
         get_docs=lambda _max_samples: [doc],
@@ -50,7 +51,7 @@ def test_pipeline_applies_empty_task_prompt_and_persists_provenance(monkeypatch)
     assert doc.query == "Question?"
     assert doc.instruction is None
     assert doc.specific["rwkv_task_prompt"] == {
-        "original_instruction": "Upstream instruction: ",
+        "upstream_instruction": "Upstream instruction: ",
         "effective_instruction": "",
         "mode": "replace",
         "digest": task.config.task_prompt_digests[0],
@@ -58,6 +59,7 @@ def test_pipeline_applies_empty_task_prompt_and_persists_provenance(monkeypatch)
     }
     assert task.config.configured_task_prompt == ""
     assert task.config.task_prompt_mode == "replace"
+    assert task.config.task_prompt_identities == [doc.specific["rwkv_task_prompt"]]
     assert task.config.experimental_identity is True
     assert pipeline.sampling_docs[SamplingMethod.GENERATIVE] == [doc]
     task_logger.log.assert_called_once_with(pipeline.tasks_dict)
@@ -102,11 +104,12 @@ def test_pipeline_preserves_upstream_prompt_only_with_explicit_inherit(monkeypat
     assert doc.query == "Question?"
     assert doc.instruction == "Upstream instruction: "
     assert doc.specific["rwkv_task_prompt"] == {
-        "original_instruction": "Upstream instruction: ",
+        "upstream_instruction": "Upstream instruction: ",
         "effective_instruction": "Upstream instruction: ",
         "mode": "inherit",
         "digest": task.config.task_prompt_digests[0],
         "experimental": False,
     }
     assert task.config.task_prompt_mode == "inherit"
+    assert task.config.task_prompt_identities == [doc.specific["rwkv_task_prompt"]]
     assert task.config.experimental_identity is False

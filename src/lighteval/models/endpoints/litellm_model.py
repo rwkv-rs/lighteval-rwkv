@@ -81,15 +81,20 @@ class _OpenAIResponseCapture:
 
 @dataclass(frozen=True)
 class OpenAICompatibleRequest:
-    """Rendered input and endpoint for one OpenAI-compatible request."""
+    """Rendered input for an endpoint that performs its own tokenization."""
 
     endpoint: Literal["/v1/chat/completions", "/v1/completions"]
     model_input: str | list[dict[str, str]]
+    tokenization: Literal["server"] = "server"
 
     def as_payload(self) -> dict[str, object]:
         """Return the endpoint-specific input field."""
         if self.endpoint == "/v1/completions":
+            if not isinstance(self.model_input, str):
+                raise TypeError("text completions require one plain-text prompt")
             return {"prompt": self.model_input}
+        if not isinstance(self.model_input, list):
+            raise TypeError("chat completions require a message list")
         return {"messages": self.model_input}
 
 
@@ -307,6 +312,10 @@ class LiteLLMClient(LightevalModel):
             logger.warning("O1 models do not support temperature, top_p, stop sequence. Disabling.")
         else:
             kwargs.update(self.generation_parameters.to_litellm_dict())
+            # Task stop sequences define the evaluation contract. Model-level
+            # defaults are used only when the task does not provide one.
+            if stop_sequence:
+                kwargs["stop"] = stop_sequence
 
         if request.endpoint == "/v1/chat/completions":
             if kwargs.get("max_completion_tokens", None) is None:
