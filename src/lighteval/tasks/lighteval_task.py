@@ -142,6 +142,12 @@ class LightevalTaskConfig:
 
     original_num_docs: int = -1
     effective_num_docs: int = -1
+    skipped_multiselect_docs: int = 0
+
+    configured_task_prompt: str | None = None
+    task_prompt_mode: str | None = None
+    task_prompt_digests: list[str] = field(default_factory=list)
+    experimental_identity: bool = False
 
     must_remove_duplicate_docs: bool = False
 
