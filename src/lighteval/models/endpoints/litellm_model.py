@@ -447,8 +447,8 @@ class LiteLLMClient(LightevalModel):
             )
         for choice in choices:
             content = cls._choice_content(choice, endpoint)
-            if not isinstance(content, str) or not content:
-                raise ValueError("endpoint returned an empty or malformed completion choice")
+            if not isinstance(content, str):
+                raise ValueError("endpoint returned a missing or malformed completion choice")
             if return_logits:
                 token_logprobs = cls._choice_token_logprobs(choice)
                 if not token_logprobs:
@@ -671,8 +671,7 @@ class LiteLLMClient(LightevalModel):
                 terminal_token_ids = [self._choice_terminal_token_id(choice) for choice in response.choices]
 
                 cur_response = ModelResponse(
-                    # In empty responses, the model should return an empty string instead of None
-                    text=result if result[0] else [""],
+                    text=result,
                     reasonings=reasonings,
                     input=context,
                     token_logprobs=token_logprobs,

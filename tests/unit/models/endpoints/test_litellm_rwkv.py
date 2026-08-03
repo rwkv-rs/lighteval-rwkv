@@ -338,16 +338,44 @@ def test_greedy_until_rejects_group_response_count_mismatch(monkeypatch):
     "payload",
     [
         _completion_response(),
-        _completion_response({"index": 0, "text": "", "finish_reason": "stop"}),
+        _completion_response({"index": 0, "text": None, "finish_reason": "stop"}),
     ],
 )
-def test_text_completion_rejects_empty_or_malformed_success_schema(payload):
+def test_text_completion_rejects_missing_or_malformed_success_schema(payload):
     with _OpenAICompatibleServer([(200, payload)]) as server:
         client = _transport_client(server.base_url)
-        with pytest.raises(ValueError, match="choices|empty or malformed"):
+        with pytest.raises(ValueError, match="choices|missing or malformed"):
             _call_text_completion(client, return_logits=False)
 
     assert len(server.requests) == 1
+
+
+def test_text_completion_preserves_empty_stop_sample_and_remaining_samples():
+    response = _completion_response(
+        _choice("", 0, stop_reason=0, token_id=0),
+        _choice("second", 1, finish_reason="length", stop_reason=None, token_id=12),
+    )
+    parameters = GenerationParameters(temperature=0.4)
+    with _OpenAICompatibleServer([(200, response)]) as server:
+        client = _transport_client(server.base_url, generation_parameters=parameters)
+        model_responses = client.greedy_until(
+            [
+                Doc(
+                    query="transport prompt",
+                    choices=["answer"],
+                    gold_index=0,
+                    generation_size=17,
+                    stop_sequences=["END"],
+                    use_logits=False,
+                    num_samples=2,
+                )
+            ]
+        )
+
+    assert model_responses[0].text == ["", "second"]
+    assert model_responses[0].finish_reasons == ["stop", "length"]
+    assert model_responses[0].stop_reasons == [0, None]
+    assert model_responses[0].terminal_token_ids == [0, 12]
 
 
 @pytest.mark.parametrize(
