@@ -150,6 +150,7 @@ class ModelResponse:
             input_tokens=self.input_tokens,
             text=[self.text[index]],
             output_tokens=[self.output_tokens[index]] if self.output_tokens else [],
+            reasonings=[self.reasonings[index]] if self.reasonings else [],
             logprobs=[self.logprobs[index]] if self.logprobs else [],
             argmax_logits_eq_gold=[self.argmax_logits_eq_gold[index]] if self.argmax_logits_eq_gold else [],
             logits=[self.logits[index]] if self.logits else None,
