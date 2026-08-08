@@ -27,11 +27,16 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+import numpy as np
+import torch
 from datasets import Dataset
 from huggingface_hub import HfApi
 
 from lighteval.logging.evaluation_tracker import EvaluationTracker
+from lighteval.logging.evaluation_artifact import EvaluationArtifactError, load_evaluation_artifact
 from lighteval.logging.info_loggers import DetailsLogger
+from lighteval.tasks.requests import Doc
+from lighteval.tasks.rwkv_prompt import apply_task_prompt_override
 
 # ruff: noqa
 from tests.fixtures import TESTING_EMPTY_HF_ORG_ID
@@ -90,7 +95,7 @@ class TestLogging:
         }
         mock_evaluation_tracker.metrics_logger.metric_aggregated = task_metrics
 
-        mock_evaluation_tracker.save()
+        artifact = mock_evaluation_tracker.save()
 
         results_dir = Path(mock_evaluation_tracker.output_dir) / "results" / "test_model"
         assert results_dir.exists()
@@ -104,6 +109,190 @@ class TestLogging:
         assert "results" in saved_results
         assert saved_results["results"] == task_metrics
         assert saved_results["config_general"]["model_name"] == "test_model"
+        assert artifact.as_dict()["publication"] == {
+            "requested": False,
+            "status": "not_published",
+        }
+        manifest_path = Path(mock_evaluation_tracker.output_dir) / artifact.manifest_path
+        assert json.loads(manifest_path.read_text(encoding="utf-8")) == artifact.as_dict()
+        loaded = load_evaluation_artifact(Path(mock_evaluation_tracker.output_dir), artifact.manifest_path)
+        assert loaded == artifact
+        assert loaded.members[0].role == "results"
+        assert loaded.members[0].media_type == "application/json"
+        assert loaded.members[0].size_bytes > 0
+        assert len(loaded.members[0].sha256) == 64
+
+    def test_results_artifact_records_task_prompt_identity(self, mock_evaluation_tracker: EvaluationTracker):
+        doc = Doc(
+            query="Upstream instruction: Question?",
+            choices=["Answer"],
+            gold_index=0,
+            instruction="Upstream instruction: ",
+        )
+        prompt_identity = apply_task_prompt_override(doc, "Campaign instruction: ", "replace").as_dict()
+        mock_evaluation_tracker.task_config_logger.tasks_configs = {
+            "fixture|0": {
+                "configured_task_prompt": "Campaign instruction: ",
+                "task_prompt_mode": "replace",
+                "task_prompt_digests": [prompt_identity["digest"]],
+                "task_prompt_identities": [prompt_identity],
+                "experimental_identity": True,
+            }
+        }
+
+        artifact = mock_evaluation_tracker.save()
+        results = json.loads(
+            (Path(mock_evaluation_tracker.output_dir) / artifact.results_path).read_text(encoding="utf-8")
+        )
+
+        assert results["config_tasks"]["fixture|0"]["task_prompt_identities"] == [prompt_identity]
+
+    def test_publication_intent_is_explicit_and_never_claims_success(self, mock_evaluation_tracker: EvaluationTracker):
+        artifact = mock_evaluation_tracker.save(publication_requested=True)
+
+        assert artifact.as_dict()["publication"] == {
+            "requested": True,
+            "status": "not_published",
+        }
+        assert artifact.results_path.startswith("results/test_model/results_")
+
+    def test_results_reject_non_finite_metrics_before_manifest_commit(
+        self, mock_evaluation_tracker: EvaluationTracker
+    ):
+        mock_evaluation_tracker.metrics_logger.metric_aggregated = {"task": {"accuracy": float("nan")}}
+
+        with pytest.raises(EvaluationArtifactError, match="non-finite"):
+            mock_evaluation_tracker.save()
+
+        assert not list(Path(mock_evaluation_tracker.output_dir).glob("artifacts/**/artifact.json"))
+
+    @pytest.mark.parametrize(
+        ("invalid_metric", "message"),
+        [
+            (float("nan"), "non-finite"),
+            (float("inf"), "non-finite"),
+            (float("-inf"), "non-finite"),
+            (np.float32("nan"), "non-finite"),
+            (np.float64("inf"), "non-finite"),
+            (np.float64("-inf"), "non-finite"),
+            (np.longdouble("nan"), "non-finite"),
+            (np.longdouble("inf"), "non-finite"),
+            (np.finfo(np.longdouble).max, "non-finite"),
+            (np.complex128(1 + 2j), "unsupported NumPy scalar dtype"),
+            (np.array(object(), dtype=object), "unsupported NumPy scalar dtype"),
+            (torch.tensor(float("nan")), "non-finite"),
+            (torch.tensor(float("inf")), "non-finite"),
+            (torch.tensor(float("-inf")), "non-finite"),
+        ],
+    )
+    def test_invalid_scalar_cannot_replace_existing_artifact(
+        self,
+        mock_evaluation_tracker: EvaluationTracker,
+        mock_datetime,
+        invalid_metric,
+        message,
+    ):
+        mock_evaluation_tracker.metrics_logger.metric_aggregated = {"task": {"accuracy": 1.0}}
+        artifact = mock_evaluation_tracker.save()
+        output_root = Path(mock_evaluation_tracker.output_dir)
+        manifest_path = output_root / artifact.manifest_path
+        committed_bytes = {member.path: (output_root / member.path).read_bytes() for member in artifact.members}
+        manifest_bytes = manifest_path.read_bytes()
+
+        mock_evaluation_tracker.metrics_logger.metric_aggregated = {"task": {"accuracy": invalid_metric}}
+        with pytest.raises(EvaluationArtifactError, match=message):
+            mock_evaluation_tracker.save()
+
+        assert manifest_path.read_bytes() == manifest_bytes
+        assert {
+            member.path: (output_root / member.path).read_bytes() for member in artifact.members
+        } == committed_bytes
+        assert load_evaluation_artifact(output_root, artifact.manifest_path) == artifact
+
+    def test_finite_numpy_and_torch_scalars_remain_nested_json_values(
+        self, mock_evaluation_tracker: EvaluationTracker
+    ):
+        mock_evaluation_tracker.metrics_logger.metric_aggregated = {
+            "task": {
+                "numpy_float": np.float32(1.25),
+                "numpy_int": np.int64(2),
+                "numpy_bool": np.bool_(True),
+                "numpy_longdouble": np.longdouble("1.5"),
+                "numpy_longdouble_array": np.array(np.longdouble("2.5")),
+                "nested": [
+                    torch.tensor(3.5),
+                    {"torch_int": torch.tensor(4), "torch_bool": torch.tensor(True)},
+                ],
+            }
+        }
+
+        artifact = mock_evaluation_tracker.save()
+        output_root = Path(mock_evaluation_tracker.output_dir)
+        results = json.loads((output_root / artifact.results_path).read_text(encoding="utf-8"))
+        metrics = results["results"]["task"]
+
+        assert metrics == {
+            "nested": [3.5, {"torch_bool": True, "torch_int": 4}],
+            "numpy_bool": True,
+            "numpy_float": 1.25,
+            "numpy_int": 2,
+            "numpy_longdouble": 1.5,
+            "numpy_longdouble_array": 2.5,
+        }
+        assert isinstance(metrics["numpy_float"], float)
+        assert isinstance(metrics["numpy_bool"], bool)
+        assert isinstance(metrics["numpy_longdouble"], float)
+        assert isinstance(metrics["numpy_longdouble_array"], float)
+        assert isinstance(metrics["nested"][1]["torch_bool"], bool)
+
+    def test_save_results_directly_rejects_numpy_nan_without_output(self, mock_evaluation_tracker: EvaluationTracker):
+        with pytest.raises(EvaluationArtifactError, match="non-finite"):
+            mock_evaluation_tracker.save_results("stamp", {"metric": np.float32("nan")})
+
+        assert not (Path(mock_evaluation_tracker.output_dir) / "results").exists()
+
+    def test_artifact_manifest_commits_last_and_save_is_retryable(
+        self,
+        mock_evaluation_tracker: EvaluationTracker,
+        mock_datetime,
+        monkeypatch,
+    ):
+        from lighteval.logging import evaluation_tracker as tracker_module
+
+        original_atomic_write = tracker_module.atomic_write_bytes
+        failed = False
+
+        def fail_first_manifest(path, content):
+            nonlocal failed
+            if Path(path).name == "artifact.json" and not failed:
+                failed = True
+                raise OSError("simulated manifest commit interruption")
+            original_atomic_write(path, content)
+
+        monkeypatch.setattr(tracker_module, "atomic_write_bytes", fail_first_manifest)
+        with pytest.raises(OSError, match="simulated manifest"):
+            mock_evaluation_tracker.save()
+
+        output_root = Path(mock_evaluation_tracker.output_dir)
+        assert len(list(output_root.glob("results/**/*.json"))) == 1
+        assert not list(output_root.glob("artifacts/**/artifact.json"))
+
+        monkeypatch.setattr(tracker_module, "atomic_write_bytes", original_atomic_write)
+        artifact = mock_evaluation_tracker.save()
+        assert load_evaluation_artifact(output_root, artifact.manifest_path) == artifact
+
+    def test_results_template_cannot_escape_artifact_root(
+        self,
+        mock_evaluation_tracker: EvaluationTracker,
+        tmp_path,
+    ):
+        outside = tmp_path / "outside"
+        mock_evaluation_tracker.results_path_template = str(outside)
+
+        with pytest.raises(EvaluationArtifactError, match="escapes output directory"):
+            mock_evaluation_tracker.save()
+
+        assert not outside.exists()
 
     def test_results_logging_template(self, mock_evaluation_tracker: EvaluationTracker):
         task_metrics = {
@@ -136,7 +325,7 @@ class TestLogging:
         }
         mock_evaluation_tracker.details_logger.details = task_details
 
-        mock_evaluation_tracker.save()
+        artifact = mock_evaluation_tracker.save()
 
         date_id = mock_datetime.isoformat().replace(":", "-")
         details_dir = Path(mock_evaluation_tracker.output_dir) / "details" / "test_model" / date_id
@@ -148,6 +337,11 @@ class TestLogging:
             assert len(dataset) == 1
             assert int(dataset[0]["truncated"]) == task_details[task][0].truncated
             assert int(dataset[0]["padded"]) == task_details[task][0].padded
+
+        loaded = load_evaluation_artifact(Path(mock_evaluation_tracker.output_dir), artifact.manifest_path)
+        details_members = [member for member in loaded.members if member.role == "details"]
+        assert len(details_members) == 2
+        assert all(member.media_type == "application/vnd.apache.parquet" for member in details_members)
 
     @pytest.mark.evaluation_tracker(save_details=False)
     def test_no_details_output(self, mock_evaluation_tracker: EvaluationTracker):
@@ -300,6 +494,7 @@ class TestProperties(unittest.TestCase):
             "provider": None,
             "base_url": None,
             "api_key": None,
+            "use_chat_template": True,
             "system_prompt": ref_system_prompt,
             "generation_parameters": ref_generation_parameters,
         }  # ruff: noqa: E501

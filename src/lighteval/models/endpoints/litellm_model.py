@@ -21,11 +21,16 @@
 # SOFTWARE.
 
 import logging
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from json import JSONDecodeError
+from typing import Literal
 
+import httpx
 import requests
+from openai import OpenAI
 from tqdm import tqdm
 
 from lighteval.data import GenerativeTaskDataset
@@ -33,29 +38,99 @@ from lighteval.models.abstract_model import LightevalModel, ModelConfig
 from lighteval.models.model_output import ModelResponse
 from lighteval.tasks.prompt_manager import PromptManager
 from lighteval.tasks.requests import Doc, SamplingMethod
+from lighteval.tasks.rwkv_prompt import render_naive_prompt
 from lighteval.utils.cache_management import SampleCache, cached
 from lighteval.utils.imports import is_package_available, requires
 
 
 logger = logging.getLogger(__name__)
 
+
+class _OpenAIResponseCapture:
+    """Capture successful raw JSON before LiteLLM coerces response fields."""
+
+    def __init__(self, *, base_url: str | None, api_key: str | None, timeout: float | None):
+        self.status_code: int | None = None
+        self.payload: object = None
+        self._http_client = httpx.Client(timeout=timeout, event_hooks={"response": [self._capture]})
+        client_kwargs = {
+            "api_key": api_key,
+            "http_client": self._http_client,
+            "max_retries": 0,
+        }
+        if base_url is not None:
+            client_kwargs["base_url"] = base_url
+        self.client = OpenAI(**client_kwargs)
+
+    def reset(self) -> None:
+        self.status_code = None
+        self.payload = None
+
+    def close(self) -> None:
+        self.client.close()
+
+    def _capture(self, response: httpx.Response) -> None:
+        self.status_code = response.status_code
+        if response.is_success:
+            response.read()
+            try:
+                self.payload = response.json()
+            except ValueError:
+                self.payload = None
+
+
+@dataclass(frozen=True)
+class OpenAICompatibleRequest:
+    """Rendered input for an endpoint that performs its own tokenization."""
+
+    endpoint: Literal["/v1/chat/completions", "/v1/completions"]
+    model_input: str | list[dict[str, str]]
+    tokenization: Literal["server"] = "server"
+
+    def as_payload(self) -> dict[str, object]:
+        """Return the endpoint-specific input field."""
+        if self.endpoint == "/v1/completions":
+            if not isinstance(self.model_input, str):
+                raise TypeError("text completions require one plain-text prompt")
+            return {"prompt": self.model_input}
+        if not isinstance(self.model_input, list):
+            raise TypeError("chat completions require a message list")
+        return {"messages": self.model_input}
+
+
+def prepare_openai_compatible_request(
+    doc: Doc,
+    *,
+    prompt_manager: PromptManager,
+    use_chat_template: bool,
+) -> OpenAICompatibleRequest:
+    """Render a standard chat request or the RWKV naive text-completion path."""
+    if use_chat_template:
+        return OpenAICompatibleRequest(
+            endpoint="/v1/chat/completions",
+            model_input=prompt_manager.prepare_prompt_api(doc),
+        )
+    if prompt_manager.system_prompt is not None:
+        raise ValueError("naive completions do not accept a model system prompt")
+    return OpenAICompatibleRequest(
+        endpoint="/v1/completions",
+        model_input=render_naive_prompt(doc),
+    )
+
+
 if is_package_available("litellm"):
     import litellm
     from litellm import encode, supports_reasoning
-    from litellm.caching.caching import Cache, LiteLLMCacheType
-    from litellm.utils import ModelResponse as LitellmModelResponse
     from litellm.utils import get_max_tokens
 
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
     logging.getLogger("LiteLLM").handlers.clear()
 
-    litellm.cache = Cache(type=LiteLLMCacheType.DISK)
 else:
     from unittest.mock import Mock
 
     litellm = Mock()
     encode = Mock()
-    LitellmModelResponse = Mock()
 
 
 class LiteLLMModelConfig(ModelConfig):
@@ -96,6 +171,10 @@ class LiteLLMModelConfig(ModelConfig):
             Multiplier for increasing sleep time between retries. Default is 2.0.
         timeout (float):
             Request timeout in seconds. Default is None (no timeout).
+        use_chat_template (bool):
+            Send chat-template messages to ``/v1/chat/completions`` when true.
+            When false, render the complete task input as plain text and use
+            ``/v1/completions``. Default is true for upstream compatibility.
         generation_parameters (GenerationParameters, optional, defaults to empty GenerationParameters):
             Configuration parameters that control text generation behavior, including
             temperature, top_p, max_new_tokens, etc.
@@ -130,6 +209,7 @@ class LiteLLMModelConfig(ModelConfig):
     api_retry_sleep: float = 1.0
     api_retry_multiplier: float = 2.0
     timeout: float | None = None
+    use_chat_template: bool = True
 
 
 @requires("litellm")
@@ -153,13 +233,19 @@ class LiteLLMClient(LightevalModel):
         self.API_RETRY_SLEEP = config.api_retry_sleep
         self.API_RETRY_MULTIPLIER = config.api_retry_multiplier
         self.timeout = config.timeout
+        self.use_chat_template = config.use_chat_template
+
+        if not self.use_chat_template and config.system_prompt is not None:
+            raise ValueError("naive completions do not accept a model system prompt")
 
         self._tokenizer = encode
         self.pairwise_tokenization = False
         litellm.drop_params = True
         litellm.verbose = config.verbose
         self.prompt_manager = PromptManager(
-            use_chat_template=True, tokenizer=self.tokenizer, system_prompt=config.system_prompt
+            use_chat_template=self.use_chat_template,
+            tokenizer=self.tokenizer,
+            system_prompt=config.system_prompt,
         )
 
         # Initialize cache for tokenization and predictions
@@ -188,74 +274,262 @@ class LiteLLMClient(LightevalModel):
 
         return max_new_tokens
 
-    def __call_api(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence):  # noqa: C901
+    def __call_api(
+        self,
+        request: OpenAICompatibleRequest,
+        return_logits,
+        max_new_tokens,
+        num_samples,
+        stop_sequence,
+    ):  # noqa: C901
         """Make API call with retries."""
-        response = LitellmModelResponse()
         stop_sequence = self._prepare_stop_sequence(stop_sequence)
         max_new_tokens = self._prepare_max_new_tokens(max_new_tokens)
 
-        if return_logits and not self.provider == "openai":
-            logger.warning("Returning logits is not supported for this provider, ignoring.")
+        if return_logits and self.provider != "openai":
+            raise ValueError("token log probabilities require an OpenAI-compatible provider")
 
         # Prepare kwargs for completion call
         kwargs = {
             "model": self.model,
-            "messages": prompt,
-            "response_format": {"type": "text"},
             "max_tokens": max_new_tokens,
-            "logprobs": return_logits if self.provider == "openai" else None,
+            "logprobs": int(return_logits) if return_logits and self.provider == "openai" else None,
             "stop": stop_sequence,
             "base_url": self.base_url,
             "api_key": self.api_key,
             "n": num_samples,
-            "caching": True,
+            # LightEval owns sample caching. A second transport-level cache can
+            # replay malformed/error responses and bypass the explicit retry contract.
+            "caching": False,
+            "num_retries": 0,
             "timeout": self.timeout,
         }
+        kwargs.update(request.as_payload())
+        if request.endpoint == "/v1/chat/completions":
+            kwargs["response_format"] = {"type": "text"}
 
         if "o1" in self.model:
             logger.warning("O1 models do not support temperature, top_p, stop sequence. Disabling.")
         else:
             kwargs.update(self.generation_parameters.to_litellm_dict())
+            # Task stop sequences define the evaluation contract. Model-level
+            # defaults are used only when the task does not provide one.
+            if stop_sequence:
+                kwargs["stop"] = stop_sequence
 
-        if kwargs.get("max_completion_tokens", None) is None:
-            kwargs["max_completion_tokens"] = max_new_tokens
+        if request.endpoint == "/v1/chat/completions":
+            if kwargs.get("max_completion_tokens", None) is None:
+                kwargs["max_completion_tokens"] = max_new_tokens
+            completion = litellm.completion
+        else:
+            configured_max_tokens = kwargs.pop("max_completion_tokens", None)
+            if configured_max_tokens is not None:
+                kwargs["max_tokens"] = configured_max_tokens
+            completion = litellm.text_completion
 
+        response_capture = None
+        if self.provider == "openai":
+            response_capture = _OpenAIResponseCapture(
+                base_url=self.base_url,
+                api_key=self.api_key,
+                timeout=self.timeout,
+            )
+            kwargs["client"] = response_capture.client
+        try:
+            return self._invoke_with_retries(
+                completion,
+                kwargs,
+                endpoint=request.endpoint,
+                num_samples=num_samples,
+                return_logits=return_logits,
+                response_capture=response_capture,
+            )
+        finally:
+            if response_capture is not None:
+                response_capture.close()
+
+    def _invoke_with_retries(
+        self,
+        completion,
+        kwargs,
+        *,
+        endpoint,
+        num_samples,
+        return_logits,
+        response_capture,
+    ):
+        if self.API_MAX_RETRY < 1:
+            raise ValueError("api_max_retry must be at least one")
         for attempt in range(self.API_MAX_RETRY):
+            if response_capture is not None:
+                response_capture.reset()
             try:
-                response = litellm.completion(**kwargs)
-                content = response.choices[0].message.content
-
-                # If response is empty, retry without caching (maybe the error is recoverable and solved with a retry)
-                if not content:
-                    logger.info("Response is empty, retrying without caching")
-                    kwargs["caching"] = False
-                    response = litellm.completion(**kwargs)
-                    content = response.choices[0].message.content
-
+                response = completion(**kwargs)
+                self._validate_captured_response(response_capture, num_samples, return_logits)
+                self._validate_response(response, endpoint, num_samples, return_logits)
                 return response
-            except litellm.BadRequestError as e:
-                if "message" in e.__dict__:
-                    error_string = (
-                        "The response was filtered due to the prompt triggering Microsoft's content management policy"
-                    )
-                    if error_string in e.__dict__["message"]:
-                        logger.warning(f"{error_string}. Returning empty response.")
-                        return LitellmModelResponse()
-            except Exception as e:
+            except Exception as original_error:
+                schema_error = self._captured_schema_error(
+                    response_capture,
+                    num_samples,
+                    return_logits,
+                )
+                if isinstance(original_error, litellm.BadRequestError) and schema_error is None:
+                    raise
+                error = schema_error or original_error
+                if attempt + 1 == self.API_MAX_RETRY:
+                    raise error
                 wait_time = min(
                     64, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER**attempt)
                 )  # Exponential backoff with max 64s
                 logger.warning(
-                    f"Error in API call: {e}, waiting {wait_time} seconds before retry {attempt + 1}/{self.API_MAX_RETRY}"
+                    f"Error in API call: {error}, waiting {wait_time} seconds before retry {attempt + 1}/{self.API_MAX_RETRY}"
                 )
                 time.sleep(wait_time)
 
-        logger.error(f"API call failed after {self.API_MAX_RETRY} attempts, returning empty response.")
-        return LitellmModelResponse()
+        raise AssertionError("unreachable API retry state")
+
+    @classmethod
+    def _captured_schema_error(cls, response_capture, num_samples, return_logits):
+        try:
+            cls._validate_captured_response(response_capture, num_samples, return_logits)
+        except ValueError as error:
+            return error
+        return None
+
+    @classmethod
+    def _validate_captured_response(cls, response_capture, num_samples, return_logits) -> None:
+        if response_capture is None or response_capture.status_code is None or response_capture.status_code >= 300:
+            return
+        payload = response_capture.payload
+        if not isinstance(payload, dict):
+            raise ValueError("endpoint returned malformed raw JSON")
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or len(choices) != num_samples:
+            raise ValueError("endpoint returned malformed raw choices")
+        for choice in choices:
+            cls._validate_raw_choice(choice, return_logits)
+
+    @classmethod
+    def _validate_raw_choice(cls, choice, return_logits) -> None:
+        if not isinstance(choice, dict):
+            raise ValueError("endpoint returned a malformed raw completion choice")
+        cls._validate_raw_logprobs(choice.get("logprobs"), required=return_logits)
+        cls._validate_finish_reason(choice.get("finish_reason"))
+        cls._validate_stop_reason(choice.get("stop_reason"))
+        token_ids = choice.get("token_ids")
+        if token_ids is not None:
+            if not isinstance(token_ids, list):
+                raise ValueError("endpoint returned a malformed terminal token id")
+            if token_ids:
+                cls._validate_terminal_token_id(token_ids[-1])
+
+    @staticmethod
+    def _validate_raw_logprobs(logprobs, *, required: bool) -> None:
+        if logprobs is None:
+            if required:
+                raise ValueError("endpoint omitted requested token log probabilities")
+            return
+        if not isinstance(logprobs, dict) or not isinstance(logprobs.get("token_logprobs"), list):
+            raise ValueError("endpoint returned malformed token log probabilities")
+        for value in logprobs["token_logprobs"]:
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int | float) or not math.isfinite(value)
+            ):
+                raise ValueError("endpoint returned malformed token log probabilities")
+
+    @classmethod
+    def _validate_response(cls, response, endpoint: str, num_samples: int, return_logits: bool) -> None:
+        choices = getattr(response, "choices", None)
+        if not isinstance(choices, list) or len(choices) != num_samples:
+            raise ValueError(
+                f"endpoint returned {0 if not isinstance(choices, list) else len(choices)} choices, expected {num_samples}"
+            )
+        for choice in choices:
+            content = cls._choice_content(choice, endpoint)
+            if not isinstance(content, str):
+                raise ValueError("endpoint returned a missing or malformed completion choice")
+            if return_logits:
+                token_logprobs = cls._choice_token_logprobs(choice)
+                if not token_logprobs:
+                    raise ValueError("endpoint omitted requested token log probabilities")
+            cls._choice_finish_reason(choice)
+            cls._choice_stop_reason(choice)
+            cls._choice_terminal_token_id(choice)
+
+    @staticmethod
+    def _choice_content(choice, endpoint: str) -> str | None:
+        if endpoint == "/v1/completions":
+            return LiteLLMClient._response_field(choice, "text")
+        message = LiteLLMClient._response_field(choice, "message")
+        return LiteLLMClient._response_field(message, "content")
+
+    @staticmethod
+    def _response_field(value, name: str):
+        if isinstance(value, dict):
+            return value.get(name)
+        field = getattr(value, name, None)
+        if field is not None:
+            return field
+        model_extra = getattr(value, "model_extra", None)
+        return model_extra.get(name) if isinstance(model_extra, dict) else None
+
+    @classmethod
+    def _choice_token_logprobs(cls, choice) -> list[float | None]:
+        logprobs = cls._response_field(choice, "logprobs")
+        values = cls._response_field(logprobs, "token_logprobs")
+        if not isinstance(values, list):
+            return []
+        parsed: list[float | None] = []
+        for value in values:
+            if value is None:
+                parsed.append(None)
+            elif isinstance(value, bool):
+                raise ValueError("endpoint returned malformed token log probabilities")
+            elif isinstance(value, int | float) and math.isfinite(value):
+                parsed.append(float(value))
+            else:
+                raise ValueError("endpoint returned malformed token log probabilities")
+        return parsed
+
+    @classmethod
+    def _choice_finish_reason(cls, choice) -> str | None:
+        return cls._validate_finish_reason(cls._response_field(choice, "finish_reason"))
+
+    @staticmethod
+    def _validate_finish_reason(finish_reason) -> str | None:
+        if finish_reason is not None and not isinstance(finish_reason, str):
+            raise ValueError("endpoint returned a malformed finish reason")
+        return finish_reason
+
+    @classmethod
+    def _choice_stop_reason(cls, choice) -> str | int | None:
+        return cls._validate_stop_reason(cls._response_field(choice, "stop_reason"))
+
+    @staticmethod
+    def _validate_stop_reason(stop_reason) -> str | int | None:
+        if isinstance(stop_reason, bool) or (stop_reason is not None and not isinstance(stop_reason, str | int)):
+            raise ValueError("endpoint returned a malformed stop reason")
+        return stop_reason
+
+    @classmethod
+    def _choice_terminal_token_id(cls, choice) -> int | None:
+        token_ids = cls._response_field(choice, "token_ids")
+        if not isinstance(token_ids, list) or not token_ids:
+            return None
+        return cls._validate_terminal_token_id(token_ids[-1])
+
+    @staticmethod
+    def _validate_terminal_token_id(terminal_token_id) -> int | None:
+        if terminal_token_id is None:
+            return None
+        if not isinstance(terminal_token_id, int) or isinstance(terminal_token_id, bool):
+            raise ValueError("endpoint returned a malformed terminal token id")
+        return terminal_token_id
 
     def __call_api_parallel(
         self,
-        prompts,
+        requests,
         return_logits: bool | list[bool],
         max_new_tokens: int | list[int] | None,
         num_samples: int | list[int],
@@ -263,33 +537,40 @@ class LiteLLMClient(LightevalModel):
     ):
         results = []
 
-        return_logitss = [return_logits for _ in prompts] if not isinstance(return_logits, list) else return_logits
-        max_new_tokenss = [max_new_tokens for _ in prompts] if not isinstance(max_new_tokens, list) else max_new_tokens
-        num_sampless = [num_samples for _ in prompts] if not isinstance(num_samples, list) else num_samples
-        stop_sequencess = [stop_sequence for _ in prompts]
+        return_logitss = [return_logits for _ in requests] if not isinstance(return_logits, list) else return_logits
+        max_new_tokenss = (
+            [max_new_tokens for _ in requests] if not isinstance(max_new_tokens, list) else max_new_tokens
+        )
+        num_sampless = [num_samples for _ in requests] if not isinstance(num_samples, list) else num_samples
+        stop_sequencess = [stop_sequence for _ in requests]
         assert (
-            len(prompts) == len(return_logitss) == len(max_new_tokenss) == len(num_sampless) == len(stop_sequencess)
+            len(requests) == len(return_logitss) == len(max_new_tokenss) == len(num_sampless) == len(stop_sequencess)
         ), (
-            f"Length of prompts, return_logitss, max_new_tokenss, num_sampless, stop_sequences, system_prompts should be the same but are {len(prompts)}, {len(return_logitss)}, {len(max_new_tokenss)}, {len(num_sampless)}, {len(stop_sequencess)}"
+            "Length of requests, return_logitss, max_new_tokenss, "
+            "num_sampless, stop_sequences should be the same but are "
+            f"{len(requests)}, {len(return_logitss)}, {len(max_new_tokenss)}, "
+            f"{len(num_sampless)}, {len(stop_sequencess)}"
         )
 
         with ThreadPoolExecutor(self.concurrent_requests) as executor:
             for entry in tqdm(
                 executor.map(
                     self.__call_api,
-                    prompts,
+                    requests,
                     return_logitss,
                     max_new_tokenss,
                     num_sampless,
                     stop_sequencess,
                 ),
-                total=len(prompts),
+                total=len(requests),
             ):
                 results.append(entry)
 
         if None in results:
             raise ValueError("Some entries are not annotated due to errors in annotate_p, please inspect and retry.")
 
+        if len(results) != len(requests):
+            raise ValueError(f"endpoint returned {len(results)} responses for {len(requests)} requests")
         return results
 
     def estimate_context_length(self) -> int:
@@ -347,7 +628,16 @@ class LiteLLMClient(LightevalModel):
             position=0,
             disable=self.disable_tqdm,
         ):
-            contexts = [self.prompt_manager.prepare_prompt_api(doc) for doc in dataset]
+            split_docs = list(split)
+            requests = [
+                prepare_openai_compatible_request(
+                    doc,
+                    prompt_manager=self.prompt_manager,
+                    use_chat_template=self.use_chat_template,
+                )
+                for doc in split_docs
+            ]
+            contexts = [request.model_input for request in requests]
             max_new_tokens = split[0].generation_size  # could be none
             return_logits = split[0].use_logits
             num_samples = split[0].num_samples
@@ -358,19 +648,36 @@ class LiteLLMClient(LightevalModel):
                     "num_samples > 1 is not supported with temperature=0, please set temperature > 0 or use non sampling metrics."
                 )
 
-            responses = self.__call_api_parallel(contexts, return_logits, max_new_tokens, num_samples, stop_sequence)
+            responses = self.__call_api_parallel(requests, return_logits, max_new_tokens, num_samples, stop_sequence)
+            if len(responses) != len(requests):
+                raise ValueError(f"endpoint returned {len(responses)} responses for {len(requests)} requests")
 
             for response, context in zip(responses, contexts):
-                result: list[str] = [choice.message.content for choice in response.choices]
-                reasonings: list[str | None] = [
-                    getattr(choice.message, "reasoning_content", None) for choice in response.choices
-                ]
+                if self.use_chat_template:
+                    result: list[str] = [
+                        self._choice_content(choice, "/v1/chat/completions") for choice in response.choices
+                    ]
+                    reasonings: list[str | None] = [
+                        self._response_field(self._response_field(choice, "message"), "reasoning_content")
+                        for choice in response.choices
+                    ]
+                else:
+                    result = [self._choice_content(choice, "/v1/completions") for choice in response.choices]
+                    reasonings = [self._response_field(choice, "reasoning_content") for choice in response.choices]
+
+                token_logprobs = [self._choice_token_logprobs(choice) for choice in response.choices]
+                finish_reasons = [self._choice_finish_reason(choice) for choice in response.choices]
+                stop_reasons = [self._choice_stop_reason(choice) for choice in response.choices]
+                terminal_token_ids = [self._choice_terminal_token_id(choice) for choice in response.choices]
 
                 cur_response = ModelResponse(
-                    # In empty responses, the model should return an empty string instead of None
-                    text=result if result[0] else [""],
+                    text=result,
                     reasonings=reasonings,
                     input=context,
+                    token_logprobs=token_logprobs,
+                    finish_reasons=finish_reasons,
+                    stop_reasons=stop_reasons,
+                    terminal_token_ids=terminal_token_ids,
                 )
                 results.append(cur_response)
 

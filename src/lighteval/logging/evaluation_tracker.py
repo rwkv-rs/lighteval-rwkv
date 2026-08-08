@@ -22,6 +22,7 @@
 
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -31,11 +32,19 @@ from enum import Enum
 from io import BytesIO
 from pathlib import Path
 
+import numpy as np
 import torch
 from datasets import Dataset, load_dataset
 from datasets.utils.metadata import MetadataConfigs
 from huggingface_hub import DatasetCard, DatasetCardData, HfApi, HFSummaryWriter, hf_hub_url
 
+from lighteval.logging.evaluation_artifact import (
+    EvaluationArtifact,
+    EvaluationArtifactError,
+    atomic_write_bytes,
+    build_artifact_member,
+    load_evaluation_artifact,
+)
 from lighteval.logging.info_loggers import (
     DetailsLogger,
     GeneralConfigLogger,
@@ -48,6 +57,7 @@ from lighteval.utils.utils import obj_to_markdown
 
 
 logger = logging.getLogger(__name__)
+_UNHANDLED_RESULT_VALUE = object()
 
 if is_package_available("nanotron"):
     from nanotron.config import GeneralArgs  # type: ignore
@@ -90,6 +100,57 @@ class EnhancedJSONEncoder(json.JSONEncoder):
         except TypeError:
             # For classes without json serialization
             return type(o).__name__
+
+
+def _normalize_results_tree(value: object) -> object:
+    """Convert finite scalar results to canonical JSON-native values.
+
+    NumPy and Torch arrays are accepted only when they are zero-dimensional
+    scalars. This prevents their string representations from turning invalid
+    numerical results into apparently valid publication artifacts.
+    """
+    scalar = _normalize_result_scalar(value)
+    if scalar is not _UNHANDLED_RESULT_VALUE:
+        return scalar
+    if isinstance(value, dict):
+        return {key: _normalize_results_tree(item) for key, item in value.items()}
+    if isinstance(value, list | tuple):
+        return [_normalize_results_tree(item) for item in value]
+    if is_dataclass(value):
+        return _normalize_results_tree(asdict(value))
+    return value
+
+
+def _normalize_result_scalar(value: object) -> object:
+    if isinstance(value, np.ndarray):
+        if value.ndim != 0:
+            raise EvaluationArtifactError("evaluation results cannot contain NumPy arrays")
+        return _normalize_numpy_scalar(value)
+    if isinstance(value, np.generic):
+        return _normalize_numpy_scalar(value)
+    if isinstance(value, torch.Tensor):
+        if value.ndim != 0:
+            raise EvaluationArtifactError("evaluation results cannot contain Torch tensors with dimensions")
+        return _normalize_results_tree(value.item())
+    if isinstance(value, float) and not math.isfinite(value):
+        raise EvaluationArtifactError("evaluation results contain a non-finite number")
+    if value is None or isinstance(value, str | bool | int | float):
+        return value
+    return _UNHANDLED_RESULT_VALUE
+
+
+def _normalize_numpy_scalar(value: np.ndarray | np.generic) -> bool | int | float:
+    scalar_kind = value.dtype.kind
+    if scalar_kind == "b":
+        return bool(value)
+    if scalar_kind in {"i", "u"}:
+        return int(value)
+    if scalar_kind == "f":
+        normalized = float(value)
+        if math.isfinite(normalized):
+            return normalized
+        raise EvaluationArtifactError("evaluation results contain a non-finite number")
+    raise EvaluationArtifactError(f"evaluation results contain unsupported NumPy scalar dtype {value.dtype}")
 
 
 class EvaluationTracker:
@@ -244,12 +305,18 @@ class EvaluationTracker:
             pprint(model_response.input)
             pprint(metrics)
 
-    def save(self) -> None:
-        """Saves the experiment information and results to files, and to the hub if requested."""
+    def save(self, *, publication_requested: bool = False) -> EvaluationArtifact:
+        """Save standard outputs and return their canonical local artifact.
+
+        ``publication_requested`` only records an explicit publication intent.
+        Network publication remains a separate caller-owned step and therefore
+        cannot prevent standard results and details from being retained.
+        """
         logger.info("Saving experiment tracker")
+        output_root = self._local_artifact_root()
         date_id = datetime.now().isoformat().replace(":", "-")
 
-        results_dict = self.results
+        results_dict = _normalize_results_tree(self.results)
 
         # Create the details datasets for later upload
         details_datasets: dict[str, Dataset] = {}
@@ -267,10 +334,45 @@ class EvaluationTracker:
             details_datasets[task_name] = dataset
 
         # We save results at every case
-        self.save_results(date_id, results_dict)
+        results_path = self.save_results(date_id, results_dict)
 
+        details_paths: tuple[Path, ...] = ()
         if self.should_save_details:
-            self.save_details(date_id, details_datasets)
+            details_paths = self.save_details(date_id, details_datasets)
+
+        manifest_path = (
+            Path(self.output_dir)
+            / "artifacts"
+            / self.general_config_logger.model_name.strip("/")
+            / date_id
+            / "artifact.json"
+        )
+        manifest_path = self._artifact_output_path(manifest_path)
+        manifest_relative_path = manifest_path.relative_to(output_root).as_posix()
+        members = [
+            build_artifact_member(
+                output_root,
+                results_path,
+                role="results",
+                media_type="application/json",
+            )
+        ]
+        members.extend(
+            build_artifact_member(
+                output_root,
+                details_path,
+                role="details",
+                media_type="application/vnd.apache.parquet",
+            )
+            for details_path in sorted(details_paths)
+        )
+        artifact = EvaluationArtifact(
+            manifest_path=manifest_relative_path,
+            members=tuple(members),
+            publication_requested=publication_requested,
+        )
+        atomic_write_bytes(manifest_path, artifact.canonical_json() + b"\n")
+        artifact = load_evaluation_artifact(output_root, manifest_relative_path)
 
         if self.should_push_to_hub:
             self.push_to_hub(
@@ -290,6 +392,26 @@ class EvaluationTracker:
                 results=self.metrics_logger.metric_aggregated, details=self.details_logger.compiled_details
             )
 
+        return artifact
+
+    def _local_artifact_root(self) -> Path:
+        """Return the local root required by the atomic artifact contract."""
+        protocol = self.fs.protocol
+        protocols = {protocol} if isinstance(protocol, str) else set(protocol)
+        if not protocols.intersection({"file", "local"}):
+            raise EvaluationArtifactError("atomic evaluation artifacts require a local output directory")
+        return Path(self.output_dir).resolve()
+
+    def _artifact_output_path(self, path: str | Path) -> Path:
+        """Resolve one output path and reject publication outside its root."""
+        output_root = self._local_artifact_root()
+        resolved = Path(path).resolve()
+        try:
+            resolved.relative_to(output_root)
+        except ValueError as error:
+            raise EvaluationArtifactError("evaluation artifact path escapes output directory") from error
+        return resolved
+
     def push_to_wandb(self, results_dict: dict, details_datasets: dict) -> None:
         # reformat the results key to replace ':' with '/'
         results_dict = {k.replace(":", "/"): v for k, v in results_dict["results"].items()}
@@ -299,7 +421,8 @@ class EvaluationTracker:
         )
         self.wandb_run.finish()
 
-    def save_results(self, date_id: str, results_dict: dict):
+    def save_results(self, date_id: str, results_dict: dict) -> Path:
+        results_dict = _normalize_results_tree(results_dict)
         if self.results_path_template is not None:
             org_model_parts = self.general_config_logger.model_name.split("/")
             org = org_model_parts[0] if len(org_model_parts) >= 2 else ""
@@ -308,11 +431,21 @@ class EvaluationTracker:
             output_dir_results = Path(self.results_path_template.format(output_dir=output_dir, org=org, model=model))
         else:
             output_dir_results = Path(self.output_dir) / "results" / self.general_config_logger.model_name.strip("/")
-        self.fs.mkdirs(output_dir_results, exist_ok=True)
-        output_results_file = output_dir_results / f"results_{date_id}.json"
+        output_results_file = self._artifact_output_path(output_dir_results / f"results_{date_id}.json")
         logger.info(f"Saving results to {output_results_file}")
-        with self.fs.open(output_results_file, "w") as f:
-            f.write(json.dumps(results_dict, cls=EnhancedJSONEncoder, indent=2, ensure_ascii=False))
+        try:
+            results_bytes = json.dumps(
+                results_dict,
+                cls=EnhancedJSONEncoder,
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode()
+        except (TypeError, ValueError) as error:
+            raise EvaluationArtifactError("evaluation results are not canonical finite JSON") from error
+        atomic_write_bytes(output_results_file, results_bytes + b"\n")
+        return output_results_file
 
     def _get_details_sub_folder(self, date_id: str):
         output_dir_details = Path(self.output_dir) / "details" / self.general_config_logger.model_name.strip("/")
@@ -351,14 +484,19 @@ class EvaluationTracker:
                 )
         return details_datasets
 
-    def save_details(self, date_id: str, details_datasets: dict[str, Dataset]):
+    def save_details(self, date_id: str, details_datasets: dict[str, Dataset]) -> tuple[Path, ...]:
         output_dir_details_sub_folder = self._get_details_sub_folder(date_id)
-        self.fs.mkdirs(output_dir_details_sub_folder, exist_ok=True)
         logger.info(f"Saving details to {output_dir_details_sub_folder}")
+        output_files = []
         for task_name, dataset in details_datasets.items():
-            output_file_details = output_dir_details_sub_folder / f"details_{task_name}_{date_id}.parquet"
-            with self.fs.open(str(output_file_details), "wb") as f:
-                dataset.to_parquet(f)
+            output_file_details = self._artifact_output_path(
+                output_dir_details_sub_folder / f"details_{task_name}_{date_id}.parquet"
+            )
+            parquet_bytes = BytesIO()
+            dataset.to_parquet(parquet_bytes)
+            atomic_write_bytes(output_file_details, parquet_bytes.getvalue())
+            output_files.append(output_file_details)
+        return tuple(output_files)
 
     def generate_final_dict(self) -> dict:
         """Aggregates and returns all the logger's experiment information in a dictionary.
