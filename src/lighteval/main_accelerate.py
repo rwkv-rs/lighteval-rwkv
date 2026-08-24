@@ -27,6 +27,7 @@ from typing_extensions import Annotated
 
 from lighteval.cli_args import (
     HELP_PANEL_NAME_4,
+    convert_logprob_choices_to_generation,
     custom_tasks,
     dataset_loading_processes,
     job_id,
@@ -67,6 +68,7 @@ def accelerate(  # noqa C901
     load_responses_from_details_date_id: load_responses_from_details_date_id.type = load_responses_from_details_date_id.default,
     remove_reasoning_tags: remove_reasoning_tags.type = remove_reasoning_tags.default,
     reasoning_tags: reasoning_tags.type = reasoning_tags.default,
+    convert_logprob_choices_to_generation: convert_logprob_choices_to_generation.type = convert_logprob_choices_to_generation.default,
     # === saving ===
     output_dir: output_dir.type = output_dir.default,
     results_path_template: results_path_template.type = results_path_template.default,
@@ -116,6 +118,7 @@ def accelerate(  # noqa C901
         remove_reasoning_tags=remove_reasoning_tags,
         reasoning_tags=reasoning_tags,
         load_responses_from_details_date_id=load_responses_from_details_date_id,
+        convert_logprob_choices_to_generation=convert_logprob_choices_to_generation,
     )
 
     if model_args.endswith(".yaml"):

@@ -26,6 +26,7 @@ import collections
 import copy
 import os
 import random
+import re
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import Enum, auto
@@ -35,6 +36,8 @@ from tqdm import tqdm
 
 from lighteval.logging.evaluation_tracker import EvaluationTracker
 from lighteval.metrics import apply_metric
+from lighteval.metrics.metrics_sample import ExactMatches
+from lighteval.metrics.utils.metric_utils import SampleLevelMetric
 from lighteval.models.abstract_model import LightevalModel, ModelConfig
 from lighteval.models.model_loader import TransformersModel, load_model
 from lighteval.models.model_output import (
@@ -72,6 +75,121 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+_RWKV_CHOICE_GENERATION_SIZE = 8192
+_CHOICE_MARKUP = re.compile(r"\*\*|__|`+")
+_CHOICE_BOXED = re.compile(
+    r"\\boxed\{\s*(?:([A-Z])|\\(?:text|mathrm)\{\s*([A-Z])\s*\})\s*\}",
+    re.IGNORECASE,
+)
+_CHOICE_EXPLICIT = re.compile(
+    r"^\s*(?:(?:thus|therefore|hence|so)[,:]?\s+)?(?:the\s+)?"
+    r"(?:(?:final|correct)\s+)?(?:answer|choice|option)"
+    r"\s*(?:is|:|=)\s*([A-Z])\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+_CHOICE_BARE = re.compile(
+    r"^\s*(?:([A-Z])\.?|\(([A-Z])\)|\[([A-Z])\])\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_multiselect(doc) -> bool:
+    gold = doc.gold_index
+    return (
+        isinstance(doc.choices, list)
+        and isinstance(gold, (list, tuple))
+        and len(gold) > 1
+        and all(
+            isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(doc.choices) for index in gold
+        )
+        and SamplingMethod.LOGPROBS in doc.sampling_methods
+        and SamplingMethod.GENERATIVE not in doc.sampling_methods
+    )
+
+
+def _is_single_choice(doc) -> bool:
+    gold = doc.gold_index
+    if (
+        isinstance(gold, (list, tuple))
+        and len(gold) == 1
+        and isinstance(gold[0], int)
+        and not isinstance(gold[0], bool)
+    ):
+        gold = gold[0]
+    return (
+        isinstance(doc.query, str)
+        and isinstance(doc.choices, list)
+        and 2 <= len(doc.choices) <= 26
+        and all(isinstance(choice, str) and choice.strip() for choice in doc.choices)
+        and isinstance(gold, int)
+        and not isinstance(gold, bool)
+        and 0 <= gold < len(doc.choices)
+        and SamplingMethod.LOGPROBS in doc.sampling_methods
+        and SamplingMethod.GENERATIVE not in doc.sampling_methods
+    )
+
+
+def _convert_choice(doc) -> None:
+    labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[: len(doc.choices)]
+    options = "\n".join(f"{label}. {choice.strip()}" for label, choice in zip(labels, doc.choices, strict=True))
+    doc.query = f'{doc.query.rstrip()}\n\n{options}\n\nAfter reasoning, end with "Answer: <letter>".'
+    doc.sampling_methods = list(
+        dict.fromkeys(
+            SamplingMethod.GENERATIVE if method == SamplingMethod.LOGPROBS else method
+            for method in doc.sampling_methods
+        )
+    )
+    doc.generation_size = _RWKV_CHOICE_GENERATION_SIZE
+    doc.stop_sequences = []
+    doc.specific = dict(doc.specific or {}, rwkv_choice=True)
+
+
+def _choice_metrics(metric):
+    names = (metric.metric_name,) if isinstance(metric.metric_name, str) else tuple(metric.metric_name)
+    grouped = not isinstance(metric.metric_name, str)
+    return tuple(
+        SampleLevelMetric(
+            metric_name=name,
+            sample_level_fn=ExactMatches(),
+            category=SamplingMethod.GENERATIVE,
+            corpus_level_fn=metric.corpus_level_fn[name] if grouped else metric.corpus_level_fn,
+            higher_is_better=metric.higher_is_better[name] if grouped else metric.higher_is_better,
+        )
+        for name in names
+    )
+
+
+def _effective_output_limit(model, doc) -> int | None:
+    generation_parameters = getattr(getattr(model, "config", None), "generation_parameters", None)
+    limit = getattr(generation_parameters, "max_new_tokens", None)
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        limit = doc.generation_size
+    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
+        return None
+    return limit
+
+
+def _choice_answer(raw: str, tokens: list[int], choices: list[str], output_limit: int | None) -> str:
+    if (
+        not isinstance(raw, str)
+        or not tokens
+        or output_limit is None
+        or len(tokens) >= output_limit
+        or raw.count("</think>") != 1
+    ):
+        return ""
+    suffix = _CHOICE_MARKUP.sub("", raw.split("</think>", 1)[1])
+    matches = [value.upper() for match in _CHOICE_BOXED.finditer(suffix) for value in match.groups() if value]
+    matches.extend(match.group(1).upper() for match in _CHOICE_EXPLICIT.finditer(suffix))
+    if match := _CHOICE_BARE.fullmatch(suffix):
+        matches.extend(value.upper() for value in match.groups() if value)
+    if len(set(matches)) != 1:
+        return ""
+    label = matches[0]
+    labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[: len(choices)]
+    return choices[labels.index(label)] if label in labels else ""
+
+
 class ParallelismManager(Enum):
     ACCELERATE = auto()
     NANOTRON = auto()
@@ -102,6 +220,7 @@ class PipelineParameters:
     load_tasks_multilingual: bool = False
     task_prompt: str | None = None
     task_prompt_mode: str | TaskPromptMode | None = None
+    convert_logprob_choices_to_generation: bool = False
 
     def __post_init__(self):  # noqa C901
         task_prompt_configured = self.task_prompt is not None
@@ -244,6 +363,12 @@ class Pipeline:
         }
         if self.pipeline_parameters.task_prompt is not None:
             self._apply_task_prompt_override()
+        logger.info(
+            "convert_logprob_choices_to_generation: %s, recommended value for RWKV models: True",
+            self.pipeline_parameters.convert_logprob_choices_to_generation,
+        )
+        if self.pipeline_parameters.convert_logprob_choices_to_generation:
+            self._prepare_single_choice_tasks()
 
         self.sampling_docs = collections.defaultdict(list)
         for _, docs in self.documents_dict.items():
@@ -257,6 +382,38 @@ class Pipeline:
             self._update_num_samples(list(self.tasks_dict.values()))
 
         self.evaluation_tracker.task_config_logger.log(self.tasks_dict)
+
+    def _prepare_single_choice_tasks(self):
+        for task in self.tasks_dict.values():
+            original_docs = self.documents_dict[task.full_name]
+            docs = [doc for doc in original_docs if not _is_multiselect(doc)]
+            if not docs:
+                raise ValueError(f"task {task.full_name} contains no supported documents")
+
+            choice_docs = [doc for doc in docs if _is_single_choice(doc)]
+            convert_choices = bool(choice_docs) and not any(
+                SamplingMethod.GENERATIVE in doc.sampling_methods for doc in docs
+            )
+            if len(docs) != len(original_docs) or convert_choices:
+                task.config = copy.copy(task.config)
+                task.config.original_num_docs = len(original_docs)
+                task.config.effective_num_docs = len(docs)
+                self.documents_dict[task.full_name] = docs
+
+            if not convert_choices:
+                continue
+
+            for doc in choice_docs:
+                _convert_choice(doc)
+            converted_metrics = []
+            for metric in task.metrics:
+                if metric.category == SamplingMethod.LOGPROBS:
+                    converted_metrics.extend(_choice_metrics(metric))
+                else:
+                    converted_metrics.append(metric)
+            task.metrics = tuple(converted_metrics)
+            task.config.metrics = task.metrics
+            task.sampling_methods = list(dict.fromkeys(metric.category for metric in task.metrics))
 
     def _apply_task_prompt_override(self):
         task_prompt = self.pipeline_parameters.task_prompt
@@ -398,6 +555,24 @@ class Pipeline:
                         )
                         for text in response.text
                     ]
+
+        if not self.pipeline_parameters.convert_logprob_choices_to_generation:
+            return
+
+        responses = sampling_method_responses.get(SamplingMethod.GENERATIVE, [])
+        for doc, response in zip(self.sampling_docs.get(SamplingMethod.GENERATIVE, []), responses):
+            if not isinstance(doc.specific, dict) or doc.specific.get("rwkv_choice") is not True:
+                continue
+            output_limit = _effective_output_limit(self.model, doc)
+            response.text_post_processed = [
+                _choice_answer(
+                    text,
+                    response.output_tokens[index] if index < len(response.output_tokens) else [],
+                    doc.choices,
+                    output_limit,
+                )
+                for index, text in enumerate(response.text)
+            ]
 
     def _compute_metrics(self, sampling_method_responses: dict[str, list[ModelResponse]]):
         # To compute the metrics we first group the samples and task and then by metrics.

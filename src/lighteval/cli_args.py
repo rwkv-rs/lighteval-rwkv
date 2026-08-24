@@ -113,6 +113,17 @@ reasoning_tags = Arg(
     default="[('<think>', '</think>')]",
 )
 
+convert_logprob_choices_to_generation = Arg(
+    type=Annotated[
+        bool,
+        Option(
+            help="Convert log-probability single-choice tasks to generation. Recommended for RWKV models.",
+            rich_help_panel=HELP_PANEL_NAME_1,
+        ),
+    ],
+    default=False,
+)
+
 load_tasks_multilingual = Arg(
     type=Annotated[
         bool,

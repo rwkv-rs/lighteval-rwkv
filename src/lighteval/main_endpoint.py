@@ -27,6 +27,7 @@ from typing_extensions import Annotated
 
 from lighteval.cli_args import (
     HELP_PANEL_NAME_4,
+    convert_logprob_choices_to_generation,
     custom_tasks,
     dataset_loading_processes,
     job_id,
@@ -73,6 +74,7 @@ def inference_endpoint(
     load_responses_from_details_date_id: load_responses_from_details_date_id.type = load_responses_from_details_date_id.default,
     remove_reasoning_tags: remove_reasoning_tags.type = remove_reasoning_tags.default,
     reasoning_tags: reasoning_tags.type = reasoning_tags.default,
+    convert_logprob_choices_to_generation: convert_logprob_choices_to_generation.type = convert_logprob_choices_to_generation.default,
     # === saving ===
     output_dir: output_dir.type = output_dir.default,
     results_path_template: results_path_template.type = results_path_template.default,
@@ -124,6 +126,7 @@ def inference_endpoint(
         remove_reasoning_tags=remove_reasoning_tags,
         reasoning_tags=reasoning_tags,
         load_tasks_multilingual=load_tasks_multilingual,
+        convert_logprob_choices_to_generation=convert_logprob_choices_to_generation,
     )
     pipeline = Pipeline(
         tasks=tasks,
@@ -158,6 +161,7 @@ def tgi(
     load_responses_from_details_date_id: load_responses_from_details_date_id.type = load_responses_from_details_date_id.default,
     remove_reasoning_tags: remove_reasoning_tags.type = remove_reasoning_tags.default,
     reasoning_tags: reasoning_tags.type = reasoning_tags.default,
+    convert_logprob_choices_to_generation: convert_logprob_choices_to_generation.type = convert_logprob_choices_to_generation.default,
     # === saving ===
     output_dir: output_dir.type = output_dir.default,
     results_path_template: results_path_template.type = results_path_template.default,
@@ -206,6 +210,7 @@ def tgi(
         load_responses_from_details_date_id=load_responses_from_details_date_id,
         remove_reasoning_tags=remove_reasoning_tags,
         reasoning_tags=reasoning_tags,
+        convert_logprob_choices_to_generation=convert_logprob_choices_to_generation,
     )
     pipeline = Pipeline(
         tasks=tasks,
@@ -243,6 +248,7 @@ def litellm(
     load_responses_from_details_date_id: load_responses_from_details_date_id.type = load_responses_from_details_date_id.default,
     remove_reasoning_tags: remove_reasoning_tags.type = remove_reasoning_tags.default,
     reasoning_tags: reasoning_tags.type = reasoning_tags.default,
+    convert_logprob_choices_to_generation: convert_logprob_choices_to_generation.type = convert_logprob_choices_to_generation.default,
     # === saving ===
     output_dir: output_dir.type = output_dir.default,
     results_path_template: results_path_template.type = results_path_template.default,
@@ -300,6 +306,7 @@ def litellm(
         load_responses_from_details_date_id=load_responses_from_details_date_id,
         remove_reasoning_tags=remove_reasoning_tags,
         reasoning_tags=reasoning_tags,
+        convert_logprob_choices_to_generation=convert_logprob_choices_to_generation,
     )
     pipeline = Pipeline(
         tasks=tasks,
@@ -346,6 +353,7 @@ def inference_providers(
     wandb: wandb.type = wandb.default,
     remove_reasoning_tags: remove_reasoning_tags.type = remove_reasoning_tags.default,
     reasoning_tags: reasoning_tags.type = reasoning_tags.default,
+    convert_logprob_choices_to_generation: convert_logprob_choices_to_generation.type = convert_logprob_choices_to_generation.default,
     # === debug ===
     max_samples: max_samples.type = max_samples.default,
     job_id: job_id.type = job_id.default,
@@ -390,6 +398,7 @@ def inference_providers(
         load_responses_from_details_date_id=None,
         remove_reasoning_tags=remove_reasoning_tags,
         reasoning_tags=reasoning_tags,
+        convert_logprob_choices_to_generation=convert_logprob_choices_to_generation,
     )
     pipeline = Pipeline(
         tasks=tasks,

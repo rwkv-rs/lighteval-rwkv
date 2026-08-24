@@ -1,17 +1,22 @@
+import logging
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
+from lighteval.metrics.metrics import Metrics
+from lighteval.models.model_output import ModelResponse
 from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters
 from lighteval.tasks.requests import Doc, SamplingMethod
 
 
-def _run_pipeline(monkeypatch, docs, pipeline_parameters):
-    original_config = SimpleNamespace()
+def _run_pipeline(monkeypatch, docs, pipeline_parameters, metrics=()):
+    original_config = SimpleNamespace(metrics=metrics)
     task = SimpleNamespace(
         full_name="fixture|0",
         config=original_config,
+        metrics=metrics,
+        sampling_methods=list(dict.fromkeys(metric.category for metric in metrics)),
         get_docs=lambda _max_samples: docs,
     )
 
@@ -111,6 +116,111 @@ def test_pipeline_task_prompt_digests_are_unique_and_sorted(monkeypatch):
     document_digests = {doc.specific["rwkv_task_prompt"]["digest"] for doc in docs}
     assert task.config.task_prompt_digests == sorted(document_digests)
     assert len(task.config.task_prompt_digests) == 2
+
+
+def _choice_doc(gold_index=1):
+    return Doc(
+        query="Question?",
+        choices=["one", "two", "three"],
+        gold_index=gold_index,
+        sampling_methods=[SamplingMethod.LOGPROBS],
+        generation_size=1,
+        stop_sequences=["\n"],
+    )
+
+
+def test_pipeline_converts_logprob_single_choice_and_skips_multiselect(monkeypatch):
+    single_choice = _choice_doc()
+    multiselect = _choice_doc(gold_index=[0, 2])
+    parameters = PipelineParameters(
+        launcher_type=ParallelismManager.NONE,
+        convert_logprob_choices_to_generation=True,
+    )
+    metric = Metrics.loglikelihood_acc.value
+
+    pipeline, task, original_config, _ = _run_pipeline(
+        monkeypatch,
+        [single_choice, multiselect],
+        parameters,
+        metrics=(metric,),
+    )
+
+    assert pipeline.documents_dict[task.full_name] == [single_choice]
+    assert pipeline.sampling_docs[SamplingMethod.GENERATIVE] == [single_choice]
+    assert single_choice.sampling_methods == [SamplingMethod.GENERATIVE]
+    assert "A. one" in single_choice.query
+    assert "Answer: <letter>" in single_choice.query
+    assert single_choice.generation_size == 8192
+    assert single_choice.stop_sequences == []
+    assert single_choice.specific["rwkv_choice"] is True
+    assert task.config is not original_config
+    assert task.config.original_num_docs == 2
+    assert task.config.effective_num_docs == 1
+    assert len(task.metrics) == 1
+    assert task.metrics[0].metric_name == metric.metric_name
+    assert task.metrics[0].category == SamplingMethod.GENERATIVE
+
+    pipeline.model = SimpleNamespace(config=SimpleNamespace(generation_parameters=SimpleNamespace(max_new_tokens=3)))
+    response = ModelResponse(
+        text=["<think>work</think>Answer: B"],
+        output_tokens=[[1, 2]],
+    )
+    pipeline._post_process_outputs({SamplingMethod.GENERATIVE: [response]})
+    assert response.text_post_processed == ["two"]
+    assert task.metrics[0].compute_sample(doc=single_choice, model_response=response) == {"acc": 1}
+
+
+def test_pipeline_leaves_logprob_choices_untouched_by_default(monkeypatch):
+    doc = _choice_doc()
+    original_query = doc.query
+    original_generation_size = doc.generation_size
+    original_stop_sequences = doc.stop_sequences
+    metric = Metrics.loglikelihood_acc.value
+    parameters = PipelineParameters(launcher_type=ParallelismManager.NONE)
+
+    pipeline, task, original_config, _ = _run_pipeline(
+        monkeypatch,
+        [doc],
+        parameters,
+        metrics=(metric,),
+    )
+
+    assert doc.query == original_query
+    assert doc.sampling_methods == [SamplingMethod.LOGPROBS]
+    assert doc.generation_size == original_generation_size
+    assert doc.stop_sequences == original_stop_sequences
+    assert doc.specific is None
+    assert pipeline.sampling_docs[SamplingMethod.LOGPROBS] == [doc]
+    assert task.metrics == (metric,)
+    assert task.config is original_config
+
+    response = ModelResponse(
+        text=["<think>work</think>Answer: B"],
+        output_tokens=[[1]],
+    )
+    pipeline._post_process_outputs({SamplingMethod.GENERATIVE: [response]})
+    assert response.text_post_processed == ["Answer: B"]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_pipeline_logs_choice_conversion_setting_before_preparation(monkeypatch, caplog, enabled):
+    doc = _choice_doc()
+    parameters = PipelineParameters(
+        launcher_type=ParallelismManager.NONE,
+        convert_logprob_choices_to_generation=enabled,
+    )
+    caplog.set_level(logging.INFO, logger="lighteval.pipeline")
+
+    _run_pipeline(
+        monkeypatch,
+        [doc],
+        parameters,
+        metrics=(Metrics.loglikelihood_acc.value,),
+    )
+
+    assert (
+        f"convert_logprob_choices_to_generation: {enabled}, recommended value for RWKV models: True"
+    ) in caplog.messages
 
 
 @pytest.mark.parametrize(
