@@ -24,6 +24,7 @@ import ast
 import asyncio
 import collections
 import copy
+import json
 import os
 import random
 import re
@@ -36,7 +37,7 @@ from tqdm import tqdm
 
 from lighteval.logging.evaluation_tracker import EvaluationTracker
 from lighteval.metrics import apply_metric
-from lighteval.metrics.metrics_sample import ExactMatches
+from lighteval.metrics.metrics_sample import SampleLevelComputation
 from lighteval.metrics.utils.metric_utils import SampleLevelMetric
 from lighteval.models.abstract_model import LightevalModel, ModelConfig
 from lighteval.models.model_loader import TransformersModel, load_model
@@ -77,53 +78,41 @@ logger = logging.getLogger(__name__)
 
 _RWKV_CHOICE_GENERATION_SIZE = 8192
 _CHOICE_MARKUP = re.compile(r"\*\*|__|`+")
-_CHOICE_BOXED = re.compile(
-    r"\\boxed\{\s*(?:([A-Z])|\\(?:text|mathrm)\{\s*([A-Z])\s*\})\s*\}",
-    re.IGNORECASE,
-)
+_CHOICE_BOXED = re.compile(r"\\boxed\{\s*([^{}]+?)\s*\}", re.IGNORECASE)
 _CHOICE_EXPLICIT = re.compile(
     r"^\s*(?:(?:thus|therefore|hence|so)[,:]?\s+)?(?:the\s+)?"
     r"(?:(?:final|correct)\s+)?(?:answer|choice|option)"
-    r"\s*(?:is|:|=)\s*([A-Z])\b",
+    r"\s*(?:is|:|=)\s*([A-Z](?:\s*(?:,|/|&|\+|\band\b)\s*[A-Z])*)\s*[.!]?\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
 _CHOICE_BARE = re.compile(
-    r"^\s*(?:([A-Z])\.?|\(([A-Z])\)|\[([A-Z])\])\s*$",
+    r"^\s*(?:\(?\[?([A-Z](?:\s*(?:,|/|&|\+|\band\b)\s*[A-Z])*)\]?\)?\.?)\s*$",
     re.IGNORECASE,
 )
 
 
-def _is_multiselect(doc) -> bool:
+def _choice_gold_indices(doc) -> tuple[int, ...] | None:
     gold = doc.gold_index
-    return (
-        isinstance(doc.choices, list)
-        and isinstance(gold, (list, tuple))
-        and len(gold) > 1
-        and all(
-            isinstance(index, int) and not isinstance(index, bool) and 0 <= index < len(doc.choices) for index in gold
-        )
-        and SamplingMethod.LOGPROBS in doc.sampling_methods
-        and SamplingMethod.GENERATIVE not in doc.sampling_methods
-    )
-
-
-def _is_single_choice(doc) -> bool:
-    gold = doc.gold_index
+    indices = tuple(gold) if isinstance(gold, (list, tuple)) else (gold,)
     if (
-        isinstance(gold, (list, tuple))
-        and len(gold) == 1
-        and isinstance(gold[0], int)
-        and not isinstance(gold[0], bool)
+        not indices
+        or len(set(indices)) != len(indices)
+        or any(
+            not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(doc.choices)
+            for index in indices
+        )
     ):
-        gold = gold[0]
-    return (
+        return None
+    return tuple(sorted(indices))
+
+
+def _is_choice(doc) -> bool:
+    return bool(
         isinstance(doc.query, str)
         and isinstance(doc.choices, list)
         and 2 <= len(doc.choices) <= 26
         and all(isinstance(choice, str) and choice.strip() for choice in doc.choices)
-        and isinstance(gold, int)
-        and not isinstance(gold, bool)
-        and 0 <= gold < len(doc.choices)
+        and _choice_gold_indices(doc) is not None
         and SamplingMethod.LOGPROBS in doc.sampling_methods
         and SamplingMethod.GENERATIVE not in doc.sampling_methods
     )
@@ -132,7 +121,10 @@ def _is_single_choice(doc) -> bool:
 def _convert_choice(doc) -> None:
     labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[: len(doc.choices)]
     options = "\n".join(f"{label}. {choice.strip()}" for label, choice in zip(labels, doc.choices, strict=True))
-    doc.query = f'{doc.query.rstrip()}\n\n{options}\n\nAfter reasoning, end with "Answer: <letter>".'
+    gold_indices = _choice_gold_indices(doc)
+    assert gold_indices is not None
+    answer_format = "<letter>" if len(gold_indices) == 1 else "<letters separated by commas>"
+    doc.query = f'{doc.query.rstrip()}\n\n{options}\n\nAfter reasoning, end with "Answer: {answer_format}".'
     doc.sampling_methods = list(
         dict.fromkeys(
             SamplingMethod.GENERATIVE if method == SamplingMethod.LOGPROBS else method
@@ -144,13 +136,22 @@ def _convert_choice(doc) -> None:
     doc.specific = dict(doc.specific or {}, rwkv_choice=True)
 
 
+class _ChoiceExactMatches(SampleLevelComputation):
+    def compute(self, doc, model_response, **_kwargs) -> float:
+        gold_indices = _choice_gold_indices(doc)
+        if gold_indices is None:
+            return 0.0
+        expected = _canonical_choice_answer(gold_indices, doc.choices)
+        return float(any(prediction == expected for prediction in model_response.final_text))
+
+
 def _choice_metrics(metric):
     names = (metric.metric_name,) if isinstance(metric.metric_name, str) else tuple(metric.metric_name)
     grouped = not isinstance(metric.metric_name, str)
     return tuple(
         SampleLevelMetric(
             metric_name=name,
-            sample_level_fn=ExactMatches(),
+            sample_level_fn=_ChoiceExactMatches(),
             category=SamplingMethod.GENERATIVE,
             corpus_level_fn=metric.corpus_level_fn[name] if grouped else metric.corpus_level_fn,
             higher_is_better=metric.higher_is_better[name] if grouped else metric.higher_is_better,
@@ -169,25 +170,61 @@ def _effective_output_limit(model, doc) -> int | None:
     return limit
 
 
-def _choice_answer(raw: str, tokens: list[int], choices: list[str], output_limit: int | None) -> str:
+def _parse_choice_labels(value: str, labels: str) -> tuple[int, ...] | None:
+    normalized = re.sub(r"\band\b", ",", value.upper())
+    parts = [part.strip() for part in re.split(r"[,/&+]", normalized)]
+    if not parts or any(not part for part in parts):
+        return None
+    if len(parts) == 1 and " " in parts[0]:
+        parts = parts[0].split()
+    if any(len(part) != 1 or part not in labels for part in parts) or len(set(parts)) != len(parts):
+        return None
+    return tuple(sorted(labels.index(part) for part in parts))
+
+
+def _canonical_choice_answer(indices: tuple[int, ...], choices: list[str]) -> str:
+    selected = [choices[index] for index in indices]
+    if len(selected) == 1:
+        return selected[0]
+    return json.dumps(selected, ensure_ascii=False, separators=(",", ":"))
+
+
+def _choice_answer(
+    raw: str,
+    tokens: list[int],
+    choices: list[str],
+    output_limit: int | None,
+    finish_reason: str | None,
+    cot_mode: str | None,
+) -> str:
     if (
         not isinstance(raw, str)
         or not tokens
         or output_limit is None
-        or len(tokens) >= output_limit
-        or raw.count("</think>") != 1
+        or finish_reason == "length"
+        or (finish_reason is None and len(tokens) >= output_limit)
     ):
         return ""
-    suffix = _CHOICE_MARKUP.sub("", raw.split("</think>", 1)[1])
-    matches = [value.upper() for match in _CHOICE_BOXED.finditer(suffix) for value in match.groups() if value]
-    matches.extend(match.group(1).upper() for match in _CHOICE_EXPLICIT.finditer(suffix))
+    reasoning_boundaries = raw.count("</think>")
+    if cot_mode == "fake_think":
+        if reasoning_boundaries > 1:
+            return ""
+        suffix = raw.split("</think>", 1)[1] if reasoning_boundaries == 1 else raw
+    else:
+        if reasoning_boundaries != 1:
+            return ""
+        suffix = raw.split("</think>", 1)[1]
+    suffix = _CHOICE_MARKUP.sub("", suffix)
+    matches = [match.group(1) for match in _CHOICE_BOXED.finditer(suffix)]
+    matches.extend(match.group(1) for match in _CHOICE_EXPLICIT.finditer(suffix))
     if match := _CHOICE_BARE.fullmatch(suffix):
-        matches.extend(value.upper() for value in match.groups() if value)
-    if len(set(matches)) != 1:
-        return ""
-    label = matches[0]
+        matches.append(match.group(1))
     labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[: len(choices)]
-    return choices[labels.index(label)] if label in labels else ""
+    candidates = {_parse_choice_labels(match, labels) for match in matches}
+    candidates.discard(None)
+    if len(candidates) != 1:
+        return ""
+    return _canonical_choice_answer(candidates.pop(), choices)
 
 
 class ParallelismManager(Enum):
@@ -368,7 +405,7 @@ class Pipeline:
             self.pipeline_parameters.convert_logprob_choices_to_generation,
         )
         if self.pipeline_parameters.convert_logprob_choices_to_generation:
-            self._prepare_single_choice_tasks()
+            self._prepare_choice_tasks()
 
         self.sampling_docs = collections.defaultdict(list)
         for _, docs in self.documents_dict.items():
@@ -383,28 +420,27 @@ class Pipeline:
 
         self.evaluation_tracker.task_config_logger.log(self.tasks_dict)
 
-    def _prepare_single_choice_tasks(self):
+    def _prepare_choice_tasks(self):
         for task in self.tasks_dict.values():
-            original_docs = self.documents_dict[task.full_name]
-            docs = [doc for doc in original_docs if not _is_multiselect(doc)]
-            if not docs:
-                raise ValueError(f"task {task.full_name} contains no supported documents")
+            docs = self.documents_dict[task.full_name]
+            unsupported_logprob_docs = [
+                doc for doc in docs if SamplingMethod.LOGPROBS in doc.sampling_methods and not _is_choice(doc)
+            ]
+            if unsupported_logprob_docs:
+                raise ValueError(
+                    f"task {task.full_name} contains {len(unsupported_logprob_docs)} "
+                    "logprob documents which cannot be converted to generation"
+                )
 
-            choice_docs = [doc for doc in docs if _is_single_choice(doc)]
-            convert_choices = bool(choice_docs) and not any(
-                SamplingMethod.GENERATIVE in doc.sampling_methods for doc in docs
-            )
-            if len(docs) != len(original_docs) or convert_choices:
-                task.config = copy.copy(task.config)
-                task.config.original_num_docs = len(original_docs)
-                task.config.effective_num_docs = len(docs)
-                self.documents_dict[task.full_name] = docs
-
-            if not convert_choices:
+            choice_docs = [doc for doc in docs if _is_choice(doc)]
+            if not choice_docs:
                 continue
 
             for doc in choice_docs:
                 _convert_choice(doc)
+            task.config = copy.copy(task.config)
+            task.config.original_num_docs = len(docs)
+            task.config.effective_num_docs = len(docs)
             converted_metrics = []
             for metric in task.metrics:
                 if metric.category == SamplingMethod.LOGPROBS:
@@ -492,6 +528,13 @@ class Pipeline:
                 task_dict=self.tasks_dict, bootstrap_iters=self.pipeline_parameters.bootstrap_iters
             )
             self.evaluation_tracker.details_logger.aggregate()
+            for task_name, summary in self.evaluation_tracker.details_logger.compiled_details.items():
+                self.evaluation_tracker.metrics_logger.metric_aggregated[task_name].update(
+                    n_samples=summary.n_samples,
+                    n_completions=summary.n_completions,
+                    n_truncated=summary.n_truncated,
+                    truncation_rate=summary.truncation_rate,
+                )
 
     async def _run_model_async(self):
         outputs = {}
@@ -564,12 +607,15 @@ class Pipeline:
             if not isinstance(doc.specific, dict) or doc.specific.get("rwkv_choice") is not True:
                 continue
             output_limit = _effective_output_limit(self.model, doc)
+            cot_mode = getattr(self.model.config, "cot_mode", None)
             response.text_post_processed = [
                 _choice_answer(
                     text,
                     response.output_tokens[index] if index < len(response.output_tokens) else [],
                     doc.choices,
                     output_limit,
+                    response.finish_reasons[index] if index < len(response.finish_reasons) else None,
+                    cot_mode,
                 )
                 for index, text in enumerate(response.text)
             ]

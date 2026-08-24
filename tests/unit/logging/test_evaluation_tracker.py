@@ -32,6 +32,8 @@ from huggingface_hub import HfApi
 
 from lighteval.logging.evaluation_tracker import EvaluationTracker
 from lighteval.logging.info_loggers import DetailsLogger
+from lighteval.models.model_output import ModelResponse
+from lighteval.tasks.requests import Doc
 
 # ruff: noqa
 from tests.fixtures import TESTING_EMPTY_HF_ORG_ID
@@ -80,6 +82,44 @@ def mock_datetime(monkeypatch):
 
     monkeypatch.setattr("lighteval.logging.evaluation_tracker.datetime", MockDatetime)
     return mock_date
+
+
+def test_details_logger_aggregates_completion_truncation_separately_from_prompt_truncation():
+    logger = DetailsLogger()
+    document = Doc(query="question", choices=["answer"], gold_index=0)
+    logger.log(
+        "task|0",
+        document,
+        ModelResponse(
+            text=["complete", "cut off"],
+            output_tokens=[[1], [2]],
+            finish_reasons=["stop", "length"],
+        ),
+        {"acc": 1},
+    )
+    logger.log(
+        "task|0",
+        document,
+        ModelResponse(
+            text=["complete"],
+            output_tokens=[[3]],
+            finish_reasons=["stop"],
+        ),
+        {"acc": 1},
+    )
+
+    logger.aggregate()
+
+    summary = logger.compiled_details["task|0"]
+    assert summary.n_samples == 2
+    assert summary.n_completions == 3
+    assert summary.n_truncated == 1
+    assert summary.truncation_rate == pytest.approx(1 / 3)
+    assert summary.truncated == 0
+    assert logger.compiled_details_over_all_tasks.n_samples == 2
+    assert logger.compiled_details_over_all_tasks.n_completions == 3
+    assert logger.compiled_details_over_all_tasks.n_truncated == 1
+    assert logger.compiled_details_over_all_tasks.truncation_rate == pytest.approx(1 / 3)
 
 
 class TestLogging:
@@ -445,6 +485,10 @@ class TestProperties(unittest.TestCase):
                         "non_truncated": 0,
                         "padded": 0,
                         "non_padded": 0,
+                        "n_samples": 0,
+                        "n_completions": 0,
+                        "n_truncated": 0,
+                        "truncation_rate": 0.0,
                     },
                 )
 

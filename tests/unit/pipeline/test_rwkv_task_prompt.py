@@ -6,7 +6,7 @@ import pytest
 
 from lighteval.metrics.metrics import Metrics
 from lighteval.models.model_output import ModelResponse
-from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters
+from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters, _choice_answer
 from lighteval.tasks.requests import Doc, SamplingMethod
 
 
@@ -129,7 +129,7 @@ def _choice_doc(gold_index=1):
     )
 
 
-def test_pipeline_converts_logprob_single_choice_and_skips_multiselect(monkeypatch):
+def test_pipeline_converts_single_and_multiselect_logprob_choices(monkeypatch):
     single_choice = _choice_doc()
     multiselect = _choice_doc(gold_index=[0, 2])
     parameters = PipelineParameters(
@@ -145,17 +145,19 @@ def test_pipeline_converts_logprob_single_choice_and_skips_multiselect(monkeypat
         metrics=(metric,),
     )
 
-    assert pipeline.documents_dict[task.full_name] == [single_choice]
-    assert pipeline.sampling_docs[SamplingMethod.GENERATIVE] == [single_choice]
+    assert pipeline.documents_dict[task.full_name] == [single_choice, multiselect]
+    assert pipeline.sampling_docs[SamplingMethod.GENERATIVE] == [single_choice, multiselect]
     assert single_choice.sampling_methods == [SamplingMethod.GENERATIVE]
+    assert multiselect.sampling_methods == [SamplingMethod.GENERATIVE]
     assert "A. one" in single_choice.query
     assert "Answer: <letter>" in single_choice.query
+    assert "Answer: <letters separated by commas>" in multiselect.query
     assert single_choice.generation_size == 8192
     assert single_choice.stop_sequences == []
     assert single_choice.specific["rwkv_choice"] is True
     assert task.config is not original_config
     assert task.config.original_num_docs == 2
-    assert task.config.effective_num_docs == 1
+    assert task.config.effective_num_docs == 2
     assert len(task.metrics) == 1
     assert task.metrics[0].metric_name == metric.metric_name
     assert task.metrics[0].category == SamplingMethod.GENERATIVE
@@ -164,10 +166,27 @@ def test_pipeline_converts_logprob_single_choice_and_skips_multiselect(monkeypat
     response = ModelResponse(
         text=["<think>work</think>Answer: B"],
         output_tokens=[[1, 2]],
+        finish_reasons=["stop"],
     )
-    pipeline._post_process_outputs({SamplingMethod.GENERATIVE: [response]})
+    multiselect_response = ModelResponse(
+        text=["<think>work</think>Answer: C, A"],
+        output_tokens=[[3, 4]],
+        finish_reasons=["stop"],
+    )
+    pipeline._post_process_outputs({SamplingMethod.GENERATIVE: [response, multiselect_response]})
     assert response.text_post_processed == ["two"]
+    assert multiselect_response.text_post_processed == ['["one","three"]']
     assert task.metrics[0].compute_sample(doc=single_choice, model_response=response) == {"acc": 1}
+    assert task.metrics[0].compute_sample(doc=multiselect, model_response=multiselect_response) == {"acc": 1}
+
+
+def test_choice_extraction_handles_fake_think_truncation_and_invalid_answers():
+    choices = ["one", "two", "three"]
+
+    assert _choice_answer("Answer: B", [1], choices, 3, "stop", "fake_think") == "two"
+    assert _choice_answer("Answer: B", [1], choices, 3, "stop", "open_think") == ""
+    assert _choice_answer("<think>x</think>Answer: B", [1, 2, 3], choices, 3, "length", "open_think") == ""
+    assert _choice_answer("<think>x</think>I am unsure", [1], choices, 3, "stop", "open_think") == ""
 
 
 def test_pipeline_leaves_logprob_choices_untouched_by_default(monkeypatch):

@@ -137,6 +137,15 @@ class ModelResponse:
     # Other metadata
     truncated_tokens_count: int = 0  # How many tokens truncated
     padded_tokens_count: int = 0  # How many tokens of padding
+    finish_reasons: list[str | None] = field(default_factory=list)  # Why each completion terminated
+    stop_reasons: list[str | None] = field(default_factory=list)  # Stop string or token returned by the backend
+    terminal_token_ids: list[int | None] = field(default_factory=list)  # Last or explicit stop token per completion
+
+    def __post_init__(self) -> None:
+        for field_name in ("finish_reasons", "stop_reasons", "terminal_token_ids"):
+            values = getattr(self, field_name)
+            if values and len(values) != len(self.text):
+                raise ValueError(f"{field_name} must be empty or aligned with text completions")
 
     @property
     def final_text(self) -> list[str]:
@@ -150,7 +159,11 @@ class ModelResponse:
             input_tokens=self.input_tokens,
             text=[self.text[index]],
             output_tokens=[self.output_tokens[index]] if self.output_tokens else [],
+            text_post_processed=[self.text_post_processed[index]] if self.text_post_processed is not None else None,
             reasonings=[self.reasonings[index]] if self.reasonings else [],
+            finish_reasons=[self.finish_reasons[index]] if self.finish_reasons else [],
+            stop_reasons=[self.stop_reasons[index]] if self.stop_reasons else [],
+            terminal_token_ids=[self.terminal_token_ids[index]] if self.terminal_token_ids else [],
             logprobs=[self.logprobs[index]] if self.logprobs else [],
             argmax_logits_eq_gold=[self.argmax_logits_eq_gold[index]] if self.argmax_logits_eq_gold else [],
             logits=[self.logits[index]] if self.logits else None,

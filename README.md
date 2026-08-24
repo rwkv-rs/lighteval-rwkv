@@ -168,6 +168,31 @@ pipeline.show_results()
 results = pipeline.get_results()
 ```
 
+## RWKV endpoint-pool evaluation
+
+This fork provides one native LightEval entry point for an already-deployed RWKV vLLM endpoint pool. The evaluator owns task resolution, endpoint health checks, client-side capacity scheduling, evaluation, and standard LightEval results/details output. The deployment system remains responsible for serving one exact model revision and `wkv_mode` and for writing the pool manifest.
+
+Set the manifest path and validate the complete configuration without downloading datasets or sending generation requests:
+
+```shell
+export RWKV_EVAL_POOL_MANIFEST=/absolute/path/to/vllm_pool.json
+uv run lighteval rwkv --config configs/eval/lighteval.toml --dry-run
+```
+
+Run all configured splits:
+
+```shell
+uv run lighteval rwkv --config configs/eval/lighteval.toml
+```
+
+`--max-samples N` is only a partial smoke-test mode. Omitting it is the full-run contract. `RWKV_EVAL_API_KEY` may contain an optional bearer token; secrets do not belong in the TOML or pool manifest. See `configs/eval/vllm_pool.example.json` for the strict manifest schema.
+
+The default configuration contains these 26 selectors already registered by this LightEval source: `mmlu`, `mmlu_pro`, `mmlu_redux_2`, `gpqa:diamond`, `gpqa:main`, `arc:challenge`, `arc:easy`, `hellaswag`, `bigbench_hard`, `agieval`, `truthfulqa:mc`, `winogrande`, `openbookqa`, `commonsenseqa`, `ceval_zho_mcf`, `med_qa`, `med_mcqa`, `gsm8k`, `math_500`, `aime24`, `aime25`, `olympiad_bench`, `lcb:codegeneration`, `ifeval`, `ifbench_test`, and `ifbench_multiturn`.
+
+It deliberately excludes `mmlu_sr_question_answer`, `kmmlu`, `minerva_math`, `svamp`, `beyond_aime`, `brumo25`, `hmmt_feb_2025`, `math_odyssey`, `comp_math_24_25`, `gaokao_2023_english`, `answer_judge`, `simpleqa_verified`, `humaneval`, `humaneval_cn`, `humaneval_fix`, `humaneval_plus`, `mbpp`, and `mbpp_plus`. Evaluate those with another framework; this command does not install, alias, skip, or substitute missing tasks.
+
+Each run writes only LightEval's standard results JSON and details parquet output under the configured `output_dir`. Model provenance includes the exact model name/revision, served model ID, `wkv_mode`, vLLM version, prompt template, CoT mode, pool fingerprint, and partial/full sample limit. Task summaries additionally report document count, completion count, and output truncation rate.
+
 ## 🙏 Acknowledgements
 
 Lighteval took inspiration from the following *amazing* frameworks: Eleuther's [AI Harness](https://github.com/EleutherAI/lm-evaluation-harness) and Stanford's

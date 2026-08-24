@@ -1,11 +1,15 @@
 ## 核心目标
 LightEval 是 LLM 社区的主流评估库, 本仓库需要通过 LightEval 原生 pipeline、model adapter 和 task 接口完成 RWKV 模型的接入.
-本仓库只需要用于完成 lm-eval-harness 和 EvalScope **未能收录** 的 benchmark 的评估.
+本仓库只评估目标清单中 LightEval 当前已经原生注册的 benchmark. 不得为了补齐历史清单移植、复制或新增 benchmark task; LightEval 缺失的 benchmark 由 EvalScope、lm-eval-harness 或其它评估框架完成.
 
 ## 目录规范
 
 ```text
-
+configs/eval/                    RWKV 一键评估配置与外部端点池 manifest 示例
+src/lighteval/main_rwkv.py       RWKV 一键评估 CLI 和配置校验
+src/lighteval/models/rwkv/       RWKV HTTP model adapter 与端点池客户端
+src/lighteval/tasks/             LightEval 原生 benchmark 定义; 不因目标清单缺项而补 task
+tests/unit/rwkv/                 RWKV CLI、配置、HTTP pool 和 model 的 hermetic 测试
 ```
 
 model_name 需要写清楚 Qwen(如 Qwen3.5-2B ) / RWKV7 (详情见 `RWKV7 权重` 一章节) 权重具体版本号.
@@ -45,7 +49,7 @@ param_size: 参数规模, 仅有 0.1b, 0.4b, 1.5b(often used in RL), 2.9b, 7.2b(
 记录详细 (benchmark_name, model_name, n_samples, k_metrics, cot_mode, prompt_template), [_可选完成 wkv_mode fp32io16 vs fp16 对比] 对应的 (正确率, 截断率) , 其中截断率定义为达到输出上限未能完成作答的样本数 / 总样本数
 
 ## 职责边界
-本仓库独立负责 LightEval 原生评估流程和标准 results/details 输出, 不承载外部评估生命周期、调度或分数发布逻辑.
+本仓库独立负责当前已注册 benchmark 的 LightEval 原生评估流程、RWKV HTTP model adapter 和标准 results/details 输出. 外部系统负责推理服务生命周期、权重与 wkv_mode 切换以及端点池 manifest; 其它框架负责 LightEval 未注册的 benchmark. 本仓库不承载跨框架调度、外部评估生命周期或分数发布逻辑.
 
 ## Env
 使用 uv 管理本机和远端专属环境 ./.venv, 严禁本项目使用其它环境, 严禁其它项目使用本项目环境, 避免环境污染问题。

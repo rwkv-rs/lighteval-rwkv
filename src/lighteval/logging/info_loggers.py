@@ -184,6 +184,10 @@ class DetailsLogger:
         non_truncated: int = 0
         padded: int = 0
         non_padded: int = 0
+        n_samples: int = 0
+        n_completions: int = 0
+        n_truncated: int = 0
+        truncation_rate: float = 0.0
 
     @dataclass
     class CompiledDetailOverAllTasks:
@@ -204,6 +208,10 @@ class DetailsLogger:
         non_truncated: int = 0
         padded: int = 0
         non_padded: int = 0
+        n_samples: int = 0
+        n_completions: int = 0
+        n_truncated: int = 0
+        truncation_rate: float = 0.0
 
     @dataclass
     class Hash:
@@ -269,9 +277,9 @@ class DetailsLogger:
         self.details[task_name].append(detail)
 
         hash = self.Hash()
-        hash.example = xxhash.xxh64(doc.query).hexdigest()
-        hash.input_tokens = xxhash.xxh64(str(model_response.input_tokens)).hexdigest()
-        hash.cont_tokens = xxhash.xxh64(str(model_response.output_tokens)).hexdigest()
+        hash.example = xxhash.xxh64(doc.query.encode()).hexdigest()
+        hash.input_tokens = xxhash.xxh64(str(model_response.input_tokens).encode()).hexdigest()
+        hash.cont_tokens = xxhash.xxh64(str(model_response.output_tokens).encode()).hexdigest()
         self.hashes[task_name].append(hash)
 
     def aggregate(self):
@@ -279,21 +287,42 @@ class DetailsLogger:
         for task_name in self.hashes:
             compiled_hash = self.CompiledHash()
             compiled_hash.hash_examples = xxhash.xxh64(
-                "".join(sorted(q.example for q in self.hashes[task_name]))
+                "".join(sorted(q.example for q in self.hashes[task_name])).encode()
             ).hexdigest()  # hash of all the hash - sorted for reproducibility
             compiled_hash.hash_full_prompts = xxhash.xxh64(
-                "".join(sorted(q.full_prompt for q in self.hashes[task_name]))
+                "".join(sorted(q.full_prompt for q in self.hashes[task_name])).encode()
             ).hexdigest()  # hash of all the hash - sorted for reproducibility
             compiled_hash.hash_input_tokens = xxhash.xxh64(
-                "".join(sorted(q.input_tokens for q in self.hashes[task_name]))
+                "".join(sorted(q.input_tokens for q in self.hashes[task_name])).encode()
             ).hexdigest()  # hash of all the hash - sorted for reproducibility
             compiled_hash.hash_cont_tokens = xxhash.xxh64(
-                "".join(sorted(q.cont_tokens for q in self.hashes[task_name]))
+                "".join(sorted(q.cont_tokens for q in self.hashes[task_name])).encode()
             ).hexdigest()  # hash of all the hash - sorted for reproducibility
             self.compiled_hashes[task_name] = compiled_hash
 
-        for task_name, _ in self.details.items():
-            self.compiled_details[task_name].hashes = asdict(self.compiled_hashes[task_name])
+        for task_name, details in self.details.items():
+            compiled = self.compiled_details[task_name]
+            compiled.hashes = asdict(self.compiled_hashes[task_name])
+            compiled.n_samples = len(details)
+            compiled.n_completions = sum(len(detail.model_response.text) for detail in details)
+            compiled.n_truncated = sum(
+                reason == "length" for detail in details for reason in detail.model_response.finish_reasons
+            )
+            compiled.truncation_rate = compiled.n_truncated / compiled.n_completions if compiled.n_completions else 0.0
+
+        self.compiled_details_over_all_tasks.n_samples = sum(
+            detail.n_samples for detail in self.compiled_details.values()
+        )
+        self.compiled_details_over_all_tasks.n_completions = sum(
+            detail.n_completions for detail in self.compiled_details.values()
+        )
+        self.compiled_details_over_all_tasks.n_truncated = sum(
+            detail.n_truncated for detail in self.compiled_details.values()
+        )
+        total_completions = self.compiled_details_over_all_tasks.n_completions
+        self.compiled_details_over_all_tasks.truncation_rate = (
+            self.compiled_details_over_all_tasks.n_truncated / total_completions if total_completions else 0.0
+        )
 
         hash_types: list[str] = list(self.compiled_details.values())[0].hashes.keys()
 
@@ -301,7 +330,7 @@ class DetailsLogger:
             self.compiled_details_over_all_tasks.hashes[hash_type] = xxhash.xxh64(
                 "".join(
                     compiled_detail.hashes[hash_type] for _, compiled_detail in sorted(self.compiled_details.items())
-                )
+                ).encode()
             ).hexdigest()
 
 

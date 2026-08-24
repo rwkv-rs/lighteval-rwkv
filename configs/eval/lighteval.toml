@@ -1,0 +1,34 @@
+schema_version = 1
+pool_manifest = "${RWKV_EVAL_POOL_MANIFEST}"
+output_dir = "results"
+prompt_template = "bot"
+cot_mode = "open_think"
+
+benchmarks = [
+  "mmlu",
+  "mmlu_pro",
+  "mmlu_redux_2",
+  "gpqa:diamond",
+  "gpqa:main",
+  "arc:challenge",
+  "arc:easy",
+  "hellaswag",
+  "bigbench_hard",
+  "agieval",
+  "truthfulqa:mc",
+  "winogrande",
+  "openbookqa",
+  "commonsenseqa",
+  "ceval_zho_mcf",
+  "med_qa",
+  "med_mcqa",
+  "gsm8k",
+  "math_500",
+  "aime24",
+  "aime25",
+  "olympiad_bench",
+  "lcb:codegeneration",
+  "ifeval",
+  "ifbench_test",
+  "ifbench_multiturn",
+]
