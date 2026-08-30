@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import os
 import re
+from collections import defaultdict
+from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Mapping
@@ -16,8 +18,11 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
 
 import typer
 
+from lighteval.metrics.metrics_sample import SampleLevelComputation, SamplingMetric
+from lighteval.metrics.utils.metric_utils import SampleLevelMetric
 from lighteval.models.rwkv.http_model import PROMPT_TEMPLATES, SAMPLING_PARAMETERS, RWKVHttpModel
 from lighteval.models.rwkv.http_pool import PoolError, PoolManifest, RWKVHttpPool
+from lighteval.tasks.requests import Doc, SamplingMethod
 
 
 _CONFIG_FIELDS = {
@@ -29,6 +34,76 @@ _CONFIG_FIELDS = {
     "benchmarks",
 }
 _ENV_REFERENCE = re.compile(r"^\$\{([A-Z][A-Z0-9_]*)\}$")
+_MIN_COMPLETIONS = 5000
+_LARGE_BENCHMARK_SIZE = 50_000
+_LARGE_BENCHMARK_FRACTION = 0.2
+
+
+class RWKVAvgAtK(SampleLevelComputation):
+    """Average one native task scorer over exactly k independent completions."""
+
+    def __init__(self, k: int, metric) -> None:
+        self.k = k
+        self.metric = metric
+
+    def compute(self, doc: Doc, model_response, **kwargs) -> float:
+        return sum(self._score(doc, model_response[index]) for index in range(self.k)) / self.k
+
+    def _score(self, doc: Doc, model_response) -> float:
+        scorer = self.metric.sample_level_fn
+        if isinstance(scorer, SamplingMetric):
+            return float(scorer.compute_score(doc, model_response))
+        value = next(iter(self.metric.compute_sample(doc=doc, model_response=model_response).values()))
+        if isinstance(value, (list, tuple)):
+            return sum(float(item) for item in value) / len(value)
+        return float(value)
+
+
+def _evaluation_plan(num_docs: int) -> tuple[int, int, str]:
+    """Return evaluated documents, completions per document, and the only metric name."""
+    if num_docs > _LARGE_BENCHMARK_SIZE:
+        return int(num_docs * _LARGE_BENCHMARK_FRACTION), 1, "avg@0.2"
+    k = 1
+    while k * num_docs <= _MIN_COMPLETIONS:
+        k *= 2
+    return num_docs, k, f"avg@{k}"
+
+
+def _configure_evaluation_plan(pipeline) -> None:
+    """Apply the RWKV sampling plan after native task preparation."""
+    for task in pipeline.tasks_dict.values():
+        original_num_docs = len(task.eval_docs())
+        effective_num_docs, k, metric_name = _evaluation_plan(original_num_docs)
+        docs = pipeline.documents_dict[task.full_name][:effective_num_docs]
+        pipeline.documents_dict[task.full_name] = docs
+        source_metric = task.metrics[0]
+        source_name = source_metric.metric_name[0] if isinstance(source_metric.metric_name, (list, tuple)) else None
+        corpus_level_fn = source_metric.corpus_level_fn[source_name] if source_name else source_metric.corpus_level_fn
+        higher_is_better = source_metric.higher_is_better[source_name] if source_name else source_metric.higher_is_better
+        task.metrics = (
+            SampleLevelMetric(
+                metric_name=metric_name,
+                sample_level_fn=RWKVAvgAtK(k, source_metric),
+                category=SamplingMethod.GENERATIVE,
+                corpus_level_fn=corpus_level_fn,
+                higher_is_better=higher_is_better,
+            ),
+        )
+        task.num_samples = [1, k]
+        for doc in docs:
+            doc.num_samples = k
+        task.config = copy(task.config)
+        task.config.metrics = task.metrics
+        task.config.original_num_docs = original_num_docs
+        task.config.effective_num_docs = len(docs)
+        task.sampling_methods = [SamplingMethod.GENERATIVE]
+
+    pipeline.sampling_docs = defaultdict(list)
+    for docs in pipeline.documents_dict.values():
+        for doc in docs:
+            for sampling in doc.sampling_methods:
+                pipeline.sampling_docs[sampling].append(doc)
+    pipeline.evaluation_tracker.task_config_logger.log(pipeline.tasks_dict)
 
 
 class ConfigError(ValueError):
@@ -251,9 +326,22 @@ def rwkv(
             evaluation_tracker=tracker,
             model=model,
         )
+        _configure_evaluation_plan(pipeline)
+        from lighteval.logging.scoreboard import ScoreboardCallback
+
+        scoreboard = ScoreboardCallback.from_environment(
+            config_path=config,
+            pipeline=pipeline,
+            tracker=tracker,
+            model=model,
+        )
+        if scoreboard is not None:
+            tracker.details_logger = scoreboard.details_logger()
         pipeline.evaluate()
         pipeline.show_results()
         pipeline.save_and_push_results()
+        if scoreboard is not None:
+            scoreboard.finalize()
     except (ConfigError, PoolError, ValueError) as error:
         typer.echo(f"RWKV evaluation failed: {error}", err=True)
         raise typer.Exit(code=2) from error
