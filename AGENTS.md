@@ -1,6 +1,6 @@
 ## 核心目标
 LightEval 是 LLM 社区的主流评估库, 本仓库需要通过 LightEval 原生 pipeline、model adapter 和 task 接口完成 RWKV 模型的接入.
-本仓库只评估目标清单中 LightEval 当前已经原生注册的 benchmark. 不得为了补齐历史清单移植、复制或新增 benchmark task; LightEval 缺失的 benchmark 由 EvalScope、lm-eval-harness 或其它评估框架完成.
+代码原则: 每一个文件/类型/函数/变量都需要找到相似实现作为原型, 若该原型带有模型名则将其替换为 `RWKV` 或其它大小写变种, 否则保持同名.
 
 ## 目录规范
 
@@ -36,7 +36,7 @@ param_size: 参数规模, 仅有 0.1b, 0.4b, 1.5b(often used in RL), 2.9b, 7.2b(
 ## 正确性检查
 1. 是否能够正确应用 transformers-rwkv 以及对应 rwkv7-g1-st 权重仓库中提供的三组 Prompt Template
 2. 默认使用 wkv_mode=fp32io16
-3. 当使用 Open Think 模式时, 使用解码参数 temp 0.96, top_p 0.76, top_k 32, presence_penalty 1.0, frequency_penalty 0.1, penalty_decay 0.988; 使用 Fake Think 模式时, 使用解码参数 temperature 1.0, top_p 0.28, top_k 32
+3. 当使用 Open Think 模式时, 使用解码参数 temp 0.96, top_p 0.76, top_k 32, presence_penalty 1.0, frequency_penalty 0.1, penalty_decay 0.988; 使用 Fake Think 模式时, 使用解码参数 temperature 1.0, top_p 0.28, top_k 32, 使用 Open Think + Function Call 模式时, 使用解码参数 temp 0.96, top_p 0.76, top_k 32, 关闭 penalty.
 4. 参考 https://github.com/BlinkDL/Albatross/blob/main/faster3a_2605/eval_gpqa_diamond.py 完成选择题的通用判分器实现
 5. 参考 https://github.com/BlinkDL/Albatross/blob/main/faster3a_2605/eval_math500.py 完成简答题的通用判分器实现
 6. 模型分数应当于 Qwen3.5 相似参数量模型有相似的得分
@@ -54,9 +54,9 @@ param_size: 参数规模, 仅有 0.1b, 0.4b, 1.5b(often used in RL), 2.9b, 7.2b(
 ## Env
 使用 uv 管理本机和远端专属环境 ./.venv, 严禁本项目使用其它环境, 严禁其它项目使用本项目环境, 避免环境污染问题。
 
-## Machine for Testing and Benchmarking
-```bash
-ssh rwkv-sha-pro6000x8
-cd ~/Projects/MachineLearning/lighteval-rwkv
-```
-use git to sync your changes instead of rsync.
+## Inference API
+url: api.rwkv.rs
+1.5B: bsz1024
+2.9B: bsz1024
+7.2B: bsz960
+13.3B: bsz320 * 2
