@@ -657,6 +657,26 @@ def test_scoreboard_waits_for_all_internal_leaves_and_publishes_only_selector():
     assert callback._selector_details == {}
 
 
+def test_scoreboard_selector_keeps_unconfigured_generation_size():
+    callback = ScoreboardCallback.__new__(ScoreboardCallback)
+    configs = [
+        SimpleNamespace(
+            num_fewshots=0,
+            generation_size=None,
+            stop_sequence=(),
+            original_num_docs=100,
+            effective_num_docs=5,
+        )
+        for _ in range(2)
+    ]
+
+    task_config = callback._task_config([SimpleNamespace(config=config) for config in configs], "avg@1")
+
+    assert task_config["generation_size"] is None
+    assert task_config["original_num_docs"] == 200
+    assert task_config["effective_num_docs"] == 10
+
+
 def test_scoreboard_publication_keeps_only_display_fields(tmp_path, monkeypatch):
     campaign_id = "12345678-1234-5678-1234-567812345678"
     requests = []

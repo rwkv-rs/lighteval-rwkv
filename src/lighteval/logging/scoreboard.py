@@ -234,7 +234,8 @@ class ScoreboardCallback:
             if name in {"original_num_docs", "effective_num_docs"}:
                 values[name] = sum(field_values)
             elif name == "generation_size":
-                values[name] = max(field_values)
+                configured_sizes = [value for value in field_values if value is not None]
+                values[name] = max(configured_sizes) if configured_sizes else None
             elif name == "stop_sequence":
                 values[name] = list(dict.fromkeys(stop for value in field_values for stop in value))
             else:
