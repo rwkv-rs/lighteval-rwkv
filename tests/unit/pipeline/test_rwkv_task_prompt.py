@@ -182,6 +182,58 @@ def test_pipeline_converts_single_and_multiselect_logprob_choices(monkeypatch):
     assert task.metrics[0].compute_sample(doc=multiselect, model_response=multiselect_response) == {"acc": 1}
 
 
+@pytest.mark.parametrize("choices", [[" A", " B", " C", " D"], ["A", "B", "C", "D", "E"]])
+def test_pipeline_converts_native_generative_letter_choices(monkeypatch, choices):
+    doc = Doc(
+        query="Question?\nA. one\nB. two\nAnswer:",
+        choices=choices,
+        gold_index=1,
+        sampling_methods=[SamplingMethod.GENERATIVE],
+        generation_size=5,
+        stop_sequences=["\n"],
+    )
+    parameters = PipelineParameters(
+        launcher_type=ParallelismManager.NONE,
+        convert_logprob_choices_to_generation=True,
+    )
+    metric = Metrics.exact_match.value
+
+    pipeline, task, original_config, _ = _run_pipeline(monkeypatch, [doc], parameters, metrics=(metric,))
+
+    assert pipeline.sampling_docs[SamplingMethod.GENERATIVE] == [doc]
+    assert doc.query.count('After reasoning, end with "Answer: <letter>".') == 1
+    assert doc.generation_size == 8192
+    assert doc.stop_sequences == []
+    assert doc.specific["rwkv_choice"] is True
+    assert task.config is not original_config
+    assert task.metrics == (metric,)
+
+
+def test_pipeline_does_not_convert_native_free_form_generation(monkeypatch):
+    doc = Doc(
+        query="Give two acceptable summaries.",
+        choices=["first summary", "second summary"],
+        gold_index=0,
+        sampling_methods=[SamplingMethod.GENERATIVE],
+        generation_size=32,
+        stop_sequences=["\n"],
+    )
+    parameters = PipelineParameters(
+        launcher_type=ParallelismManager.NONE,
+        convert_logprob_choices_to_generation=True,
+    )
+    metric = Metrics.exact_match.value
+
+    pipeline, task, original_config, _ = _run_pipeline(monkeypatch, [doc], parameters, metrics=(metric,))
+
+    assert pipeline.sampling_docs[SamplingMethod.GENERATIVE] == [doc]
+    assert doc.query == "Give two acceptable summaries."
+    assert doc.generation_size == 32
+    assert doc.stop_sequences == ["\n"]
+    assert doc.specific is None
+    assert task.config is original_config
+
+
 def test_med_qa_uses_official_parquet_schema_and_does_not_repeat_letter_options(monkeypatch):
     doc = med_qa_prompt(
         {
@@ -228,13 +280,54 @@ def test_olympiad_bench_does_not_emit_an_empty_specific_struct():
     assert doc.specific is None
 
 
-def test_choice_extraction_handles_fake_think_truncation_and_invalid_answers():
-    choices = ["one", "two", "three"]
+@pytest.mark.parametrize(
+    ("completion", "expected"),
+    [
+        ("Answer: B", "two"),
+        ("<think>x</think>Answer: <B>", "two"),
+        ("<think>x</think>The correct answer is B. two.", "two"),
+        ("<think>x</think>正确答案是 **B**。", "two"),
+        ("<think>x</think><answer>B</answer>", "two"),
+        ("<think>x</think>Answer: <choice B>", "two"),
+        ("<think>x</think>Answer: <final>B</final>", "two"),
+        ('<think>x</think>Answer: <span class="choice">B</span>', "two"),
+        ("<think>x</think>Answer: <letter>B</letter>", "two"),
+        ('<think>x</think>Answer: {"answer": "B"}', "two"),
+        ("<think>x</think>Answer: <function=finish>\n<parameter=message>\nB\n</parameter>\n</function>", "two"),
+        ("<think>x</think>C. three", "three"),
+        ("<think>x</think><<B>>", "two"),
+        ("<think>x</think>This aligns with option B.", "two"),
+        ("<think>x</think>This makes (B) the correct effect.", "two"),
+        ("<think>x</think>Answer: A\nAnswer: B", "two"),
+        ("<think>x</think>Answer: A\nI choose B", "two"),
+        ("<think>x</think>Answer: C, A", '["one","three"]'),
+        ("<think>x</think>Answer: <letter>", ""),
+        ("<think>x</think>Answer: E", ""),
+        ("<think>x</think>I am unsure", ""),
+    ],
+)
+def test_choice_extraction_handles_dashboard_formats(completion, expected):
+    assert _choice_answer(completion, ["one", "two", "three"]) == expected
 
-    assert _choice_answer("Answer: B", [1], choices, 3, "stop", "fake_think") == "two"
-    assert _choice_answer("Answer: B", [1], choices, 3, "stop", "open_think") == ""
-    assert _choice_answer("<think>x</think>Answer: B", [1, 2, 3], choices, 3, "length", "open_think") == ""
-    assert _choice_answer("<think>x</think>I am unsure", [1], choices, 3, "stop", "open_think") == ""
+
+def test_choice_extraction_uses_unique_full_choice_text_as_last_fallback():
+    choices = ["store bile", "produce digestive enzymes", "filter blood"]
+
+    assert _choice_answer("<think>x</think>The gallbladder's function is to store bile.", choices) == "store bile"
+    assert _choice_answer("<think>x</think>Both store bile and filter blood are discussed.", choices) == ""
+
+
+def test_choice_extraction_uses_query_options_for_native_letter_choices():
+    query = "Question?\nA。first option\nB。collective defense\nC。third option\nAnswer:"
+
+    assert _choice_answer("<think>x</think>Collective defense", ["A", "B", "C"], query) == "B"
+    assert _choice_answer("<think>x</think>The correct answer is <collective defense>.", ["A", "B", "C"], query) == "B"
+
+
+def test_choice_extraction_prefers_the_longest_unique_option_text():
+    query = "Question?\nA. /\nB. //\nC. %\nAnswer:"
+
+    assert _choice_answer("<think>x</think>Python floor division uses //.", ["A", "B", "C"], query) == "B"
 
 
 def test_pipeline_leaves_logprob_choices_untouched_by_default(monkeypatch):

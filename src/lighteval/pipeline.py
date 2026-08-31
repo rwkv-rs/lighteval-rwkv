@@ -78,16 +78,71 @@ logger = logging.getLogger(__name__)
 
 _RWKV_CHOICE_GENERATION_SIZE = 8192
 _CHOICE_MARKUP = re.compile(r"\*\*|__|`+")
-_CHOICE_BOXED = re.compile(r"\\boxed\{\s*([^{}]+?)\s*\}", re.IGNORECASE)
-_CHOICE_EXPLICIT = re.compile(
-    r"^\s*(?:(?:thus|therefore|hence|so)[,:]?\s+)?(?:the\s+)?"
-    r"(?:(?:final|correct)\s+)?(?:answer|choice|option)"
-    r"\s*(?:is|:|=)\s*([A-Z](?:\s*(?:,|/|&|\+|\band\b)\s*[A-Z])*)\s*[.!]?\s*$",
-    re.IGNORECASE | re.MULTILINE,
+_CHOICE_LABELS = r"[A-Z](?:\s*(?:,|/|&|\+|\band\b)\s*[A-Z])*"
+_CHOICE_PATTERNS = (
+    re.compile(
+        rf"\\boxed\s*\{{\s*(?:\\(?:text|mathrm)\s*\{{\s*)?({_CHOICE_LABELS})\s*\}}?\s*\}}",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?i:(?:final\s+answer|correct\s+answer|answer|choice|option|最终答案|正确答案|答案|选项)\s*"
+        rf"(?:(?:choice|option)\s*)?(?:is\s*|would\s+be\s*|是\s*|[:：=]\s*)"
+        rf"(?:<letter>\s*)?(?:<\s*(?:answer|choice|b)\s*>\s*)?[\"'\[(]*\s*)"
+        rf"({_CHOICE_LABELS})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?i:(?:final\s+answer|correct\s+answer|answer|choice|option|最终答案|正确答案|答案|选项)\s*"
+        rf"(?:(?:choice|option)\s*)?(?:is\s*|would\s+be\s*|是\s*|[:：=]\s*)<\s*)"
+        rf"({_CHOICE_LABELS})\s*>",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"<\s*(?:answer|choice|b|final|final_answer|span)(?:\s+[^>]*)?\s*>\s*"
+        rf"({_CHOICE_LABELS})(?:\s*[.:]\s*[^<]*)?\s*"
+        rf"</\s*(?:answer|choice|b|final|final_answer|span)\s*>",
+        re.IGNORECASE,
+    ),
+    re.compile(rf"<\s*({_CHOICE_LABELS})\s*>[^<]+</\s*[A-Z]\s*>", re.IGNORECASE),
+    re.compile(rf"<\s*(?:answer|choice)\s*[:=]?\s*({_CHOICE_LABELS})\s*>", re.IGNORECASE),
+    re.compile(
+        rf"\\?[\"']answer\\?[\"']\s*:\s*\\?[\"']({_CHOICE_LABELS})\\?[\"']",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        rf"(?i:(?:(?:choice|option)\s*)?\(?\s*)({_CHOICE_LABELS})"
+        rf"(?i:\s*\)?\s+is\s+(?:the\s+)?(?:final\s+|correct\s+)?answer)",
+    ),
+)
+_CHOICE_FALLBACK_PATTERNS = (
+    re.compile(
+        rf"(?i:\b(?:choose|select|pick)\s+(?:(?:choice|option|answer)\s*)?[:=]?\s*\(?\s*)"
+        rf"({_CHOICE_LABELS})(?i:\s*\)?\b)",
+    ),
+    re.compile(
+        rf"(?i:\b(?:corresponds?|maps?)\s+to\s+(?:(?:choice|option|answer)\s*)?\(?\s*)"
+        rf"({_CHOICE_LABELS})(?i:\s*\)?\b)",
+    ),
+    re.compile(
+        rf"(?i:\b(?:aligns?|matches?)\s+with\s+(?:(?:choice|option|answer)\s*)?\(?\s*)"
+        rf"({_CHOICE_LABELS})(?i:\s*\)?\b)",
+    ),
+    re.compile(
+        rf"(?i:\b(?:therefore|thus|hence|so|consequently)[,:]?\s+(?:the\s+)?"
+        rf"(?:(?:correct|final)\s+)?(?:answer|choice|option)\s+(?:is|would\s+be)\s+\(?\s*)"
+        rf"({_CHOICE_LABELS})(?i:\s*\)?\b)",
+    ),
+    re.compile(rf"(?i:\b\(?\s*)({_CHOICE_LABELS})(?i:\s*\)?\s+(?:the\s+)?correct\b)"),
 )
 _CHOICE_BARE = re.compile(
-    r"^\s*(?:\(?\[?([A-Z](?:\s*(?:,|/|&|\+|\band\b)\s*[A-Z])*)\]?\)?\.?)\s*$",
+    rf"\s*(?:final\s+answer\s*[:=]?\s*)?[\[(<]*({_CHOICE_LABELS})[\])>]*"
+    r"(?:\s*[.:：]\s*\S.*)?\s*",
     re.IGNORECASE,
+)
+_CHOICE_TEXT_EXPLICIT = re.compile(
+    r"(?:final\s+answer|correct\s+answer|answer|最终答案|正确答案|答案)\s*"
+    r"(?:is\s*|would\s+be\s*|是\s*|[:：=]\s*)(.+?)(?:[.。]\s*$|$)",
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -107,14 +162,19 @@ def _choice_gold_indices(doc) -> tuple[int, ...] | None:
 
 
 def _is_choice(doc) -> bool:
-    return bool(
+    if not (
         isinstance(doc.query, str)
         and isinstance(doc.choices, list)
         and 2 <= len(doc.choices) <= 26
         and all(isinstance(choice, str) and choice.strip() for choice in doc.choices)
         and _choice_gold_indices(doc) is not None
-        and SamplingMethod.LOGPROBS in doc.sampling_methods
-    )
+    ):
+        return False
+    labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[: len(doc.choices)]
+    native_letter_choice = SamplingMethod.GENERATIVE in doc.sampling_methods and [
+        choice.strip().upper() for choice in doc.choices
+    ] == list(labels)
+    return SamplingMethod.LOGPROBS in doc.sampling_methods or native_letter_choice
 
 
 def _convert_choice(doc) -> None:
@@ -122,11 +182,15 @@ def _convert_choice(doc) -> None:
     gold_indices = _choice_gold_indices(doc)
     assert gold_indices is not None
     answer_format = "<letter>" if len(gold_indices) == 1 else "<letters separated by commas>"
-    if [choice.strip() for choice in doc.choices] == list(labels):
-        doc.query = f'{doc.query.rstrip()}\n\nAfter reasoning, end with "Answer: {answer_format}".'
-    else:
-        options = "\n".join(f"{label}. {choice.strip()}" for label, choice in zip(labels, doc.choices, strict=True))
-        doc.query = f'{doc.query.rstrip()}\n\n{options}\n\nAfter reasoning, end with "Answer: {answer_format}".'
+    answer_instruction = f'After reasoning, end with "Answer: {answer_format}".'
+    if answer_instruction not in doc.query:
+        if [choice.strip().upper() for choice in doc.choices] == list(labels):
+            doc.query = f"{doc.query.rstrip()}\n\n{answer_instruction}"
+        else:
+            options = "\n".join(
+                f"{label}. {choice.strip()}" for label, choice in zip(labels, doc.choices, strict=True)
+            )
+            doc.query = f"{doc.query.rstrip()}\n\n{options}\n\n{answer_instruction}"
     doc.sampling_methods = list(
         dict.fromkeys(
             SamplingMethod.GENERATIVE if method == SamplingMethod.LOGPROBS else method
@@ -162,16 +226,6 @@ def _choice_metrics(metric):
     )
 
 
-def _effective_output_limit(model, doc) -> int | None:
-    generation_parameters = getattr(getattr(model, "config", None), "generation_parameters", None)
-    limit = getattr(generation_parameters, "max_new_tokens", None)
-    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
-        limit = doc.generation_size
-    if not isinstance(limit, int) or isinstance(limit, bool) or limit <= 0:
-        return None
-    return limit
-
-
 def _parse_choice_labels(value: str, labels: str) -> tuple[int, ...] | None:
     normalized = re.sub(r"\band\b", ",", value.upper())
     parts = [part.strip() for part in re.split(r"[,/&+]", normalized)]
@@ -191,42 +245,100 @@ def _canonical_choice_answer(indices: tuple[int, ...], choices: list[str]) -> st
     return json.dumps(selected, ensure_ascii=False, separators=(",", ":"))
 
 
-def _choice_answer(
-    raw: str,
-    tokens: list[int],
+def _normalized_choice_text(value: str) -> str:
+    normalized = " ".join(_CHOICE_MARKUP.sub("", value).replace("<", "").replace(">", "").casefold().split())
+    normalized = re.sub(r"\s+([%/.,，。])", r"\1", normalized)
+    return normalized.strip(" \t\r\n.。,:：;；!?！？()[]{}\"'")
+
+
+def _choice_texts(query: str | None, choices: list[str], labels: str) -> list[str]:
+    if [choice.strip().upper() for choice in choices] != list(labels) or not isinstance(query, str):
+        return choices
+    parsed = {}
+    for match in re.finditer(r"(?m)^\s*([A-Z])\s*[.)。、]\s*(.+?)\s*$", query, re.IGNORECASE):
+        label = match.group(1).upper()
+        if label in labels:
+            parsed[label] = match.group(2)
+    return [parsed.get(label, choice) for label, choice in zip(labels, choices, strict=True)]
+
+
+def _choice_text_answer(
+    text: str,
     choices: list[str],
-    output_limit: int | None,
-    finish_reason: str | None,
-    cot_mode: str | None,
-) -> str:
-    if (
-        not isinstance(raw, str)
-        or not tokens
-        or output_limit is None
-        or finish_reason == "length"
-        or (finish_reason is None and len(tokens) >= output_limit)
-    ):
+    labels: str,
+    query: str | None,
+) -> tuple[int, ...] | None:
+    normalized_text = _normalized_choice_text(text)
+    matched = []
+    choice_texts = _choice_texts(query, choices, labels)
+    for index, (label, choice) in enumerate(zip(labels, choice_texts, strict=True)):
+        normalized_choice = _normalized_choice_text(choice)
+        without_label = re.sub(rf"^\s*(?:\({label}\)|{label}[.)、])\s*", "", normalized_choice, flags=re.I)
+        variants = {variant for variant in (normalized_choice, without_label) if variant}
+        matching_variants = [variant for variant in variants if variant in normalized_text]
+        if matching_variants:
+            matched.append((index, max(matching_variants, key=len)))
+    if not matched:
+        return None
+    maximal = [
+        index for index, variant in matched if not any(variant != other and variant in other for _, other in matched)
+    ]
+    return (maximal[0],) if len(maximal) == 1 else None
+
+
+def _choice_payload_answer(
+    text: str,
+    choices: list[str],
+    labels: str,
+    query: str | None,
+) -> tuple[int, tuple[int, ...]] | None:
+    choice_texts = _choice_texts(query, choices, labels)
+    matches = []
+    for match in _CHOICE_TEXT_EXPLICIT.finditer(text):
+        payload = _normalized_choice_text(match.group(1))
+        if not payload or payload in {"letter", "answer_letter"}:
+            continue
+        candidates = []
+        for index, choice in enumerate(choice_texts):
+            normalized_choice = _normalized_choice_text(choice)
+            without_label = re.sub(
+                rf"^\s*(?:\({labels[index]}\)|{labels[index]}[.)、])\s*",
+                "",
+                normalized_choice,
+                flags=re.I,
+            )
+            if payload in {normalized_choice, without_label} or (
+                len(payload) > 1 and (payload in without_label or without_label in payload)
+            ):
+                candidates.append(index)
+        if len(candidates) == 1:
+            matches.append((match.start(), (candidates[0],)))
+    return max(matches, key=lambda item: item[0]) if matches else None
+
+
+def _choice_answer(raw: str, choices: list[str], query: str | None = None) -> str:
+    if not isinstance(raw, str) or not raw.strip():
         return ""
-    reasoning_boundaries = raw.count("</think>")
-    if cot_mode == "fake_think":
-        if reasoning_boundaries > 1:
-            return ""
-        suffix = raw.split("</think>", 1)[1] if reasoning_boundaries == 1 else raw
-    else:
-        if reasoning_boundaries != 1:
-            return ""
-        suffix = raw.split("</think>", 1)[1]
-    suffix = _CHOICE_MARKUP.sub("", suffix)
-    matches = [match.group(1) for match in _CHOICE_BOXED.finditer(suffix)]
-    matches.extend(match.group(1) for match in _CHOICE_EXPLICIT.finditer(suffix))
-    if match := _CHOICE_BARE.fullmatch(suffix):
-        matches.append(match.group(1))
+    _, think_closed, suffix = raw.rpartition("</think>")
+    answer_text = _CHOICE_MARKUP.sub("", suffix if think_closed else raw)
     labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[: len(choices)]
-    candidates = {_parse_choice_labels(match, labels) for match in matches}
-    candidates.discard(None)
-    if len(candidates) != 1:
-        return ""
-    return _canonical_choice_answer(candidates.pop(), choices)
+    matches = [
+        (match.start(), parsed)
+        for pattern in (*_CHOICE_PATTERNS, *_CHOICE_FALLBACK_PATTERNS)
+        for match in pattern.finditer(answer_text)
+        if (parsed := _parse_choice_labels(match.group(1), labels)) is not None
+    ]
+    if payload := _choice_payload_answer(answer_text, choices, labels, query):
+        matches.append(payload)
+    for line_match in re.finditer(r"(?m)^.*$", answer_text):
+        if match := _CHOICE_BARE.fullmatch(line_match.group()):
+            if parsed := _parse_choice_labels(match.group(1), labels):
+                matches.append((line_match.start(), parsed))
+    if matches:
+        return _canonical_choice_answer(max(matches, key=lambda item: item[0])[1], choices)
+    if parsed := _choice_text_answer(answer_text, choices, labels, query):
+        return _canonical_choice_answer(parsed, choices)
+    return ""
 
 
 class ParallelismManager(Enum):
@@ -608,19 +720,7 @@ class Pipeline:
         for doc, response in zip(self.sampling_docs.get(SamplingMethod.GENERATIVE, []), responses):
             if not isinstance(doc.specific, dict) or doc.specific.get("rwkv_choice") is not True:
                 continue
-            output_limit = _effective_output_limit(self.model, doc)
-            cot_mode = getattr(self.model.config, "cot_mode", None)
-            response.text_post_processed = [
-                _choice_answer(
-                    text,
-                    response.output_tokens[index] if index < len(response.output_tokens) else [],
-                    doc.choices,
-                    output_limit,
-                    response.finish_reasons[index] if index < len(response.finish_reasons) else None,
-                    cot_mode,
-                )
-                for index, text in enumerate(response.text)
-            ]
+            response.text_post_processed = [_choice_answer(text, doc.choices, doc.query) for text in response.text]
 
     def _compute_metrics(self, sampling_method_responses: dict[str, list[ModelResponse]]):
         # To compute the metrics we first group the samples and task and then by metrics.
