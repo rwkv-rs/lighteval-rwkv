@@ -1,6 +1,5 @@
+import asyncio
 import json
-import threading
-from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 import pytest
@@ -52,6 +51,7 @@ class Response:
 def _completion(token):
     return Response(
         {
+            "prompt_text": "rendered",
             "prompt_token_ids": [1, 2],
             "choices": [
                 {
@@ -81,28 +81,22 @@ def test_manifest_is_strict_and_fingerprint_is_stable(tmp_path):
 
 
 def test_scheduler_respects_heterogeneous_capacity_and_unblocks():
-    scheduler = CapacityScheduler([2, 1])
-    assert [scheduler.acquire() for _ in range(3)] == [0, 1, 0]
+    async def run():
+        scheduler = CapacityScheduler([2, 1])
+        assert [await scheduler.acquire() for _ in range(3)] == [0, 1, 0]
 
-    acquired = []
-    ready = threading.Event()
+        acquire = asyncio.create_task(scheduler.acquire())
+        await asyncio.sleep(0)
+        assert not acquire.done()
+        await scheduler.release(0)
+        assert await acquire == 0
 
-    def acquire():
-        acquired.append(scheduler.acquire())
-        ready.set()
+        await scheduler.release(0)
+        await scheduler.release(0)
+        await scheduler.release(1)
+        assert scheduler.inflight == (0, 0)
 
-    thread = threading.Thread(target=acquire)
-    thread.start()
-    assert not ready.wait(0.05)
-    scheduler.release(0)
-    assert ready.wait(1)
-    thread.join()
-    assert acquired == [0]
-
-    scheduler.release(0)
-    scheduler.release(0)
-    scheduler.release(1)
-    assert scheduler.inflight == (0, 0)
+    asyncio.run(run())
 
 
 def test_pool_preflights_every_replica_and_checks_manifest_identity(tmp_path, monkeypatch):
@@ -115,7 +109,11 @@ def test_pool_preflights_every_replica_and_checks_manifest_identity(tmp_path, mo
 
         def get(self, path):
             gets.append((self.base_url, path))
-            return Response({}) if path == "/health" else Response({"data": [{"id": "rwkv-current"}]})
+            return (
+                Response({})
+                if path == "/health"
+                else Response({"data": [{"id": "another-model"}, {"id": "rwkv-current"}]})
+            )
 
         def close(self):
             pass
@@ -129,15 +127,13 @@ def test_pool_preflights_every_replica_and_checks_manifest_identity(tmp_path, mo
     pool.close()
 
     mismatch = RWKVHttpPool(_manifest(tmp_path, served_model_name="different"), api_key="secret")
-    with pytest.raises(PoolError, match="does not match manifest"):
+    with pytest.raises(PoolError, match="does not serve manifest model"):
         mismatch.preflight()
     mismatch.close()
 
 
 def test_pool_uses_capacity_concurrently_and_preserves_completion_metadata(tmp_path, monkeypatch):
-    barrier = threading.Barrier(2)
     calls = []
-    lock = threading.Lock()
 
     class Client:
         def __init__(self, *, base_url, **_kwargs):
@@ -146,33 +142,44 @@ def test_pool_uses_capacity_concurrently_and_preserves_completion_metadata(tmp_p
         def get(self, path):
             return Response({}) if path == "/health" else Response({"data": [{"id": "rwkv-current"}]})
 
-        def post(self, path, *, json):
-            if path == "/detokenize":
-                return Response({"prompt": "rendered"})
-            with lock:
-                calls.append(self.base_url)
-                token = len(calls)
-            barrier.wait(timeout=1)
-            return _completion(token)
-
         def close(self):
             pass
 
+    class AsyncClient:
+        def __init__(self, *, base_url, **_kwargs):
+            self.base_url = str(base_url)
+
+        async def post(self, path, *, json):
+            assert path == "/v1/chat/completions"
+            calls.append(self.base_url)
+            token = len(calls)
+            await asyncio.sleep(0)
+            return _completion(token)
+
+        async def aclose(self):
+            pass
+
     monkeypatch.setattr(http_pool.httpx, "Client", Client)
+    monkeypatch.setattr(http_pool.httpx, "AsyncClient", AsyncClient)
     pool = RWKVHttpPool(_manifest(tmp_path))
     pool.preflight()
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        completions = list(executor.map(lambda _: pool.complete([{"role": "user", "content": "q"}], {}), range(2)))
+    async def run():
+        completions = await asyncio.gather(*(pool.complete([{"role": "user", "content": "q"}], {}) for _ in range(2)))
+        await pool.aclose()
+        return completions
+
+    completions = asyncio.run(run())
 
     assert set(calls) == {"http://10.0.0.1:8000", "http://10.0.0.2:8000"}
     assert [completion.prompt_text for completion in completions] == ["rendered", "rendered"]
     assert [completion.finish_reason for completion in completions] == ["stop", "stop"]
     assert [completion.terminal_token_id for completion in completions] == [0, 0]
-    pool.close()
+    assert pool.peak_inflight == (1, 1)
+    assert pool.inflight == (0, 0)
 
 
-def test_pool_fails_over_only_for_retryable_failures(tmp_path, monkeypatch):
+def test_pool_fails_over_only_for_retryable_failures(tmp_path, monkeypatch):  # noqa: C901
     posts = []
 
     class Client:
@@ -182,28 +189,42 @@ def test_pool_fails_over_only_for_retryable_failures(tmp_path, monkeypatch):
         def get(self, path):
             return Response({}) if path == "/health" else Response({"data": [{"id": "rwkv-current"}]})
 
-        def post(self, path, *, json):
+        def close(self):
+            pass
+
+    class AsyncClient:
+        def __init__(self, *, base_url, **_kwargs):
+            self.base_url = str(base_url)
+
+        async def post(self, path, *, json):
             posts.append((self.base_url, path))
-            if path == "/detokenize":
-                return Response({"prompt": "rendered"})
             if self.base_url.endswith("1:8000"):
                 return Response({"error": "busy"}, status_code=503)
             return _completion(7)
 
-        def close(self):
+        async def aclose(self):
             pass
 
+    async def no_sleep(_delay):
+        assert pool.inflight == (0, 0)
+
     monkeypatch.setattr(http_pool.httpx, "Client", Client)
+    monkeypatch.setattr(http_pool.httpx, "AsyncClient", AsyncClient)
+    monkeypatch.setattr(http_pool.asyncio, "sleep", no_sleep)
     pool = RWKVHttpPool(_manifest(tmp_path))
     pool.preflight()
 
-    completion = pool.complete([{"role": "user", "content": "q"}], {})
+    async def run():
+        completion = await pool.complete([{"role": "user", "content": "q"}], {})
+        await pool.aclose()
+        return completion
+
+    completion = asyncio.run(run())
     assert completion.text == "answer-7"
     assert posts[:2] == [
         ("http://10.0.0.1:8000", "/v1/chat/completions"),
         ("http://10.0.0.2:8000", "/v1/chat/completions"),
     ]
-    pool.close()
 
 
 def test_pool_fails_closed_on_schema_errors_without_trying_another_replica(tmp_path, monkeypatch):
@@ -216,21 +237,32 @@ def test_pool_fails_closed_on_schema_errors_without_trying_another_replica(tmp_p
         def get(self, path):
             return Response({}) if path == "/health" else Response({"data": [{"id": "rwkv-current"}]})
 
-        def post(self, path, *, json):
-            posts.append(self.base_url)
-            return Response({"choices": []})
-
         def close(self):
             pass
 
+    class AsyncClient:
+        def __init__(self, *, base_url, **_kwargs):
+            self.base_url = str(base_url)
+
+        async def post(self, path, *, json):
+            posts.append(self.base_url)
+            return Response({"choices": []})
+
+        async def aclose(self):
+            pass
+
     monkeypatch.setattr(http_pool.httpx, "Client", Client)
+    monkeypatch.setattr(http_pool.httpx, "AsyncClient", AsyncClient)
     pool = RWKVHttpPool(_manifest(tmp_path))
     pool.preflight()
 
-    with pytest.raises(PoolError, match="invalid completion"):
-        pool.complete([{"role": "user", "content": "q"}], {})
+    async def run():
+        with pytest.raises(PoolError, match="invalid completion"):
+            await pool.complete([{"role": "user", "content": "q"}], {})
+        await pool.aclose()
+
+    asyncio.run(run())
     assert posts == ["http://10.0.0.1:8000"]
-    pool.close()
 
 
 def test_pool_rejects_missing_completion_content(tmp_path, monkeypatch):
@@ -241,7 +273,14 @@ def test_pool_rejects_missing_completion_content(tmp_path, monkeypatch):
         def get(self, path):
             return Response({}) if path == "/health" else Response({"data": [{"id": "rwkv-current"}]})
 
-        def post(self, path, *, json):
+        def close(self):
+            pass
+
+    class AsyncClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def post(self, path, *, json):
             assert path == "/v1/chat/completions"
             return Response(
                 {
@@ -250,13 +289,59 @@ def test_pool_rejects_missing_completion_content(tmp_path, monkeypatch):
                 }
             )
 
-        def close(self):
+        async def aclose(self):
             pass
 
     monkeypatch.setattr(http_pool.httpx, "Client", Client)
+    monkeypatch.setattr(http_pool.httpx, "AsyncClient", AsyncClient)
     pool = RWKVHttpPool(_manifest(tmp_path))
     pool.preflight()
 
-    with pytest.raises(PoolError, match="content is missing"):
-        pool.complete([{"role": "user", "content": "q"}], {})
-    pool.close()
+    async def run():
+        with pytest.raises(PoolError, match="content is missing"):
+            await pool.complete([{"role": "user", "content": "q"}], {})
+        await pool.aclose()
+
+    asyncio.run(run())
+
+
+def test_cancelled_request_releases_capacity_before_pool_close(tmp_path, monkeypatch):
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def get(self, path):
+            return Response({}) if path == "/health" else Response({"data": [{"id": "rwkv-current"}]})
+
+        def close(self):
+            pass
+
+    started = asyncio.Event()
+
+    class AsyncClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def post(self, _path, *, json):
+            started.set()
+            await asyncio.Future()
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(http_pool.httpx, "Client", Client)
+    monkeypatch.setattr(http_pool.httpx, "AsyncClient", AsyncClient)
+    pool = RWKVHttpPool(_manifest(tmp_path))
+    pool.preflight()
+
+    async def run():
+        request = asyncio.create_task(pool.complete([{"role": "user", "content": "q"}], {}))
+        await started.wait()
+        assert pool.inflight == (1, 0)
+        request.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await request
+        assert pool.inflight == (0, 0)
+        await pool.aclose()
+
+    asyncio.run(run())

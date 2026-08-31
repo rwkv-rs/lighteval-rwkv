@@ -1,5 +1,8 @@
+import asyncio
 import gzip
 import json
+import signal
+import threading
 from collections import Counter
 from types import SimpleNamespace
 
@@ -9,8 +12,9 @@ from typer.testing import CliRunner
 
 import lighteval.logging.scoreboard as scoreboard_module
 import lighteval.main_rwkv as main_rwkv
+import temp.main_rwkv as launcher
 from lighteval.logging.info_loggers import DetailsLogger, MetricsLogger
-from lighteval.logging.scoreboard import ScoreboardCallback, TaskCallbackDetailsLogger
+from lighteval.logging.scoreboard import ScoreboardCallback
 from lighteval.metrics.metrics_sample import AvgAtN, ExactMatches
 from lighteval.models.model_output import ModelResponse
 from lighteval.tasks.requests import Doc
@@ -42,6 +46,42 @@ def _manifest():
         aggregate_capacity=5,
         fingerprint="f" * 64,
     )
+
+
+def _streaming_pipeline(task_names, model, download, *, max_samples):
+    pipeline = main_rwkv.RWKVPipeline.__new__(main_rwkv.RWKVPipeline)
+    pipeline._task_names = tuple(task_names)
+    pipeline.tasks_dict = {
+        task_name: SimpleNamespace(
+            full_name=task_name,
+            download_dataset_worker=lambda task: download(task.full_name),
+        )
+        for task_name in task_names
+    }
+    pipeline.documents_dict = {}
+    pipeline.sampling_docs = main_rwkv.defaultdict(list)
+    pipeline._datasets_loaded = 0
+    pipeline._all_datasets_ready_at = None
+    pipeline.pipeline_parameters = SimpleNamespace(max_samples=max_samples)
+    pipeline.model = model
+    pipeline.evaluation_tracker = SimpleNamespace(
+        task_config_logger=SimpleNamespace(log=lambda _tasks: None),
+    )
+    pipeline._prepare_task_documents = lambda task: [
+        SimpleNamespace(
+            task_name=task.full_name,
+            num_samples=1,
+            sampling_methods=[main_rwkv.SamplingMethod.GENERATIVE],
+        )
+    ]
+    return pipeline
+
+
+async def _evaluate_streaming_pipeline(pipeline):
+    async def score(task_name, sampling_docs, outputs):
+        pipeline._score_task(task_name, sampling_docs, outputs)
+
+    await pipeline._evaluate_tasks(score)
 
 
 def test_dry_run_preflights_without_creating_results_or_model(tmp_path, monkeypatch):
@@ -118,9 +158,8 @@ def test_partial_run_uses_native_pipeline_and_standard_saving(tmp_path, monkeypa
     monkeypatch.setattr(main_rwkv.RWKVEvaluationConfig, "read", lambda _path: config)
     monkeypatch.setattr(main_rwkv, "_preflight", lambda _config: (_manifest(), pool, resolved))
     monkeypatch.setattr(main_rwkv, "RWKVHttpModel", Model)
-    monkeypatch.setattr(main_rwkv, "_configure_evaluation_plan", lambda _pipeline: calls.append(("plan",)))
     monkeypatch.setattr("lighteval.logging.evaluation_tracker.EvaluationTracker", Tracker)
-    monkeypatch.setattr("lighteval.pipeline.Pipeline", Pipeline)
+    monkeypatch.setattr(main_rwkv, "RWKVPipeline", Pipeline)
 
     result = CliRunner().invoke(
         _app(),
@@ -142,28 +181,241 @@ def test_partial_run_uses_native_pipeline_and_standard_saving(tmp_path, monkeypa
     assert calls[-1] == ("cleanup",)
 
 
+def test_four_model_launcher_forwards_signals_to_every_process(tmp_path, monkeypatch):
+    handlers = {}
+    processes = []
+
+    class Process:
+        def __init__(self, command, *, cwd, env):
+            self.command = command
+            self.cwd = cwd
+            self.env = env
+            self.done = False
+            self.signals = []
+            processes.append(self)
+
+        def poll(self):
+            return 0 if self.done else None
+
+        def send_signal(self, signum):
+            self.signals.append(signum)
+
+        def wait(self):
+            if self is processes[0]:
+                handlers[signal.SIGTERM](signal.SIGTERM, None)
+            self.done = True
+            return 0
+
+    monkeypatch.setattr(launcher, "_validate", lambda _evaluations: None)
+    monkeypatch.setattr(launcher.signal, "signal", lambda signum, handler: handlers.setdefault(signum, handler))
+    monkeypatch.setattr(launcher.subprocess, "Popen", Process)
+    manifests = [tmp_path / f"{size}.json" for size in ("1.5b", "2.9b", "7.2b", "13.3b")]
+
+    result = launcher.main(
+        [
+            "--manifest-1.5b",
+            str(manifests[0]),
+            "--manifest-2.9b",
+            str(manifests[1]),
+            "--manifest-7.2b",
+            str(manifests[2]),
+            "--manifest-13.3b",
+            str(manifests[3]),
+        ]
+    )
+
+    assert result == 128 + signal.SIGTERM
+    assert len(processes) == 4
+    assert all(process.command[-2:] == ["--max-samples", "10"] for process in processes)
+    assert [process.env["RWKV_EVAL_POOL_MANIFEST"] for process in processes] == [
+        str(manifest.resolve()) for manifest in manifests
+    ]
+    assert all(process.signals == [signal.SIGTERM] for process in processes)
+
+
+def test_rwkv_pipeline_starts_fast_task_before_slow_dataset_finishes(monkeypatch):
+    slow_release = threading.Event()
+    slow_finished = threading.Event()
+    model_called = threading.Event()
+    calls = []
+
+    def download(task_name):
+        if task_name == "slow|0":
+            slow_release.wait(2)
+            slow_finished.set()
+        return task_name
+
+    class Model:
+        pool = SimpleNamespace(http_worker_limit=20)
+
+        async def greedy_until(self, docs):
+            calls.append(docs[0].task_name)
+            model_called.set()
+            return []
+
+        async def acleanup(self):
+            pass
+
+    pipeline = _streaming_pipeline(("fast|0", "slow|0"), Model(), download, max_samples=10)
+    pipeline._score_task = lambda *_args: None
+    monkeypatch.setattr(main_rwkv, "_configure_task_evaluation_plan", lambda _pipeline, _task, docs: docs)
+
+    async def run():
+        evaluation = asyncio.create_task(_evaluate_streaming_pipeline(pipeline))
+        try:
+            assert await asyncio.to_thread(model_called.wait, 1)
+            assert calls[0] == "fast|0"
+            assert not slow_finished.is_set()
+        finally:
+            slow_release.set()
+        await evaluation
+
+    asyncio.run(run())
+
+
+def test_rwkv_pipeline_task_concurrency_matches_run_mode():
+    model = SimpleNamespace(pool=SimpleNamespace(http_worker_limit=25))
+    pipeline = _streaming_pipeline(("a|0", "b|0", "c|0"), model, lambda task_name: task_name, max_samples=None)
+
+    assert pipeline._task_concurrency() == 1
+    pipeline.pipeline_parameters.max_samples = 10
+    assert pipeline._task_concurrency() == 3
+
+
+def test_rwkv_pipeline_runs_scorer_on_process_main_thread():
+    pipeline = main_rwkv.RWKVPipeline.__new__(main_rwkv.RWKVPipeline)
+    pipeline.pipeline_parameters = SimpleNamespace(num_fewshot_seeds=1, max_samples=10, job_id=0)
+    pipeline.model = SimpleNamespace(
+        pool=SimpleNamespace(
+            peak_inflight=(2,),
+            first_request_at=1.0,
+            manifest=SimpleNamespace(replicas=(SimpleNamespace(max_concurrency=4),)),
+        )
+    )
+    pipeline._all_datasets_ready_at = 2.0
+    pipeline._datasets_loaded = 1
+    pipeline._task_names = ("task|0",)
+    pipeline.evaluation_tracker = SimpleNamespace(
+        general_config_logger=SimpleNamespace(log_args_info=lambda **_kwargs: None),
+    )
+    pipeline.is_main_process = lambda: False
+    score_threads = []
+
+    async def evaluate_tasks(score):
+        await score("task|0", {}, {})
+
+    pipeline._evaluate_tasks = evaluate_tasks
+    pipeline._score_task = lambda *_args: score_threads.append(threading.current_thread())
+
+    pipeline.evaluate()
+
+    assert score_threads == [threading.main_thread()]
+
+
+def test_rwkv_pipeline_scores_only_after_every_rollout_finishes(monkeypatch):
+    pending_rollout = asyncio.Event()
+    first_rollouts_done = asyncio.Event()
+    scored = []
+
+    class Model:
+        pool = SimpleNamespace(http_worker_limit=4)
+
+        async def greedy_until(self, _docs):
+            first_rollouts_done.set()
+            await pending_rollout.wait()
+            return []
+
+        async def acleanup(self):
+            pass
+
+    pipeline = _streaming_pipeline(("task|0",), Model(), lambda task_name: task_name, max_samples=None)
+    pipeline._prepare_task_documents = lambda task: [
+        SimpleNamespace(
+            task_name=task.full_name,
+            num_samples=3,
+            sampling_methods=[main_rwkv.SamplingMethod.GENERATIVE],
+        )
+    ]
+    pipeline._score_task = lambda *_args: scored.append("task|0")
+    monkeypatch.setattr(main_rwkv, "_configure_task_evaluation_plan", lambda _pipeline, _task, docs: docs)
+
+    async def run():
+        evaluation = asyncio.create_task(_evaluate_streaming_pipeline(pipeline))
+        await first_rollouts_done.wait()
+        assert scored == []
+        pending_rollout.set()
+        await evaluation
+
+    asyncio.run(run())
+
+
+def test_rwkv_pipeline_scoring_failure_cancels_other_tasks(monkeypatch):
+    second_started = asyncio.Event()
+    cancelled = []
+
+    class Model:
+        pool = SimpleNamespace(http_worker_limit=2)
+
+        async def greedy_until(self, docs):
+            if docs[0].task_name == "failed|0":
+                await second_started.wait()
+                return []
+            second_started.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                cancelled.append(docs[0].task_name)
+                raise
+
+        async def acleanup(self):
+            cancelled.append("closed")
+
+    pipeline = _streaming_pipeline(
+        ("failed|0", "pending|0"),
+        Model(),
+        lambda task_name: task_name,
+        max_samples=1,
+    )
+    pipeline._score_task = lambda task_name, *_args: (_ for _ in ()).throw(ValueError(task_name))
+    monkeypatch.setattr(main_rwkv, "_configure_task_evaluation_plan", lambda _pipeline, _task, docs: docs)
+
+    with pytest.raises(ValueError, match=r"failed\|0"):
+        asyncio.run(_evaluate_streaming_pipeline(pipeline))
+
+    assert cancelled == ["pending|0", "closed"]
+
+
 def test_scoreboard_callback_selects_twenty_samples_per_outcome():
     details = []
     for outcome in ("correct", "incorrect", "unanswered"):
         for index in range(25):
+            text = {"correct": "answer", "incorrect": "wrong", "unanswered": ""}[outcome]
             response = ModelResponse(
                 input=f"prompt-{outcome}-{index}",
-                text=["answer"],
+                text=[text],
                 output_tokens=[[1]],
-                truncated_tokens_count=int(outcome == "unanswered"),
+                finish_reasons=["length" if outcome == "unanswered" else "stop"],
             )
             details.append(
                 DetailsLogger.Detail(
                     doc=Doc(query="question", choices=["answer"], gold_index=0, id=str(index)),
                     model_response=response,
-                    metric={"accuracy": float(outcome == "correct")},
+                    metric={"avg@1": float(outcome == "correct")},
                 )
             )
 
-    selected, totals = ScoreboardCallback._select_samples(details, "accuracy")
+    native_metric = main_rwkv.SampleLevelMetric(
+        metric_name="accuracy",
+        sample_level_fn=ExactMatches(strip_strings=True),
+        category=main_rwkv.SamplingMethod.GENERATIVE,
+        corpus_level_fn=lambda values: sum(values) / len(values),
+        higher_is_better=True,
+    )
+    task = SimpleNamespace(metrics=(SimpleNamespace(sample_level_fn=main_rwkv.RWKVAvgAtK(1, native_metric)),))
+    selected, totals = ScoreboardCallback._select_samples(ScoreboardCallback._rollouts(task, details))
 
     assert totals == {"correct": 25, "incorrect": 25, "unanswered": 25}
-    assert Counter(outcome for _, outcome in selected) == {
+    assert Counter(rollout.outcome for rollout in selected) == {
         "correct": 20,
         "incorrect": 20,
         "unanswered": 20,
@@ -181,9 +433,7 @@ def test_scoreboard_callback_selects_twenty_samples_per_outcome():
         (50_001, 10_000, 1, "avg@0.2"),
     ],
 )
-def test_evaluation_plan_uses_power_of_two_k_or_twenty_percent(
-    num_docs, effective_docs, k, metric_name
-):
+def test_evaluation_plan_uses_power_of_two_k_or_twenty_percent(num_docs, effective_docs, k, metric_name):
     assert main_rwkv._evaluation_plan(num_docs) == (effective_docs, k, metric_name)
     if num_docs <= 50_000:
         assert k & (k - 1) == 0
@@ -204,6 +454,7 @@ def test_rwkv_avg_at_k_averages_the_native_task_scorer():
     response = ModelResponse(text=["one", "two", "one", "two"])
 
     assert scorer.compute(doc, response) == 0.5
+    assert str(scorer) == "RWKVAvgAtK(k=4)"
 
 
 def test_rwkv_pipeline_exposes_only_avg_at_k_and_updates_document_counts():
@@ -229,10 +480,15 @@ def test_rwkv_pipeline_exposes_only_avg_at_k_and_updates_document_counts():
     pipeline = SimpleNamespace(
         tasks_dict={task.full_name: task},
         documents_dict={task.full_name: [doc]},
+        pipeline_parameters=SimpleNamespace(max_samples=None),
         evaluation_tracker=SimpleNamespace(task_config_logger=SimpleNamespace(log=lambda _tasks: None)),
     )
 
-    main_rwkv._configure_evaluation_plan(pipeline)
+    pipeline.documents_dict[task.full_name] = main_rwkv._configure_task_evaluation_plan(
+        pipeline,
+        task,
+        pipeline.documents_dict[task.full_name],
+    )
 
     assert [metric.metric_name for metric in task.metrics] == ["avg@16"]
     assert doc.num_samples == 16
@@ -241,31 +497,80 @@ def test_rwkv_pipeline_exposes_only_avg_at_k_and_updates_document_counts():
     assert task.config.effective_num_docs == 1
 
 
-def test_scoreboard_partial_truncation_is_not_an_unanswered_task_sample():
+def test_rwkv_partial_run_uses_avg_at_one():
+    docs = [
+        Doc(
+            query=f"question {index}",
+            choices=["answer"],
+            gold_index=0,
+            sampling_methods=[main_rwkv.SamplingMethod.GENERATIVE],
+        )
+        for index in range(10)
+    ]
+    metric = main_rwkv.SampleLevelMetric(
+        metric_name="accuracy",
+        sample_level_fn=ExactMatches(strip_strings=True),
+        category=main_rwkv.SamplingMethod.GENERATIVE,
+        corpus_level_fn=lambda values: sum(values) / len(values),
+        higher_is_better=True,
+    )
+    task = SimpleNamespace(
+        full_name="task|0",
+        metrics=(metric,),
+        eval_docs=lambda: [object()] * 30,
+        config=SimpleNamespace(metrics=(metric,), original_num_docs=-1, effective_num_docs=-1),
+    )
+    pipeline = SimpleNamespace(
+        tasks_dict={task.full_name: task},
+        documents_dict={task.full_name: docs},
+        pipeline_parameters=SimpleNamespace(max_samples=10),
+        evaluation_tracker=SimpleNamespace(task_config_logger=SimpleNamespace(log=lambda _tasks: None)),
+    )
+
+    pipeline.documents_dict[task.full_name] = main_rwkv._configure_task_evaluation_plan(
+        pipeline,
+        task,
+        pipeline.documents_dict[task.full_name],
+    )
+
+    assert [configured.metric_name for configured in task.metrics] == ["avg@1"]
+    assert len(pipeline.documents_dict[task.full_name]) == 10
+    assert all(doc.num_samples == 1 for doc in docs)
+    assert task.num_samples == [1, 1]
+    assert task.config.original_num_docs == 30
+    assert task.config.effective_num_docs == 10
+
+
+def test_scoreboard_splits_rollouts_and_scores_each_one():
     detail = DetailsLogger.Detail(
         doc=Doc(query="question", choices=["one"], gold_index=0),
-        model_response=ModelResponse(text=["answer", ""], truncated_tokens_count=1),
+        model_response=ModelResponse(
+            text=["one", ""],
+            text_post_processed=["one", ""],
+            output_tokens=[[1], [2, 3]],
+            finish_reasons=["stop", "length"],
+        ),
         metric={"avg@2": 0.5},
     )
-
-    assert ScoreboardCallback._outcome(detail, "avg@2") == "incorrect"
-
-
-def test_scoreboard_callback_runs_when_each_task_stores_its_last_detail():
-    calls = []
-    logger = TaskCallbackDetailsLogger(
-        {"task-a": 2, "task-b": 1},
-        lambda task_name, details: calls.append((task_name, len(details))),
+    native_metric = main_rwkv.SampleLevelMetric(
+        metric_name="accuracy",
+        sample_level_fn=ExactMatches(strip_strings=True),
+        category=main_rwkv.SamplingMethod.GENERATIVE,
+        corpus_level_fn=lambda values: sum(values) / len(values),
+        higher_is_better=True,
     )
-    doc = Doc(query="question", choices=["answer"], gold_index=0)
-    response = ModelResponse(input="prompt", text=["answer"], output_tokens=[[1]])
+    task = SimpleNamespace(metrics=(SimpleNamespace(sample_level_fn=main_rwkv.RWKVAvgAtK(2, native_metric)),))
 
-    logger.log("task-a", doc, response, {"accuracy": 1.0})
-    assert calls == []
-    logger.log("task-b", doc, response, {"accuracy": 1.0})
-    logger.log("task-a", doc, response, {"accuracy": 0.0})
+    rollouts = ScoreboardCallback._rollouts(task, [detail])
+    samples = [ScoreboardCallback._sample(index, rollout, "avg@2") for index, rollout in enumerate(rollouts)]
 
-    assert calls == [("task-b", 1), ("task-a", 2)]
+    assert [(rollout.repeat_id, rollout.score, rollout.outcome) for rollout in rollouts] == [
+        (0, 1.0, "correct"),
+        (1, 0.0, "unanswered"),
+    ]
+    assert [sample["answer"]["raw_completion"] for sample in samples] == ["one", ""]
+    assert [sample["answer"]["repeat_id"] for sample in samples] == [0, 1]
+    assert samples[0]["metrics"] == {"scoreboard_outcome": "correct", "avg@2": 1.0}
 
 
 def test_scoreboard_publication_keeps_only_display_fields(tmp_path, monkeypatch):
@@ -313,6 +618,20 @@ def test_scoreboard_publication_keeps_only_display_fields(tmp_path, monkeypatch)
         config=task_config,
         full_name="gsm8k|0",
         num_samples=[1],
+        metrics=(
+            SimpleNamespace(
+                sample_level_fn=main_rwkv.RWKVAvgAtK(
+                    1,
+                    main_rwkv.SampleLevelMetric(
+                        metric_name="accuracy",
+                        sample_level_fn=ExactMatches(strip_strings=True),
+                        category=main_rwkv.SamplingMethod.GENERATIVE,
+                        corpus_level_fn=lambda values: sum(values) / len(values),
+                        higher_is_better=True,
+                    ),
+                )
+            ),
+        ),
         aggregation=lambda: {"avg@1": lambda values: sum(values) / len(values)},
     )
     model = SimpleNamespace(
@@ -329,8 +648,13 @@ def test_scoreboard_publication_keeps_only_display_fields(tmp_path, monkeypatch)
             cot_mode="open_think",
         ),
         _generation_parameters={"temperature": 0.96, "top_p": 0.76, "top_k": 32},
+        _completion_limit=lambda _doc: 8192,
+        _stop_sequences=lambda _doc: ["✿"],
     )
-    pipeline = SimpleNamespace(tasks_dict={"gsm8k|0": task}, documents_dict={"gsm8k|0": [object()]})
+    pipeline = SimpleNamespace(
+        tasks_dict={"gsm8k|0": task},
+        documents_dict={"gsm8k|0": [SimpleNamespace(num_samples=1)]},
+    )
     tracker = SimpleNamespace(
         metrics_logger=MetricsLogger(),
         general_config_logger=SimpleNamespace(lighteval_sha="c" * 40),
@@ -357,7 +681,8 @@ def test_scoreboard_publication_keeps_only_display_fields(tmp_path, monkeypatch)
 
     callback("gsm8k|0", [detail])
 
-    publication = json.loads(gzip.decompress(requests[-1].data))
+    publication_request = next(request for request in requests if request.method == "PUT")
+    publication = json.loads(gzip.decompress(publication_request.data))
     sample = publication["samples"][0]
     assert publication["sampling_config"]["temperature"] == 0.96
     assert publication["sampling_config"]["num_samples"] == 1
@@ -365,7 +690,7 @@ def test_scoreboard_publication_keeps_only_display_fields(tmp_path, monkeypatch)
     assert publication["comparison"]["coordinates"][0]["comparison"]["id"] == "precision"
     assert publication["comparison"]["coordinates"][0]["arm"] == "b"
     assert publication["comparison"]["samples"] == 1
-    assert sample["document_index"] == 7
+    assert sample["document_index"] == 0
     assert sample["metrics"]["scoreboard_outcome"] == "correct"
     assert sample["model_response"]["text"] == ["2"]
     assert sample["answer"]["outcome"] == "correct"

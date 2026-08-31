@@ -185,7 +185,19 @@ Run all configured splits:
 uv run lighteval rwkv --config configs/eval/lighteval.toml
 ```
 
-`--max-samples N` is only a partial smoke-test mode. Omitting it is the full-run contract. `RWKV_EVAL_API_KEY` may contain an optional bearer token; secrets do not belong in the TOML or pool manifest. See `configs/eval/vllm_pool.example.json` for the strict manifest schema.
+Deployment-specific manifests and the optional four-process launcher live under `temp/`, outside the LightEval pipeline and model-adapter surface. Run the 1.5B, 2.9B, 7.2B, and 13.3B evaluations as four independent processes:
+
+```shell
+temp/run_rwkv.sh \
+  --manifest-1.5b /absolute/path/to/1.5b.json \
+  --manifest-2.9b /absolute/path/to/2.9b.json \
+  --manifest-7.2b /absolute/path/to/7.2b.json \
+  --manifest-13.3b /absolute/path/to/13.3b.json
+```
+
+The launcher requires aggregate pool capacities of 1024, 1024, 960, and 320 respectively and evaluates 10 samples per leaf benchmark by default. Pass `--dry-run` to validate the four configurations or `--max-samples N` to override that sample count.
+
+`RWKV_EVAL_API_KEY` may contain an optional bearer token; secrets do not belong in the TOML or pool manifest. See `configs/eval/vllm_pool.example.json` for the strict manifest schema.
 
 The default configuration contains these 26 selectors already registered by this LightEval source: `mmlu`, `mmlu_pro`, `mmlu_redux_2`, `gpqa:diamond`, `gpqa:main`, `arc:challenge`, `arc:easy`, `hellaswag`, `bigbench_hard`, `agieval`, `truthfulqa:mc`, `winogrande`, `openbookqa`, `commonsenseqa`, `ceval_zho_mcf`, `med_qa`, `med_mcqa`, `gsm8k`, `math_500`, `aime24`, `aime25`, `olympiad_bench`, `lcb:codegeneration`, `ifeval`, `ifbench_test`, and `ifbench_multiturn`.
 

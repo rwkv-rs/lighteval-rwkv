@@ -1,20 +1,22 @@
 # MIT License
 """Publish completed RWKV benchmark tasks to Scoreboard."""
+
 from __future__ import annotations
 
 import gzip
 import hashlib
 import json
+import logging
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping
 from urllib.parse import quote, urlsplit
 
 import httpx
 
 from lighteval.logging.info_loggers import DetailsLogger, MetricsLogger
-from lighteval.models.rwkv.http_model import MAX_NEW_TOKENS, PROMPT_TEMPLATES
+from lighteval.models.model_output import ModelResponse
 
 
 MAX_SAMPLES_PER_OUTCOME = 20
@@ -22,11 +24,28 @@ MAX_COMPRESSED_BYTES = 64 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _TASK_CONFIG_FIELDS = ("num_fewshots", "generation_size", "stop_sequence", "original_num_docs", "effective_num_docs")
 _ENVIRONMENT_FIELDS = ("served_model_name", "model_revision", "vllm_version", "pool_fingerprint", "max_model_length")
+logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class _Rollout:
+    detail: DetailsLogger.Detail
+    document_index: int
+    repeat_id: int
+    response: ModelResponse
+    score: float
+    outcome: str
 
 
 def _canonical_json(value: object) -> bytes:
-    return json.dumps(value, ensure_ascii=False, allow_nan=False, default=lambda item: item.item(),
-                      sort_keys=True, separators=(",", ":")).encode()
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        default=lambda item: item.item(),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
 
 
 def _sha256(value: object) -> str:
@@ -48,23 +67,8 @@ def _campaign_run_key(campaign: dict) -> str:
     return _sha256(normalized)
 
 
-class TaskCallbackDetailsLogger(DetailsLogger):
-    """Call Scoreboard as soon as the last detail for one task is stored."""
-
-    def __init__(self, expected_samples: Mapping[str, int], callback: "ScoreboardCallback") -> None:
-        super().__init__()
-        self._expected_samples = dict(expected_samples)
-        self._callback = callback
-
-    def log(self, task_name, doc, model_response, metrics) -> None:
-        super().log(task_name, doc, model_response, metrics)
-        # DetailsLogger receives the metric immediately after MetricsLogger does.
-        if len(self.details[task_name]) == self._expected_samples[task_name]:
-            self._callback(task_name, self.details[task_name])
-
-
 class ScoreboardCallback:
-    """Create one campaign and publish each completed LightEval task."""
+    """Publish one completed LightEval task as one finalized campaign."""
 
     def __init__(self, *, base_url, token, config_path, pipeline, tracker, model, rerun_reason=None) -> None:
         parsed = urlsplit(base_url)
@@ -79,30 +83,32 @@ class ScoreboardCallback:
         self._tracker = tracker
         self._model = model
         self._model_variant = self._model_metadata(model.config.model_name)
-        self._tasks = {name: self._task_metadata(task) for name, task in pipeline.tasks_dict.items()}
-        benchmarks = sorted({task["benchmark"] for task in self._tasks.values()})
-        config_digest = _sha256({"file_sha256": hashlib.sha256(Path(config_path).read_bytes()).hexdigest(),
-                                 "max_samples": model.config.max_samples})
+        self._config_digest = _sha256(
+            {
+                "file_sha256": hashlib.sha256(Path(config_path).read_bytes()).hexdigest(),
+                "max_samples": model.config.max_samples,
+            }
+        )
+        self._rerun_reason = rerun_reason
+        self._request("GET", "/api/v1/evaluation-publication-preflight")
+
+    def _campaign(self, task_metadata: dict) -> dict:
         omitted = {"identity", "weight_sha256", "weight_display_name", "wkv_mode"}
-        registry = [{key: value for key, value in task.items() if key not in omitted} for task in self._tasks.values()]
-        registry.sort(key=lambda task: task["task_name"])
+        registry = [{key: value for key, value in task_metadata.items() if key not in omitted}]
         campaign = {
             "schema_version": "scoreboard-v1",
             "source": "lighteval",
-            "config_sha256": config_digest,
+            "config_sha256": self._config_digest,
             "registry_sha256": _sha256(registry),
-            "contract_sha256": _sha256("scoreboard-v1:lighteval:document,metrics,model_response"),
-            "configured_benchmarks": benchmarks,
-            "resolved_benchmarks": benchmarks,
+            "contract_sha256": _sha256("scoreboard-v1:lighteval:document,rollout,metrics,model_response"),
+            "configured_benchmarks": [task_metadata["benchmark"]],
+            "resolved_benchmarks": [task_metadata["benchmark"]],
             "skipped_benchmarks": [],
-            "expected_tasks": list(self._tasks.values()),
-            "rerun_reason": rerun_reason,
+            "expected_tasks": [task_metadata],
+            "rerun_reason": self._rerun_reason,
         }
         campaign["run_key"] = _campaign_run_key(campaign)
-        self._request("GET", "/api/v1/evaluation-publication-preflight")
-        receipt = self._request("POST", "/api/v1/evaluation-campaigns", campaign,
-                                f"campaign:{campaign['run_key']}")
-        self.campaign_id = receipt["campaign_id"]
+        return campaign
 
     @classmethod
     def from_environment(cls, **kwargs) -> "ScoreboardCallback | None":
@@ -112,56 +118,81 @@ class ScoreboardCallback:
             return None
         if not base_url or not token:
             raise ValueError("SCOREBOARD_API_BASE_URL and SCOREBOARD_PUBLICATION_TOKEN must be set together")
-        return cls(base_url=base_url, token=token, rerun_reason=os.environ.get("SCOREBOARD_RERUN_REASON"),
-                   **kwargs)
-
-    def details_logger(self) -> TaskCallbackDetailsLogger:
-        expected = {name: len(documents) for name, documents in self._pipeline.documents_dict.items()}
-        return TaskCallbackDetailsLogger(expected, self)
+        return cls(base_url=base_url, token=token, rerun_reason=os.environ.get("SCOREBOARD_RERUN_REASON"), **kwargs)
 
     def __call__(self, task_name: str, details: list[DetailsLogger.Detail]) -> None:
         task = self._pipeline.tasks_dict[task_name]
+        task_metadata = self._task_metadata(task)
         aggregate = MetricsLogger()
         aggregate.metrics_values[task_name] = self._tracker.metrics_logger.metrics_values[task_name]
         aggregate.aggregate({task_name: task}, bootstrap_iters=0)
         metrics = {name: float(value) for name, value in aggregate.metric_aggregated[task_name].items()}
-        selected, outcome_totals = self._select_samples(details, next(iter(metrics)))
-        samples = [self._sample(index, detail, outcome) for index, (detail, outcome) in enumerate(selected)]
-        outcome_uploaded = {outcome: sum(value == outcome for _, value in selected) for outcome in outcome_totals}
-        truncated = sum(detail.model_response.truncated_tokens_count for detail in details)
-        completions = sum(len(detail.model_response.text) for detail in details)
+        primary_metric = next(iter(metrics))
+        rollouts = self._rollouts(task, details)
+        selected, outcome_totals = self._select_samples(rollouts)
+        samples = [self._sample(index, rollout, primary_metric) for index, rollout in enumerate(selected)]
+        outcome_uploaded = {
+            outcome: sum(rollout.outcome == outcome for rollout in selected) for outcome in outcome_totals
+        }
+        truncated = sum(rollout.response.finish_reasons == ["length"] for rollout in rollouts)
+        completions = len(rollouts)
+        campaign = self._campaign(task_metadata)
+        receipt = self._request(
+            "POST",
+            "/api/v1/evaluation-campaigns",
+            campaign,
+            f"campaign:{campaign['run_key']}",
+        )
+        campaign_id = receipt["campaign_id"]
         publication = {
             "schema_version": "scoreboard-v1",
-            "campaign_id": self.campaign_id,
-            "task": self._tasks[task_name],
+            "campaign_id": campaign_id,
+            "task": task_metadata,
             "result_files": [],
-            "task_config": {**{name: getattr(task.config, name) for name in _TASK_CONFIG_FIELDS}, "k_metrics": next(iter(metrics))},
+            "task_config": {
+                **{name: getattr(task.config, name) for name in _TASK_CONFIG_FIELDS},
+                "k_metrics": next(iter(metrics)),
+            },
             "environment": {
                 "framework": "lighteval",
                 "lighteval_sha": self._tracker.general_config_logger.lighteval_sha,
                 **{name: getattr(self._model.config, name) for name in _ENVIRONMENT_FIELDS},
             },
             "sampling_config": self._sampling_config(task),
-            "primary_metric": next(iter(metrics)),
+            "primary_metric": primary_metric,
             "metrics": metrics,
             "diagnostics": {
-                "samples_total": len(details),
+                "documents_total": len(details),
+                "completions_total": completions,
+                "samples_total": completions,
                 "samples_uploaded": len(samples),
                 "outcome_totals": outcome_totals,
                 "outcome_uploaded": outcome_uploaded,
-                "completions": completions,
                 "truncated_completions": truncated,
                 "truncation_rate": truncated / completions if completions else 0.0,
             },
             "samples": samples,
-            "comparison": self._comparison(task, metrics, len(samples), truncated / completions if completions else 0.0),
+            "comparison": self._comparison(
+                task, metrics, len(samples), truncated / completions if completions else 0.0
+            ),
         }
-        identity = self._tasks[task_name]["identity"]
-        path = f"/api/v1/evaluation-campaigns/{self.campaign_id}/tasks/{quote(identity, safe='')}"
-        self._request("PUT", path, publication, f"publish:{_sha256(publication)}")
-
-    def finalize(self) -> None:
-        self._request("POST", f"/api/v1/evaluation-campaigns/{self.campaign_id}/finalize", idempotency_key=f"finalize:{self.campaign_id}")
+        identity = task_metadata["identity"]
+        publication_sha256 = _sha256(publication)
+        if receipt.get("status") == "complete":
+            logger.info(
+                "Scoreboard task already finalized: campaign=%s task=%s hash_matches=%s",
+                campaign_id,
+                task_name,
+                receipt.get("task_hashes", {}).get(identity) == publication_sha256,
+            )
+            return
+        path = f"/api/v1/evaluation-campaigns/{campaign_id}/tasks/{quote(identity, safe='')}"
+        self._request("PUT", path, publication, f"publish:{publication_sha256}")
+        self._request(
+            "POST",
+            f"/api/v1/evaluation-campaigns/{campaign_id}/finalize",
+            idempotency_key=f"finalize:{campaign_id}",
+        )
 
     def _task_metadata(self, task) -> dict:
         config = task.config
@@ -186,7 +217,14 @@ class ScoreboardCallback:
         config = self._model.config
         parameters = dict(self._model._generation_parameters)
         chat_kwargs = {"rwkv_prompt_template": config.prompt_template, "rwkv_generation_prompt": config.cot_mode}
-        parameters.update(max_completion_tokens=MAX_NEW_TOKENS, num_samples=max(task.num_samples), stop=[PROMPT_TEMPLATES[config.prompt_template]], chat_template_kwargs=chat_kwargs)
+        documents = self._pipeline.documents_dict[task.full_name]
+        parameters.update(
+            max_completion_tokens=max(self._model._completion_limit(doc) for doc in documents),
+            num_samples=max(doc.num_samples for doc in documents),
+            stop=list(dict.fromkeys(stop for doc in documents for stop in self._model._stop_sequences(doc))),
+            seed=42,
+            chat_template_kwargs=chat_kwargs,
+        )
         return parameters
 
     @staticmethod
@@ -196,91 +234,132 @@ class ScoreboardCallback:
         parameter_match = re.search(r"(?:^|-)(\d+(?:\.\d+)?b)(?:-|$)", model_name, re.IGNORECASE)
         if generation_match is None or parameter_match is None:
             raise ValueError("Scoreboard publication requires model_name to contain generation and parameter size")
-        return {"label": f"{architecture} {generation_match.group(1).upper()} {parameter_match.group(1).upper()}", "architecture": architecture, "generation": generation_match.group(1).upper(),
-                "parameters": parameter_match.group(1).upper()}
+        return {
+            "label": f"{architecture} {generation_match.group(1).upper()} {parameter_match.group(1).upper()}",
+            "architecture": architecture,
+            "generation": generation_match.group(1).upper(),
+            "parameters": parameter_match.group(1).upper(),
+        }
 
     def _comparison(self, task, metrics: dict, samples: int, truncation_rate: float) -> dict:
         precision = self._model.config.wkv_mode
         parameter = self._model_variant["parameters"]
-        option = {"id": "precision", "label": "fp16 vs fp32io16", "short_label": "精度",
-                  "a_label": "fp16", "b_label": "fp32io16",
-                  "contract": "同一 checkpoint 与 generation contract，仅改变 WKV precision。"}
-        group = {"id": parameter.lower(), "label": parameter, "a_model": self._model_variant,
-                 "b_model": self._model_variant, "parameter_delta_percent": 0.0, "comparable": True}
+        option = {
+            "id": "precision",
+            "label": "fp16 vs fp32io16",
+            "short_label": "精度",
+            "a_label": "fp16",
+            "b_label": "fp32io16",
+            "contract": "同一 checkpoint 与 generation contract，仅改变 WKV precision。",
+        }
+        group = {
+            "id": parameter.lower(),
+            "label": parameter,
+            "a_model": self._model_variant,
+            "b_model": self._model_variant,
+            "parameter_delta_percent": 0.0,
+            "comparable": True,
+        }
         return {
             "model": self._model_variant,
-            "benchmark": {"label": task.config.name, "categories": [{"id": "benchmark", "label": "Benchmark"}],
-                          "evaluation_method": next(iter(metrics)), "score_multiplier": 100.0},
+            "benchmark": {
+                "label": task.config.name,
+                "categories": [{"id": "benchmark", "label": "Benchmark"}],
+                "evaluation_method": next(iter(metrics)),
+                "score_multiplier": 100.0,
+            },
             "evaluation": {
                 "prompt_profile": self._model.config.cot_mode,
                 "prompt_template": self._model.config.prompt_template,
                 "precision": precision,
             },
-            "coordinates": [{"comparison": option, "parameter_group": group,
-                             "arm": "a" if precision == "fp16" else "b"}],
+            "coordinates": [
+                {"comparison": option, "parameter_group": group, "arm": "a" if precision == "fp16" else "b"}
+            ],
             "samples": samples,
             "truncation_rate": truncation_rate,
         }
 
-    @classmethod
-    def _select_samples(cls, details, primary_metric: str):
+    @staticmethod
+    def _select_samples(rollouts: list[_Rollout]):
         buckets = {"correct": [], "incorrect": [], "unanswered": []}
-        for detail in details:
-            outcome = cls._outcome(detail, primary_metric)
-            buckets[outcome].append(detail)
-        selected = [
-            (detail, outcome) for outcome, bucket in buckets.items() for detail in bucket[:MAX_SAMPLES_PER_OUTCOME]
-        ]
+        for rollout in rollouts:
+            buckets[rollout.outcome].append(rollout)
+        selected = [rollout for bucket in buckets.values() for rollout in bucket[:MAX_SAMPLES_PER_OUTCOME]]
         return selected, {outcome: len(bucket) for outcome, bucket in buckets.items()}
 
+    @classmethod
+    def _rollouts(cls, task, details: list[DetailsLogger.Detail]) -> list[_Rollout]:
+        scorer = task.metrics[0].sample_level_fn
+        rollouts = []
+        for document_index, detail in enumerate(details):
+            for repeat_id in range(len(detail.model_response.text)):
+                response = detail.model_response[repeat_id]
+                response.truncated_tokens_count = int(response.finish_reasons == ["length"])
+                score = float(scorer.score_rollout(detail.doc, response))
+                rollouts.append(
+                    _Rollout(
+                        detail=detail,
+                        document_index=document_index,
+                        repeat_id=repeat_id,
+                        response=response,
+                        score=score,
+                        outcome=cls._outcome(response, score),
+                    )
+                )
+        return rollouts
+
     @staticmethod
-    def _outcome(detail: DetailsLogger.Detail, primary_metric: str) -> str:
-        response = detail.model_response
-        score = detail.metric.get(primary_metric, next(iter(detail.metric.values())))
-        if float(score) == 1.0:
+    def _outcome(response: ModelResponse, score: float) -> str:
+        if score == 1.0:
             return "correct"
-        if not any(text.strip() for text in response.final_text) or response.truncated_tokens_count >= len(response.text):
+        if not response.final_text[0].strip() or response.finish_reasons == ["length"]:
             return "unanswered"
-        if detail.doc.specific and detail.doc.specific.get("rwkv_choice"):
-            if len(response.text) == 1 and float(score) == 1.0 / len(detail.doc.choices):
-                return "unanswered"
         return "incorrect"
 
     @staticmethod
-    def _sample(index: int, detail: DetailsLogger.Detail, outcome: str) -> dict:
+    def _sample(index: int, rollout: _Rollout, primary_metric: str) -> dict:
+        detail = rollout.detail
         doc = detail.doc
-        response = detail.model_response
+        response = rollout.response
+        outcome = rollout.outcome
         document_id = str(doc.id)
-        completions = [text for text in response.text if isinstance(text, str)]
-        final_answers = [text for text in response.final_text if isinstance(text, str)]
         ground_truth = doc.get_golds()
         fail_reason = "answer_mismatch" if outcome == "incorrect" else None
         if outcome == "unanswered":
-            fail_reason = ("max_tokens_before_final_answer" if response.truncated_tokens_count
-                           else "empty_or_unextractable_answer")
+            fail_reason = (
+                "max_tokens_before_final_answer"
+                if response.truncated_tokens_count
+                else "empty_or_unextractable_answer"
+            )
         return {
             "sample_index": index,
-            "document_index": int(document_id) if document_id.isdigit() else index,
+            "document_index": rollout.document_index,
             # Answer metadata below contains the UI fields; keep source records minimal.
             "document": {"id": document_id, "query": doc.query},
-            "metrics": {"scoreboard_outcome": outcome, **detail.metric},
+            "metrics": {"scoreboard_outcome": outcome, primary_metric: rollout.score},
             "model_response": {"text": response.text},
             "answer": {
                 "outcome": outcome,
                 "problem_id": document_id or str(index),
-                "repeat_id": 0,
-                "ground_truth": ground_truth[0] if len(ground_truth) == 1 else json.dumps(ground_truth, ensure_ascii=False),
-                "extracted_answer": "\n\n".join(final_answers),
-                "assembled_prompt": response.input if isinstance(response.input, str) else json.dumps(response.input, ensure_ascii=False),
-                "raw_completion": "\n\n".join(completions),
+                "repeat_id": rollout.repeat_id,
+                "ground_truth": ground_truth[0]
+                if len(ground_truth) == 1
+                else json.dumps(ground_truth, ensure_ascii=False),
+                "extracted_answer": response.final_text[0],
+                "assembled_prompt": response.input
+                if isinstance(response.input, str)
+                else json.dumps(response.input, ensure_ascii=False),
+                "raw_completion": response.text[0],
                 "fail_reason": fail_reason,
                 "generated_tokens": sum(len(tokens) for tokens in response.output_tokens),
                 "latency_ms": None,
             },
         }
 
-    def _request(self, method: str, path: str, payload: dict | None = None,
-                 idempotency_key: str | None = None) -> dict:
+    def _request(
+        self, method: str, path: str, payload: dict | None = None, idempotency_key: str | None = None
+    ) -> dict:
         body = _canonical_json(payload) if payload is not None else None
         compressed = gzip.compress(body) if body is not None else None
         if body is not None and (len(body) > MAX_UNCOMPRESSED_BYTES or len(compressed) > MAX_COMPRESSED_BYTES):
@@ -291,7 +370,9 @@ class ScoreboardCallback:
         if idempotency_key is not None:
             headers["Idempotency-Key"] = idempotency_key
         try:
-            response = httpx.request(method, f"{self._base_url}{path}", content=compressed, headers=headers, timeout=60)
+            response = httpx.request(
+                method, f"{self._base_url}{path}", content=compressed, headers=headers, timeout=60
+            )
             response.raise_for_status()
             return response.json()
         except httpx.HTTPStatusError as error:

@@ -5,12 +5,15 @@ LightEval 是 LLM 社区的主流评估库, 本仓库需要通过 LightEval 原�
 ## 目录规范
 
 ```text
-configs/eval/                    RWKV 一键评估配置与外部端点池 manifest 示例
+configs/eval/                    RWKV 一键评估配置与外部端点池 manifest schema 示例
 src/lighteval/main_rwkv.py       RWKV 一键评估 CLI 和配置校验
 src/lighteval/models/rwkv/       RWKV HTTP model adapter 与端点池客户端
 src/lighteval/tasks/             LightEval 原生 benchmark 定义; 不因目标清单缺项而补 task
 tests/unit/rwkv/                 RWKV CLI、配置、HTTP pool 和 model 的 hermetic 测试
+temp/                            外部部署 manifest、启动脚本与四模型进程编排入口
 ```
+
+`src/lighteval/`、LightEval task 和输入契约内的改动必须应用对照原则；`temp/` 不属于 LightEval 管理范围，只存放外部系统提供的部署快照和操作入口，不以 LightEval 内部实现作为代码原型.
 
 model_name 需要写清楚 Qwen(如 Qwen3.5-2B ) / RWKV7 (详情见 `RWKV7 权重` 一章节) 权重具体版本号.
 新增任何文件, 都需要得到用户确认.
@@ -59,4 +62,4 @@ url: api.rwkv.rs
 1.5B: bsz1024
 2.9B: bsz1024
 7.2B: bsz960
-13.3B: bsz320 * 2
+13.3B: bsz320

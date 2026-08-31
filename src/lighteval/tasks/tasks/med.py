@@ -53,15 +53,17 @@ def med_paragraph_simplification_prompt(line, task_name: str = None):
 
 
 def med_qa_prompt(line, task_name: str = None):
-    query = f"Give a letter answer among A, B, C or D.\nQuestion: {line['question']}\n"
+    choices = [option["key"] for option in line["options"]]
+    instruction = f"Give a letter answer among {', '.join(choices[:-1])} or {choices[-1]}.\n"
+    query = f"{instruction}Question: {line['question']}\n"
     query += "".join([f"{option['key']}. {option['value']}\n" for option in line["options"]])
     query += "Answer:"
     return Doc(
         task_name=task_name,
         query=query,
-        choices=[opt["key"] for opt in line["options"]],
+        choices=choices,
         gold_index=list(ascii_uppercase).index(line["answer_idx"]),
-        instruction="Give a letter answer among A, B, C or D.\n",
+        instruction=instruction,
     )
 
 
@@ -105,7 +107,15 @@ med_qa = LightevalTaskConfig(
     name="med_qa",
     prompt_function=med_qa_prompt,
     hf_repo="bigbio/med_qa",
-    hf_subset="med_qa_en_source",
+    hf_subset="default",
+    hf_data_files={
+        split: (
+            "https://huggingface.co/datasets/bigbio/med_qa/resolve/"
+            f"e04abdc0672c54547fa1dbe36cfefc000e4f2657/med_qa_en_source/{split}/0000.parquet"
+        )
+        for split in ("train", "validation", "test")
+    },
+    hf_revision="e04abdc0672c54547fa1dbe36cfefc000e4f2657",
     hf_avail_splits=["train", "test", "validation"],
     evaluation_splits=["validation", "test"],
     few_shots_split=None,

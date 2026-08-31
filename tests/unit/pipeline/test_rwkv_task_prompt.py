@@ -8,6 +8,8 @@ from lighteval.metrics.metrics import Metrics
 from lighteval.models.model_output import ModelResponse
 from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters, _choice_answer
 from lighteval.tasks.requests import Doc, SamplingMethod
+from lighteval.tasks.tasks.med import med_qa, med_qa_prompt
+from lighteval.tasks.tasks.olympiade_bench import olympiad_bench_prompt
 
 
 def _run_pipeline(monkeypatch, docs, pipeline_parameters, metrics=()):
@@ -178,6 +180,52 @@ def test_pipeline_converts_single_and_multiselect_logprob_choices(monkeypatch):
     assert multiselect_response.text_post_processed == ['["one","three"]']
     assert task.metrics[0].compute_sample(doc=single_choice, model_response=response) == {"acc": 1}
     assert task.metrics[0].compute_sample(doc=multiselect, model_response=multiselect_response) == {"acc": 1}
+
+
+def test_med_qa_uses_official_parquet_schema_and_does_not_repeat_letter_options(monkeypatch):
+    doc = med_qa_prompt(
+        {
+            "question": "Question?",
+            "options": [
+                {"key": "A", "value": "one"},
+                {"key": "B", "value": "two"},
+                {"key": "C", "value": "three"},
+                {"key": "D", "value": "four"},
+                {"key": "E", "value": "five"},
+            ],
+            "answer_idx": "E",
+        },
+        "med_qa|0",
+    )
+    parameters = PipelineParameters(
+        launcher_type=ParallelismManager.NONE,
+        convert_logprob_choices_to_generation=True,
+    )
+
+    _run_pipeline(monkeypatch, [doc], parameters, metrics=(Metrics.loglikelihood_acc.value,))
+
+    assert med_qa.hf_subset == "default"
+    assert med_qa.hf_revision == "e04abdc0672c54547fa1dbe36cfefc000e4f2657"
+    assert set(med_qa.hf_data_files) == {"train", "validation", "test"}
+    assert doc.query.count("A. one") == 1
+    assert "Give a letter answer among A, B, C, D or E." in doc.query
+
+
+def test_olympiad_bench_does_not_emit_an_empty_specific_struct():
+    doc = olympiad_bench_prompt(
+        {
+            "subject": "Math",
+            "language": "English",
+            "unit": None,
+            "is_multiple_answer": False,
+            "answer_type": "Numerical",
+            "final_answer": "1",
+            "question": "Compute 1.",
+        },
+        "olympiad_bench:OE_TO_maths_en_COMP|0",
+    )
+
+    assert doc.specific is None
 
 
 def test_choice_extraction_handles_fake_think_truncation_and_invalid_answers():

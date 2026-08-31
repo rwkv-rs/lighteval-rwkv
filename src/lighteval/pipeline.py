@@ -114,17 +114,19 @@ def _is_choice(doc) -> bool:
         and all(isinstance(choice, str) and choice.strip() for choice in doc.choices)
         and _choice_gold_indices(doc) is not None
         and SamplingMethod.LOGPROBS in doc.sampling_methods
-        and SamplingMethod.GENERATIVE not in doc.sampling_methods
     )
 
 
 def _convert_choice(doc) -> None:
     labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[: len(doc.choices)]
-    options = "\n".join(f"{label}. {choice.strip()}" for label, choice in zip(labels, doc.choices, strict=True))
     gold_indices = _choice_gold_indices(doc)
     assert gold_indices is not None
     answer_format = "<letter>" if len(gold_indices) == 1 else "<letters separated by commas>"
-    doc.query = f'{doc.query.rstrip()}\n\n{options}\n\nAfter reasoning, end with "Answer: {answer_format}".'
+    if [choice.strip() for choice in doc.choices] == list(labels):
+        doc.query = f'{doc.query.rstrip()}\n\nAfter reasoning, end with "Answer: {answer_format}".'
+    else:
+        options = "\n".join(f"{label}. {choice.strip()}" for label, choice in zip(labels, doc.choices, strict=True))
+        doc.query = f'{doc.query.rstrip()}\n\n{options}\n\nAfter reasoning, end with "Answer: {answer_format}".'
     doc.sampling_methods = list(
         dict.fromkeys(
             SamplingMethod.GENERATIVE if method == SamplingMethod.LOGPROBS else method

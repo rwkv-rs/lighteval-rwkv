@@ -1,4 +1,4 @@
-import threading
+import asyncio
 from types import SimpleNamespace
 
 import pytest
@@ -6,10 +6,13 @@ import pytest
 from lighteval.models.rwkv.http_model import PROMPT_TEMPLATES, RWKVHttpModel
 from lighteval.models.rwkv.http_pool import Completion
 from lighteval.tasks.prompt_manager import PromptManager
+from lighteval.utils.cache_management import TaskID
 
 
 def _document(query, num_samples=1, generation_size=9000, stops=None):
     return SimpleNamespace(
+        id=query,
+        task_name="task|0",
         query=query,
         instruction=None,
         fewshot_samples=[],
@@ -30,15 +33,17 @@ def _document(query, num_samples=1, generation_size=9000, stops=None):
 )
 def test_model_uses_prompt_template_stops_and_preserves_document_order(template, prefix, template_stop):
     calls = []
-    lock = threading.Lock()
 
     class Pool:
         http_worker_limit = 5
 
-        def complete(self, messages, parameters):
-            with lock:
-                calls.append((messages, parameters))
-                token = len(calls)
+        async def start(self):
+            pass
+
+        async def complete(self, messages, parameters):
+            calls.append((messages, parameters))
+            token = len(calls)
+            await asyncio.sleep(0.001 * (4 - token))
             return Completion(
                 text=messages[-1]["content"],
                 reasoning="reasoning",
@@ -67,8 +72,10 @@ def test_model_uses_prompt_template_stops_and_preserves_document_order(template,
     }
     model._cache = None
 
-    responses = model.greedy_until(
-        [_document("first", num_samples=2, stops=[template_stop, "task-stop"]), _document("second")]
+    responses = asyncio.run(
+        model.greedy_until(
+            [_document("first", num_samples=2, stops=[template_stop, "task-stop"]), _document("second")]
+        )
     )
 
     assert [response.text for response in responses] == [["first", "first"], ["second"]]
@@ -82,6 +89,7 @@ def test_model_uses_prompt_template_stops_and_preserves_document_order(template,
         [template_stop],
     ]
     assert [response.terminal_token_ids for response in responses] == [[0, 0], [0]]
+    assert [response.output_tokens for response in responses] == [[[1], [2]], [[3]]]
     assert len(calls) == 3
     first_parameters = calls[0][1]
     assert first_parameters == {
@@ -94,6 +102,7 @@ def test_model_uses_prompt_template_stops_and_preserves_document_order(template,
         },
         "ignore_eos": False,
         "return_token_ids": True,
+        "return_prompt_text": True,
     }
 
 
@@ -154,7 +163,63 @@ def test_model_rejects_generation_logits():
     document.use_logits = True
 
     with pytest.raises(ValueError, match="generation logits"):
-        model.greedy_until([document])
+        asyncio.run(model.greedy_until([document]))
+
+
+def test_async_model_cache_preserves_document_order_and_skips_completed_requests():
+    calls = []
+
+    class Pool:
+        async def start(self):
+            pass
+
+        async def complete(self, messages, _parameters):
+            calls.append(messages[-1]["content"])
+            return Completion(
+                text=messages[-1]["content"],
+                reasoning=None,
+                finish_reason="stop",
+                stop_reason=None,
+                terminal_token_id=1,
+                prompt_text=messages[-1]["content"],
+                prompt_token_ids=(1,),
+                output_token_ids=(2,),
+            )
+
+    class Cache:
+        def __init__(self):
+            self.results = {}
+
+        def get_task_id(self, task_name, sampling_method):
+            return TaskID(task_name, "hash", sampling_method)
+
+        def get_samples_to_process_and_cache(self, docs, sampling_method):
+            missing = [doc for doc in docs if doc.id not in self.results]
+            cached = {self.get_task_id(doc.task_name, sampling_method) for doc in docs if doc.id in self.results}
+            return missing, cached
+
+        def cache_samples(self, docs, results, **_kwargs):
+            self.results.update((doc.id, result) for doc, result in zip(docs, results))
+
+        def get_samples_from_cache(self, docs, _task_ids, _sampling_method):
+            return [self.results[doc.id] for doc in docs]
+
+    model = RWKVHttpModel.__new__(RWKVHttpModel)
+    model.pool = Pool()
+    model.prompt_manager = PromptManager(use_chat_template=True, tokenizer=None)
+    model._prompt_template = "bot"
+    model._template_stop = "✿"
+    model._cot_mode = "open_think"
+    model._generation_parameters = {}
+    model._cache = Cache()
+    docs = [_document("first"), _document("second")]
+
+    first = asyncio.run(model.greedy_until(docs))
+    second = asyncio.run(model.greedy_until(list(reversed(docs))))
+
+    assert calls == ["first", "second"]
+    assert [response.text for response in first] == [["first"], ["second"]]
+    assert [response.text for response in second] == [["second"], ["first"]]
 
 
 def test_prompt_template_contract_is_exact():

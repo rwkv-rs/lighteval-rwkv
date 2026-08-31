@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+import asyncio
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -11,9 +11,9 @@ from lighteval.models.model_input import GenerationParameters
 from lighteval.models.model_output import ModelResponse
 from lighteval.tasks.prompt_manager import PromptManager
 from lighteval.tasks.requests import Doc, SamplingMethod
-from lighteval.utils.cache_management import SampleCache, cached
+from lighteval.utils.cache_management import SampleCache
 
-from .http_pool import Completion, PoolManifest, RWKVHttpPool
+from .http_pool import Completion, PoolError, PoolManifest, RWKVHttpPool
 
 
 MAX_NEW_TOKENS = 8192
@@ -63,6 +63,8 @@ class _Job:
 
 class RWKVHttpModel(LightevalModel):
     """Generative LightEval adapter for an existing RWKV vLLM endpoint pool."""
+
+    is_async = True
 
     def __init__(
         self,
@@ -126,8 +128,25 @@ class RWKVHttpModel(LightevalModel):
     def max_length(self) -> int:
         return self.pool.manifest.max_model_len
 
-    @cached(SamplingMethod.GENERATIVE)
-    def greedy_until(self, docs: list[Doc]) -> list[ModelResponse]:  # noqa: C901
+    async def greedy_until(self, docs: list[Doc]) -> list[ModelResponse]:
+        if self._cache is None:
+            return await self._generate(docs)
+        task_ids = {self._cache.get_task_id(doc.task_name, SamplingMethod.GENERATIVE) for doc in docs}
+        pending, _ = self._cache.get_samples_to_process_and_cache(docs, SamplingMethod.GENERATIVE)
+        if pending:
+            results = await self._generate(pending)
+            self._cache.cache_samples(
+                docs=pending,
+                results=results,
+                task_ids=task_ids,
+                sampling_method=SamplingMethod.GENERATIVE,
+            )
+        results = list(self._cache.get_samples_from_cache(docs, task_ids, SamplingMethod.GENERATIVE))
+        if any(result is None for result in results):
+            raise ValueError("Problem while loading and aggregating items from cache.")
+        return results
+
+    async def _generate(self, docs: list[Doc]) -> list[ModelResponse]:  # noqa: C901
         jobs: list[_Job] = []
         response_slots: list[list[Completion | None]] = []
         for document_index, doc in enumerate(docs):
@@ -148,6 +167,7 @@ class RWKVHttpModel(LightevalModel):
                 },
                 ignore_eos=False,
                 return_token_ids=True,
+                return_prompt_text=True,
             )
             for sample_index in range(doc.num_samples):
                 jobs.append(
@@ -159,14 +179,28 @@ class RWKVHttpModel(LightevalModel):
                     )
                 )
 
-        def execute(job: _Job) -> tuple[_Job, Completion]:
-            return job, self.pool.complete(job.messages, job.parameters)
-
         if jobs:
-            workers = min(len(jobs), self.pool.http_worker_limit)
-            with ThreadPoolExecutor(max_workers=workers) as executor:
-                for job, completion in executor.map(execute, jobs):
-                    response_slots[job.document_index][job.sample_index] = completion
+            await self.pool.start()
+
+            async def execute(job: _Job) -> Completion:
+                try:
+                    return await self.pool.complete(job.messages, job.parameters)
+                except PoolError as error:
+                    task_name = docs[job.document_index].task_name
+                    raise PoolError(
+                        f"{task_name} document {job.document_index} rollout {job.sample_index}: {error}"
+                    ) from error
+
+            requests = [asyncio.create_task(execute(job)) for job in jobs]
+            try:
+                completions = await asyncio.gather(*requests)
+            except BaseException:
+                for request in requests:
+                    request.cancel()
+                await asyncio.gather(*requests, return_exceptions=True)
+                raise
+            for job, completion in zip(jobs, completions):
+                response_slots[job.document_index][job.sample_index] = completion
 
         responses: list[ModelResponse] = []
         for slots in response_slots:
@@ -190,6 +224,7 @@ class RWKVHttpModel(LightevalModel):
                     stop_reasons=[completion.stop_reason for completion in completions],
                     terminal_token_ids=[completion.terminal_token_id for completion in completions],
                     output_tokens=[list(completion.output_token_ids) for completion in completions],
+                    truncated_tokens_count=sum(completion.finish_reason == "length" for completion in completions),
                 )
             )
         return responses
@@ -216,3 +251,6 @@ class RWKVHttpModel(LightevalModel):
 
     def cleanup(self) -> None:
         self.pool.close()
+
+    async def acleanup(self) -> None:
+        await self.pool.aclose()

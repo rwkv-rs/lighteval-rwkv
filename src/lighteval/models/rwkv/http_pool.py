@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
-import threading
+import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, Mapping, Sequence
+from typing import AsyncIterator, Mapping, Sequence
 from urllib.parse import urlsplit
 
 import httpx
 
 
 RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
+RETRY_DELAYS = (1.0, 2.0, 4.0)
+logger = logging.getLogger(__name__)
 
 
 class PoolError(RuntimeError):
@@ -182,13 +186,14 @@ class CapacityScheduler:
             raise ValueError("capacities must contain positive integers")
         self._capacities = tuple(capacities)
         self._inflight = [0] * len(capacities)
-        self._condition = threading.Condition()
+        self._peak_inflight = [0] * len(capacities)
+        self._condition = asyncio.Condition()
 
-    def acquire(self, excluded: frozenset[int] = frozenset()) -> int:
+    async def acquire(self, excluded: frozenset[int] = frozenset()) -> int:
         eligible = [index for index in range(len(self._capacities)) if index not in excluded]
         if not eligible:
             raise PoolError("all RWKV replicas have already failed this request")
-        with self._condition:
+        async with self._condition:
             while True:
                 available = [index for index in eligible if self._inflight[index] < self._capacities[index]]
                 if available:
@@ -201,11 +206,12 @@ class CapacityScheduler:
                         ),
                     )
                     self._inflight[selected] += 1
+                    self._peak_inflight[selected] = max(self._peak_inflight[selected], self._inflight[selected])
                     return selected
-                self._condition.wait()
+                await self._condition.wait()
 
-    def release(self, index: int) -> None:
-        with self._condition:
+    async def release(self, index: int) -> None:
+        async with self._condition:
             if not 0 <= index < len(self._inflight):
                 raise IndexError("replica index is outside the scheduler")
             if self._inflight[index] <= 0:
@@ -213,18 +219,21 @@ class CapacityScheduler:
             self._inflight[index] -= 1
             self._condition.notify_all()
 
-    @contextmanager
-    def lease(self, excluded: frozenset[int] = frozenset()) -> Iterator[int]:
-        index = self.acquire(excluded)
+    @asynccontextmanager
+    async def lease(self, excluded: frozenset[int] = frozenset()) -> AsyncIterator[int]:
+        index = await self.acquire(excluded)
         try:
             yield index
         finally:
-            self.release(index)
+            await self.release(index)
 
     @property
     def inflight(self) -> tuple[int, ...]:
-        with self._condition:
-            return tuple(self._inflight)
+        return tuple(self._inflight)
+
+    @property
+    def peak_inflight(self) -> tuple[int, ...]:
+        return tuple(self._peak_inflight)
 
 
 @dataclass(frozen=True)
@@ -245,26 +254,14 @@ class RWKVHttpPool:
     def __init__(self, manifest: PoolManifest, api_key: str | None = None) -> None:
         self.manifest = manifest
         self._scheduler = CapacityScheduler([replica.max_concurrency for replica in manifest.replicas])
-        headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
-        self._clients = tuple(
-            httpx.Client(
-                base_url=replica.base_url,
-                headers=headers,
-                timeout=httpx.Timeout(3600.0, connect=30.0),
-                limits=httpx.Limits(
-                    max_connections=replica.max_concurrency,
-                    max_keepalive_connections=replica.max_concurrency,
-                ),
-                trust_env=False,
-            )
-            for replica in manifest.replicas
-        )
+        self._headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+        self._clients: tuple[httpx.AsyncClient, ...] | None = None
         self._model_id: str | None = None
-        self._closed = False
+        self._first_request_at: float | None = None
 
     def preflight(self) -> str:
-        with ThreadPoolExecutor(max_workers=len(self._clients)) as executor:
-            model_ids = list(executor.map(self._preflight_replica, range(len(self._clients))))
+        with ThreadPoolExecutor(max_workers=len(self.manifest.replicas)) as executor:
+            model_ids = list(executor.map(self._preflight_replica, range(len(self.manifest.replicas))))
         if len(set(model_ids)) != 1:
             raise PoolError("RWKV replicas do not serve one model: " + ", ".join(model_ids))
         model_id = model_ids[0]
@@ -277,8 +274,13 @@ class RWKVHttpPool:
         return model_id
 
     def _preflight_replica(self, index: int) -> str:
-        client = self._clients[index]
         replica = self.manifest.replicas[index]
+        client = httpx.Client(
+            base_url=replica.base_url,
+            headers=self._headers,
+            timeout=httpx.Timeout(30.0),
+            trust_env=False,
+        )
         try:
             health = client.get("/health")
             health.raise_for_status()
@@ -287,30 +289,57 @@ class RWKVHttpPool:
             payload = response.json()
         except (httpx.HTTPError, ValueError) as error:
             raise PoolError(f"RWKV replica preflight failed for {replica.base_url}: {error}") from error
+        finally:
+            client.close()
         data = payload.get("data") if isinstance(payload, dict) else None
-        if (
-            not isinstance(data, list)
-            or len(data) != 1
-            or not isinstance(data[0], dict)
-            or not isinstance(data[0].get("id"), str)
-            or not data[0]["id"]
-        ):
+        if not isinstance(data, list) or not data:
             raise PoolError(f"RWKV replica {replica.base_url} returned an invalid model list")
-        return data[0]["id"]
+        model_ids = [entry.get("id") for entry in data if isinstance(entry, dict)]
+        if len(model_ids) != len(data) or not all(isinstance(model_id, str) and model_id for model_id in model_ids):
+            raise PoolError(f"RWKV replica {replica.base_url} returned an invalid model list")
+        if self.manifest.served_model_name not in model_ids:
+            raise PoolError(
+                f"RWKV replica {replica.base_url} does not serve manifest model {self.manifest.served_model_name}"
+            )
+        return self.manifest.served_model_name
 
-    def complete(self, messages: list[dict[str, str]], parameters: Mapping[str, object]) -> Completion:
+    async def start(self) -> None:
+        if self._clients is not None:
+            return
+        self._clients = tuple(
+            httpx.AsyncClient(
+                base_url=replica.base_url,
+                headers=self._headers,
+                timeout=httpx.Timeout(3600.0, connect=30.0),
+                limits=httpx.Limits(
+                    max_connections=replica.max_concurrency,
+                    max_keepalive_connections=replica.max_concurrency,
+                ),
+                trust_env=False,
+            )
+            for replica in self.manifest.replicas
+        )
+
+    async def complete(self, messages: list[dict[str, str]], parameters: Mapping[str, object]) -> Completion:
         if self._model_id is None:
             raise PoolError("RWKV pool must pass preflight before evaluation")
         if not isinstance(messages, list):
             raise PoolError("RWKV chat completion requires messages")
+        if self._first_request_at is None:
+            self._first_request_at = time.monotonic()
+        await self.start()
+        assert self._clients is not None
 
         attempted: set[int] = set()
         failures: list[str] = []
-        for _ in self._clients:
-            with self._scheduler.lease(frozenset(attempted)) as index:
+        total_attempts = len(self._clients) + len(RETRY_DELAYS)
+        for attempt in range(total_attempts):
+            if len(attempted) == len(self._clients):
+                attempted.clear()
+            async with self._scheduler.lease(frozenset(attempted)) as index:
                 attempted.add(index)
                 try:
-                    return self._complete_on(index, messages, parameters)
+                    return await self._complete_on(index, messages, parameters)
                 except httpx.HTTPStatusError as error:
                     status = error.response.status_code
                     if status not in RETRYABLE_STATUS_CODES:
@@ -319,9 +348,11 @@ class RWKVHttpPool:
                     failures.append(f"{self.manifest.replicas[index].base_url}: HTTP {status}")
                 except httpx.RequestError as error:
                     failures.append(f"{self.manifest.replicas[index].base_url}: {type(error).__name__}: {error}")
+            if attempt < total_attempts - 1:
+                await asyncio.sleep(RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)])
         raise PoolError("RWKV completion failed: " + "; ".join(failures))
 
-    def _complete_on(  # noqa: C901
+    async def _complete_on(  # noqa: C901
         self,
         index: int,
         messages: list[dict[str, str]],
@@ -329,7 +360,8 @@ class RWKVHttpPool:
     ) -> Completion:
         payload = dict(parameters)
         payload.update(model=self.model_id, messages=messages, n=1, stream=False)
-        response = self._clients[index].post("/v1/chat/completions", json=payload)
+        assert self._clients is not None
+        response = await self._clients[index].post("/v1/chat/completions", json=payload)
         response.raise_for_status()
         try:
             raw = response.json()
@@ -348,6 +380,9 @@ class RWKVHttpPool:
                 raise ValueError("completion content is missing or invalid")
             if reasoning is not None and not isinstance(reasoning, str):
                 raise ValueError("completion reasoning_content must be text")
+            prompt_text = raw.get("prompt_text")
+            if not isinstance(prompt_text, str):
+                raise ValueError("completion prompt_text is missing or invalid")
             prompt_token_ids = self._token_ids(raw.get("prompt_token_ids"), "prompt")
             output_token_ids = self._token_ids(choice.get("token_ids"), "output")
             finish_reason = choice.get("finish_reason")
@@ -368,17 +403,6 @@ class RWKVHttpPool:
         )
         stop_reason = str(raw_stop_reason) if raw_stop_reason is not None else None
 
-        detokenized = self._clients[index].post(
-            "/detokenize",
-            json={"model": self.model_id, "tokens": list(prompt_token_ids)},
-        )
-        detokenized.raise_for_status()
-        try:
-            prompt_text = detokenized.json()["prompt"]
-        except (KeyError, TypeError, ValueError) as error:
-            raise PoolError(f"RWKV endpoint returned invalid detokenized prompt: {error}") from error
-        if not isinstance(prompt_text, str):
-            raise PoolError("RWKV detokenized prompt must be text")
         return Completion(
             text=text,
             reasoning=reasoning,
@@ -416,9 +440,26 @@ class RWKVHttpPool:
     def inflight(self) -> tuple[int, ...]:
         return self._scheduler.inflight
 
+    @property
+    def peak_inflight(self) -> tuple[int, ...]:
+        return self._scheduler.peak_inflight
+
+    @property
+    def first_request_at(self) -> float | None:
+        return self._first_request_at
+
     def close(self) -> None:
-        if self._closed:
-            return
-        for client in self._clients:
-            client.close()
-        self._closed = True
+        if self._clients is not None:
+            raise PoolError("RWKV async pool must be closed from its event loop")
+
+    async def aclose(self) -> None:
+        clients, self._clients = self._clients, None
+        if clients is not None:
+            await asyncio.gather(*(client.aclose() for client in clients))
+        if any(self.inflight):
+            raise RuntimeError("RWKV pool closed with active requests")
+        logger.info(
+            "RWKV pool peak in-flight: observed=%s capacity=%s",
+            self.peak_inflight,
+            tuple(replica.max_concurrency for replica in self.manifest.replicas),
+        )
