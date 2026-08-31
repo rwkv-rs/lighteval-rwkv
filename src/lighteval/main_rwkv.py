@@ -88,7 +88,8 @@ def _configure_task_evaluation_plan(pipeline, task, docs) -> list[Doc]:
     if max_samples is None:
         effective_num_docs, k, metric_name = _evaluation_plan(original_num_docs)
     else:
-        effective_num_docs, k, metric_name = min(original_num_docs, max_samples), 1, "avg@1"
+        task_max_samples = getattr(pipeline, "_task_max_samples", {}).get(task.full_name, max_samples)
+        effective_num_docs, k, metric_name = min(original_num_docs, task_max_samples), 1, "avg@1"
     docs = docs[:effective_num_docs]
     source_metric = task.metrics[0]
     source_name = source_metric.metric_name[0] if isinstance(source_metric.metric_name, (list, tuple)) else None
@@ -119,6 +120,11 @@ class RWKVPipeline(Pipeline):
 
     _DATASET_LOADERS = 8
 
+    def __init__(self, *args, selector_tasks: Mapping[str, tuple[str, ...]], task_max_samples=None, **kwargs) -> None:
+        self._configured_selector_tasks = selector_tasks
+        self._configured_task_max_samples = task_max_samples
+        super().__init__(*args, **kwargs)
+
     def _init_tasks_and_requests(self, tasks: str) -> None:
         logger.info("--- LOADING TASKS ---")
         self.registry = Registry(
@@ -127,7 +133,36 @@ class RWKVPipeline(Pipeline):
             custom_tasks=self.pipeline_parameters.custom_tasks_directory,
         )
         self.tasks_dict = self.registry.load_tasks()
-        self._task_names = tuple(self.tasks_dict)
+        full_names = {task_name.rsplit("|", 1)[0]: task_name for task_name in self.tasks_dict}
+        self._selector_tasks = {
+            selector: tuple(full_names[leaf] for leaf in leaves if leaf in full_names)
+            for selector, leaves in self._configured_selector_tasks.items()
+        }
+        self._task_selectors = {
+            task_name: selector for selector, task_names in self._selector_tasks.items() for task_name in task_names
+        }
+        if self._configured_task_max_samples is None:
+            self._task_max_samples = {}
+            self._task_names = tuple(self.tasks_dict)
+        else:
+            self._task_max_samples = {
+                full_names[leaf]: budget
+                for leaf, budget in self._configured_task_max_samples.items()
+                if budget and leaf in full_names
+            }
+            self.tasks_dict = {
+                task_name: task for task_name, task in self.tasks_dict.items() if task_name in self._task_max_samples
+            }
+            self._task_names = tuple(self.tasks_dict)
+            self._selector_tasks = {
+                selector: tuple(task_name for task_name in task_names if task_name in self._task_max_samples)
+                for selector, task_names in self._selector_tasks.items()
+            }
+            self._task_selectors = {
+                task_name: selector
+                for selector, task_names in self._selector_tasks.items()
+                for task_name in task_names
+            }
         self.documents_dict = {}
         self.sampling_docs = defaultdict(list)
         self.task_callback = None
@@ -141,7 +176,8 @@ class RWKVPipeline(Pipeline):
         )
 
     def _prepare_task_documents(self, task):
-        docs = task.get_docs(self.pipeline_parameters.max_samples)
+        max_samples = self._task_max_samples.get(task.full_name, self.pipeline_parameters.max_samples)
+        docs = task.get_docs(max_samples)
         if self.pipeline_parameters.task_prompt is not None:
             self._apply_task_prompt_to_docs(task, docs)
         if self.pipeline_parameters.convert_logprob_choices_to_generation:
@@ -447,6 +483,26 @@ class RWKVEvaluationConfig:
 class ResolvedBenchmarks:
     selector_count: int
     leaf_tasks: tuple[str, ...]
+    selector_tasks: tuple[tuple[str, tuple[str, ...]], ...] = ()
+
+
+def _selector_sample_budgets(
+    resolved: ResolvedBenchmarks, max_samples: int | None
+) -> tuple[dict[str, tuple[str, ...]], dict[str, int] | None]:
+    selector_tasks = dict(resolved.selector_tasks)
+    if max_samples is None:
+        return selector_tasks, None
+    budgets: dict[str, int] = {}
+    for leaves in selector_tasks.values():
+        if len(leaves) <= max_samples:
+            base, remainder = divmod(max_samples, len(leaves))
+            for index, leaf in enumerate(leaves):
+                budgets[leaf] = base + (index < remainder)
+            continue
+        selected = {leaves[index * len(leaves) // max_samples] for index in range(max_samples)}
+        for leaf in selected:
+            budgets[leaf] = 1
+    return selector_tasks, budgets
 
 
 def resolve_benchmarks(selectors: tuple[str, ...]) -> ResolvedBenchmarks:
@@ -458,6 +514,7 @@ def resolve_benchmarks(selectors: tuple[str, ...]) -> ResolvedBenchmarks:
     missing: list[str] = []
     incompatible: list[str] = []
     owners: dict[str, str] = {}
+    selector_tasks: list[tuple[str, tuple[str, ...]]] = []
 
     for selector in selectors:
         expanded = registry._expand_task_definition(selector)
@@ -465,6 +522,7 @@ def resolve_benchmarks(selectors: tuple[str, ...]) -> ResolvedBenchmarks:
         if unavailable:
             missing.append(selector)
             continue
+        selector_tasks.append((selector, tuple(expanded)))
         for leaf in expanded:
             if leaf in owners:
                 raise ConfigError(f"benchmark selectors overlap on {leaf}: {owners[leaf]}, {selector}")
@@ -487,7 +545,11 @@ def resolve_benchmarks(selectors: tuple[str, ...]) -> ResolvedBenchmarks:
         )
     if not owners:
         raise ConfigError("no LightEval benchmark leaf tasks were resolved")
-    return ResolvedBenchmarks(selector_count=len(selectors), leaf_tasks=tuple(sorted(owners)))
+    return ResolvedBenchmarks(
+        selector_count=len(selectors),
+        leaf_tasks=tuple(sorted(owners)),
+        selector_tasks=tuple(selector_tasks),
+    )
 
 
 def _preflight(config: RWKVEvaluationConfig) -> tuple[PoolManifest, RWKVHttpPool, ResolvedBenchmarks]:
@@ -566,11 +628,14 @@ def rwkv(
             load_tasks_multilingual=True,
             convert_logprob_choices_to_generation=True,
         )
+        selector_tasks, task_max_samples = _selector_sample_budgets(resolved, max_samples)
         pipeline = RWKVPipeline(
             tasks=",".join(eval_config.benchmarks),
             pipeline_parameters=parameters,
             evaluation_tracker=tracker,
             model=model,
+            selector_tasks=selector_tasks,
+            task_max_samples=task_max_samples,
         )
         from lighteval.logging.scoreboard import ScoreboardCallback
 

@@ -15,7 +15,7 @@ from urllib.parse import quote, urlsplit
 
 import httpx
 
-from lighteval.logging.info_loggers import DetailsLogger, MetricsLogger
+from lighteval.logging.info_loggers import DetailsLogger
 from lighteval.models.model_output import ModelResponse
 
 
@@ -30,6 +30,7 @@ logger = logging.getLogger(__name__)
 @dataclass(frozen=True)
 class _Rollout:
     detail: DetailsLogger.Detail
+    task_name: str
     document_index: int
     repeat_id: int
     response: ModelResponse
@@ -68,7 +69,7 @@ def _campaign_run_key(campaign: dict) -> str:
 
 
 class ScoreboardCallback:
-    """Publish one completed LightEval task as one finalized campaign."""
+    """Publish one configured benchmark selector as one finalized campaign."""
 
     def __init__(self, *, base_url, token, config_path, pipeline, tracker, model, rerun_reason=None) -> None:
         parsed = urlsplit(base_url)
@@ -90,6 +91,7 @@ class ScoreboardCallback:
             }
         )
         self._rerun_reason = rerun_reason
+        self._selector_details: dict[str, dict[str, list[DetailsLogger.Detail]]] = {}
         self._request("GET", "/api/v1/evaluation-publication-preflight")
 
     def _campaign(self, task_metadata: dict) -> dict:
@@ -100,7 +102,7 @@ class ScoreboardCallback:
             "source": "lighteval",
             "config_sha256": self._config_digest,
             "registry_sha256": _sha256(registry),
-            "contract_sha256": _sha256("scoreboard-v1:lighteval:document,rollout,metrics,model_response"),
+            "contract_sha256": _sha256("scoreboard-v1:lighteval:selector,document,rollout,metrics,model_response"),
             "configured_benchmarks": [task_metadata["benchmark"]],
             "resolved_benchmarks": [task_metadata["benchmark"]],
             "skipped_benchmarks": [],
@@ -121,14 +123,26 @@ class ScoreboardCallback:
         return cls(base_url=base_url, token=token, rerun_reason=os.environ.get("SCOREBOARD_RERUN_REASON"), **kwargs)
 
     def __call__(self, task_name: str, details: list[DetailsLogger.Detail]) -> None:
-        task = self._pipeline.tasks_dict[task_name]
-        task_metadata = self._task_metadata(task)
-        aggregate = MetricsLogger()
-        aggregate.metrics_values[task_name] = self._tracker.metrics_logger.metrics_values[task_name]
-        aggregate.aggregate({task_name: task}, bootstrap_iters=0)
-        metrics = {name: float(value) for name, value in aggregate.metric_aggregated[task_name].items()}
-        primary_metric = next(iter(metrics))
-        rollouts = self._rollouts(task, details)
+        selector = self._pipeline._task_selectors[task_name]
+        selector_details = self._selector_details.setdefault(selector, {})
+        selector_details[task_name] = details
+        expected = self._pipeline._selector_tasks[selector]
+        if any(expected_task not in selector_details for expected_task in expected):
+            return
+        self._publish_selector(selector, expected, selector_details)
+        del self._selector_details[selector]
+
+    def _publish_selector(self, selector, task_names, details_by_task) -> None:
+        tasks = [self._pipeline.tasks_dict[task_name] for task_name in task_names]
+        task_metadata = self._task_metadata(selector, tasks)
+        rollouts = []
+        document_offset = 0
+        for task, task_name in zip(tasks, task_names):
+            details = details_by_task[task_name]
+            rollouts.extend(self._rollouts(task, details, document_offset))
+            document_offset += len(details)
+        primary_metric = self._primary_metric(tasks)
+        metrics = {primary_metric: sum(rollout.score for rollout in rollouts) / len(rollouts)}
         selected, outcome_totals = self._select_samples(rollouts)
         samples = [self._sample(index, rollout, primary_metric) for index, rollout in enumerate(selected)]
         outcome_uploaded = {
@@ -149,20 +163,17 @@ class ScoreboardCallback:
             "campaign_id": campaign_id,
             "task": task_metadata,
             "result_files": [],
-            "task_config": {
-                **{name: getattr(task.config, name) for name in _TASK_CONFIG_FIELDS},
-                "k_metrics": next(iter(metrics)),
-            },
+            "task_config": self._task_config(tasks, primary_metric),
             "environment": {
                 "framework": "lighteval",
                 "lighteval_sha": self._tracker.general_config_logger.lighteval_sha,
                 **{name: getattr(self._model.config, name) for name in _ENVIRONMENT_FIELDS},
             },
-            "sampling_config": self._sampling_config(task),
+            "sampling_config": self._sampling_config(tasks),
             "primary_metric": primary_metric,
             "metrics": metrics,
             "diagnostics": {
-                "documents_total": len(details),
+                "documents_total": sum(len(details_by_task[task_name]) for task_name in task_names),
                 "completions_total": completions,
                 "samples_total": completions,
                 "samples_uploaded": len(samples),
@@ -173,7 +184,7 @@ class ScoreboardCallback:
             },
             "samples": samples,
             "comparison": self._comparison(
-                task, metrics, len(samples), truncated / completions if completions else 0.0
+                selector, metrics, len(samples), truncated / completions if completions else 0.0
             ),
         }
         identity = task_metadata["identity"]
@@ -182,7 +193,7 @@ class ScoreboardCallback:
             logger.info(
                 "Scoreboard task already finalized: campaign=%s task=%s hash_matches=%s",
                 campaign_id,
-                task_name,
+                selector,
                 receipt.get("task_hashes", {}).get(identity) == publication_sha256,
             )
             return
@@ -194,30 +205,59 @@ class ScoreboardCallback:
             idempotency_key=f"finalize:{campaign_id}",
         )
 
-    def _task_metadata(self, task) -> dict:
-        config = task.config
-        task_name = task.full_name
+    def _task_metadata(self, selector, tasks) -> dict:
+        configs = [task.config for task in tasks]
         revision = self._model.config.model_revision
+        versions = sorted({str(config.version) for config in configs})
+        repositories = {config.hf_repo for config in configs}
+        subsets = {config.hf_subset for config in configs}
         return {
-            "identity": f"{revision}:{self._model.config.wkv_mode}:{task_name}",
+            "identity": f"{revision}:{self._model.config.wkv_mode}:{selector}",
             "weight_sha256": revision,
             "weight_display_name": self._model.config.model_name,
             "wkv_mode": self._model.config.wkv_mode,
-            "benchmark": config.name,
-            "task_name": task_name,
-            "task_version": str(config.version),
-            "dataset": config.hf_repo or None,
-            "subset": config.hf_subset or None,
-            "evaluation_splits": sorted(config.evaluation_splits),
+            "benchmark": selector,
+            "task_name": selector,
+            "task_version": ",".join(versions),
+            "dataset": next(iter(repositories)) if len(repositories) == 1 else None,
+            "subset": next(iter(subsets)) if len(subsets) == 1 else None,
+            "evaluation_splits": sorted({split for config in configs for split in config.evaluation_splits}),
             "languages": [],
             "tags": [],
         }
 
-    def _sampling_config(self, task) -> dict:
+    def _task_config(self, tasks, primary_metric) -> dict:
+        configs = [task.config for task in tasks]
+        values = {}
+        for name in _TASK_CONFIG_FIELDS:
+            field_values = [getattr(config, name) for config in configs]
+            if name in {"original_num_docs", "effective_num_docs"}:
+                values[name] = sum(field_values)
+            elif name == "generation_size":
+                values[name] = max(field_values)
+            elif name == "stop_sequence":
+                values[name] = list(dict.fromkeys(stop for value in field_values for stop in value))
+            else:
+                unique = list(dict.fromkeys(field_values))
+                values[name] = unique[0] if len(unique) == 1 else unique
+        values["k_metrics"] = primary_metric
+        return values
+
+    @staticmethod
+    def _primary_metric(tasks) -> str:
+        names = {
+            task.metrics[0].metric_name
+            if isinstance(task.metrics[0].metric_name, str)
+            else task.metrics[0].metric_name[0]
+            for task in tasks
+        }
+        return next(iter(names)) if len(names) == 1 else "mean"
+
+    def _sampling_config(self, tasks) -> dict:
         config = self._model.config
         parameters = dict(self._model._generation_parameters)
         chat_kwargs = {"rwkv_prompt_template": config.prompt_template, "rwkv_generation_prompt": config.cot_mode}
-        documents = self._pipeline.documents_dict[task.full_name]
+        documents = [doc for task in tasks for doc in self._pipeline.documents_dict[task.full_name]]
         parameters.update(
             max_completion_tokens=max(self._model._completion_limit(doc) for doc in documents),
             num_samples=max(doc.num_samples for doc in documents),
@@ -241,7 +281,7 @@ class ScoreboardCallback:
             "parameters": parameter_match.group(1).upper(),
         }
 
-    def _comparison(self, task, metrics: dict, samples: int, truncation_rate: float) -> dict:
+    def _comparison(self, selector: str, metrics: dict, samples: int, truncation_rate: float) -> dict:
         precision = self._model.config.wkv_mode
         parameter = self._model_variant["parameters"]
         option = {
@@ -263,7 +303,7 @@ class ScoreboardCallback:
         return {
             "model": self._model_variant,
             "benchmark": {
-                "label": task.config.name,
+                "label": selector,
                 "categories": [{"id": "benchmark", "label": "Benchmark"}],
                 "evaluation_method": next(iter(metrics)),
                 "score_multiplier": 100.0,
@@ -289,10 +329,10 @@ class ScoreboardCallback:
         return selected, {outcome: len(bucket) for outcome, bucket in buckets.items()}
 
     @classmethod
-    def _rollouts(cls, task, details: list[DetailsLogger.Detail]) -> list[_Rollout]:
+    def _rollouts(cls, task, details: list[DetailsLogger.Detail], document_offset: int = 0) -> list[_Rollout]:
         scorer = task.metrics[0].sample_level_fn
         rollouts = []
-        for document_index, detail in enumerate(details):
+        for document_index, detail in enumerate(details, start=document_offset):
             for repeat_id in range(len(detail.model_response.text)):
                 response = detail.model_response[repeat_id]
                 response.truncated_tokens_count = int(response.finish_reasons == ["length"])
@@ -300,6 +340,7 @@ class ScoreboardCallback:
                 rollouts.append(
                     _Rollout(
                         detail=detail,
+                        task_name=task.full_name,
                         document_index=document_index,
                         repeat_id=repeat_id,
                         response=response,
@@ -324,6 +365,7 @@ class ScoreboardCallback:
         response = rollout.response
         outcome = rollout.outcome
         document_id = str(doc.id)
+        problem_id = f"{rollout.task_name}:{document_id}"
         ground_truth = doc.get_golds()
         fail_reason = "answer_mismatch" if outcome == "incorrect" else None
         if outcome == "unanswered":
@@ -336,12 +378,12 @@ class ScoreboardCallback:
             "sample_index": index,
             "document_index": rollout.document_index,
             # Answer metadata below contains the UI fields; keep source records minimal.
-            "document": {"id": document_id, "query": doc.query},
+            "document": {"id": problem_id, "query": doc.query},
             "metrics": {"scoreboard_outcome": outcome, primary_metric: rollout.score},
             "model_response": {"text": response.text},
             "answer": {
                 "outcome": outcome,
-                "problem_id": document_id or str(index),
+                "problem_id": problem_id,
                 "repeat_id": rollout.repeat_id,
                 "ground_truth": ground_truth[0]
                 if len(ground_truth) == 1

@@ -87,7 +87,11 @@ async def _evaluate_streaming_pipeline(pipeline):
 def test_dry_run_preflights_without_creating_results_or_model(tmp_path, monkeypatch):
     config = _config(tmp_path)
     pool = SimpleNamespace(close=lambda: setattr(pool, "closed", True), closed=False)
-    resolved = main_rwkv.ResolvedBenchmarks(selector_count=2, leaf_tasks=("gsm8k", "ifeval"))
+    resolved = main_rwkv.ResolvedBenchmarks(
+        selector_count=2,
+        leaf_tasks=("gsm8k", "ifeval"),
+        selector_tasks=(("gsm8k", ("gsm8k",)), ("ifeval", ("ifeval",))),
+    )
     monkeypatch.setattr(main_rwkv.RWKVEvaluationConfig, "read", lambda _path: config)
     monkeypatch.setattr(main_rwkv, "_preflight", lambda _config: (_manifest(), pool, resolved))
     monkeypatch.setattr(
@@ -126,7 +130,11 @@ def test_cli_reports_all_resolution_errors_with_nonzero_exit(tmp_path, monkeypat
 def test_partial_run_uses_native_pipeline_and_standard_saving(tmp_path, monkeypatch):
     config = _config(tmp_path)
     pool = SimpleNamespace(close=lambda: None)
-    resolved = main_rwkv.ResolvedBenchmarks(selector_count=2, leaf_tasks=("gsm8k", "ifeval"))
+    resolved = main_rwkv.ResolvedBenchmarks(
+        selector_count=2,
+        leaf_tasks=("gsm8k", "ifeval"),
+        selector_tasks=(("gsm8k", ("gsm8k",)), ("ifeval", ("ifeval",))),
+    )
     calls = []
     monkeypatch.delenv("SCOREBOARD_API_BASE_URL", raising=False)
     monkeypatch.delenv("SCOREBOARD_PUBLICATION_TOKEN", raising=False)
@@ -175,6 +183,8 @@ def test_partial_run_uses_native_pipeline_and_standard_saving(tmp_path, monkeypa
     assert pipeline_call[1]["pipeline_parameters"].max_samples == 3
     assert pipeline_call[1]["pipeline_parameters"].load_tasks_multilingual is True
     assert pipeline_call[1]["pipeline_parameters"].convert_logprob_choices_to_generation is True
+    assert pipeline_call[1]["selector_tasks"] == {"gsm8k": ("gsm8k",), "ifeval": ("ifeval",)}
+    assert pipeline_call[1]["task_max_samples"] == {"gsm8k": 3, "ifeval": 3}
     assert ("evaluate",) in calls
     assert ("show",) in calls
     assert ("save",) in calls
@@ -411,7 +421,10 @@ def test_scoreboard_callback_selects_twenty_samples_per_outcome():
         corpus_level_fn=lambda values: sum(values) / len(values),
         higher_is_better=True,
     )
-    task = SimpleNamespace(metrics=(SimpleNamespace(sample_level_fn=main_rwkv.RWKVAvgAtK(1, native_metric)),))
+    task = SimpleNamespace(
+        full_name="task|0",
+        metrics=(SimpleNamespace(sample_level_fn=main_rwkv.RWKVAvgAtK(1, native_metric)),),
+    )
     selected, totals = ScoreboardCallback._select_samples(ScoreboardCallback._rollouts(task, details))
 
     assert totals == {"correct": 25, "incorrect": 25, "unanswered": 25}
@@ -439,6 +452,52 @@ def test_evaluation_plan_uses_power_of_two_k_or_twenty_percent(num_docs, effecti
         assert k & (k - 1) == 0
         assert k * num_docs > 5000
         assert k == 1 or (k // 2) * num_docs <= 5000
+
+
+def test_partial_budget_is_ten_per_selector_not_ten_per_leaf():
+    leaves = tuple(f"mmlu:subject_{index}" for index in range(57))
+    resolved = main_rwkv.ResolvedBenchmarks(
+        selector_count=2,
+        leaf_tasks=(*leaves, "gsm8k"),
+        selector_tasks=(("mmlu", leaves), ("gsm8k", ("gsm8k",))),
+    )
+
+    selector_tasks, budgets = main_rwkv._selector_sample_budgets(resolved, 10)
+
+    assert selector_tasks == {"mmlu": leaves, "gsm8k": ("gsm8k",)}
+    assert budgets is not None
+    assert sum(budgets[leaf] for leaf in leaves if leaf in budgets) == 10
+    assert [index for index, leaf in enumerate(leaves) if leaf in budgets] == [0, 5, 11, 17, 22, 28, 34, 39, 45, 51]
+    assert budgets["gsm8k"] == 10
+
+
+def test_partial_pipeline_drops_leaf_tasks_without_selector_budget(monkeypatch):
+    tasks = {"mmlu:a|0": object(), "mmlu:b|0": object(), "gsm8k|0": object()}
+
+    class Registry:
+        def __init__(self, **_kwargs):
+            pass
+
+        def load_tasks(self):
+            return dict(tasks)
+
+    monkeypatch.setattr(main_rwkv, "Registry", Registry)
+    pipeline = main_rwkv.RWKVPipeline.__new__(main_rwkv.RWKVPipeline)
+    pipeline._configured_selector_tasks = {"mmlu": ("mmlu:a", "mmlu:b"), "gsm8k": ("gsm8k",)}
+    pipeline._configured_task_max_samples = {"mmlu:b": 1, "gsm8k": 10}
+    pipeline.pipeline_parameters = SimpleNamespace(
+        load_tasks_multilingual=True,
+        custom_tasks_directory=None,
+        convert_logprob_choices_to_generation=True,
+    )
+    pipeline._metric_options = None
+
+    pipeline._init_tasks_and_requests("mmlu,gsm8k")
+
+    assert tuple(pipeline.tasks_dict) == ("mmlu:b|0", "gsm8k|0")
+    assert pipeline._task_names == ("mmlu:b|0", "gsm8k|0")
+    assert pipeline._selector_tasks == {"mmlu": ("mmlu:b|0",), "gsm8k": ("gsm8k|0",)}
+    assert pipeline._task_max_samples == {"mmlu:b|0": 1, "gsm8k|0": 10}
 
 
 def test_rwkv_avg_at_k_averages_the_native_task_scorer():
@@ -559,7 +618,10 @@ def test_scoreboard_splits_rollouts_and_scores_each_one():
         corpus_level_fn=lambda values: sum(values) / len(values),
         higher_is_better=True,
     )
-    task = SimpleNamespace(metrics=(SimpleNamespace(sample_level_fn=main_rwkv.RWKVAvgAtK(2, native_metric)),))
+    task = SimpleNamespace(
+        full_name="task|0",
+        metrics=(SimpleNamespace(sample_level_fn=main_rwkv.RWKVAvgAtK(2, native_metric)),),
+    )
 
     rollouts = ScoreboardCallback._rollouts(task, [detail])
     samples = [ScoreboardCallback._sample(index, rollout, "avg@2") for index, rollout in enumerate(rollouts)]
@@ -571,6 +633,28 @@ def test_scoreboard_splits_rollouts_and_scores_each_one():
     assert [sample["answer"]["raw_completion"] for sample in samples] == ["one", ""]
     assert [sample["answer"]["repeat_id"] for sample in samples] == [0, 1]
     assert samples[0]["metrics"] == {"scoreboard_outcome": "correct", "avg@2": 1.0}
+
+
+def test_scoreboard_waits_for_all_internal_leaves_and_publishes_only_selector():
+    callback = ScoreboardCallback.__new__(ScoreboardCallback)
+    callback._pipeline = SimpleNamespace(
+        _task_selectors={"mmlu:a|0": "mmlu", "mmlu:b|0": "mmlu"},
+        _selector_tasks={"mmlu": ("mmlu:a|0", "mmlu:b|0")},
+    )
+    callback._selector_details = {}
+    publications = []
+    callback._publish_selector = lambda selector, tasks, details: publications.append((selector, tasks, details))
+
+    callback("mmlu:a|0", ["a"])
+    assert publications == []
+
+    callback("mmlu:b|0", ["b"])
+
+    assert len(publications) == 1
+    assert publications[0][0] == "mmlu"
+    assert publications[0][1] == ("mmlu:a|0", "mmlu:b|0")
+    assert publications[0][2] == {"mmlu:a|0": ["a"], "mmlu:b|0": ["b"]}
+    assert callback._selector_details == {}
 
 
 def test_scoreboard_publication_keeps_only_display_fields(tmp_path, monkeypatch):
@@ -620,6 +704,7 @@ def test_scoreboard_publication_keeps_only_display_fields(tmp_path, monkeypatch)
         num_samples=[1],
         metrics=(
             SimpleNamespace(
+                metric_name="avg@1",
                 sample_level_fn=main_rwkv.RWKVAvgAtK(
                     1,
                     main_rwkv.SampleLevelMetric(
@@ -629,7 +714,7 @@ def test_scoreboard_publication_keeps_only_display_fields(tmp_path, monkeypatch)
                         corpus_level_fn=lambda values: sum(values) / len(values),
                         higher_is_better=True,
                     ),
-                )
+                ),
             ),
         ),
         aggregation=lambda: {"avg@1": lambda values: sum(values) / len(values)},
@@ -654,6 +739,8 @@ def test_scoreboard_publication_keeps_only_display_fields(tmp_path, monkeypatch)
     pipeline = SimpleNamespace(
         tasks_dict={"gsm8k|0": task},
         documents_dict={"gsm8k|0": [SimpleNamespace(num_samples=1)]},
+        _task_selectors={"gsm8k|0": "gsm8k"},
+        _selector_tasks={"gsm8k": ("gsm8k|0",)},
     )
     tracker = SimpleNamespace(
         metrics_logger=MetricsLogger(),
@@ -687,6 +774,8 @@ def test_scoreboard_publication_keeps_only_display_fields(tmp_path, monkeypatch)
     assert publication["sampling_config"]["temperature"] == 0.96
     assert publication["sampling_config"]["num_samples"] == 1
     assert publication["task_config"]["k_metrics"] == "avg@1"
+    assert publication["task"]["benchmark"] == "gsm8k"
+    assert publication["task"]["task_name"] == "gsm8k"
     assert publication["comparison"]["coordinates"][0]["comparison"]["id"] == "precision"
     assert publication["comparison"]["coordinates"][0]["arm"] == "b"
     assert publication["comparison"]["samples"] == 1
@@ -694,6 +783,7 @@ def test_scoreboard_publication_keeps_only_display_fields(tmp_path, monkeypatch)
     assert sample["metrics"]["scoreboard_outcome"] == "correct"
     assert sample["model_response"]["text"] == ["2"]
     assert sample["answer"]["outcome"] == "correct"
+    assert sample["answer"]["problem_id"] == "gsm8k|0:7"
     assert sample["answer"]["ground_truth"] == "2"
     assert sample["answer"]["assembled_prompt"] == "User: What is 1 + 1?"
     assert sample["answer"]["raw_completion"] == "2"
