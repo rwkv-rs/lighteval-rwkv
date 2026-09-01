@@ -41,6 +41,10 @@ import numpy as np
 from tqdm import tqdm
 
 
+_FORK_CONTEXT = multiprocessing.get_context("fork")
+_SPAWN_CONTEXT = multiprocessing.get_context("spawn")
+
+
 try:
     sys.set_int_max_str_digits(50000)
 except AttributeError:
@@ -503,9 +507,9 @@ def check_correctness(sample, generation, timeout: int) -> list[int | bool]:
     def _temp_run(sample, generation, result):
         result.append(run_test(sample, test=generation, timeout=timeout))
 
-    manager = multiprocessing.Manager()
+    manager = _FORK_CONTEXT.Manager()
     result = manager.list()
-    p = multiprocessing.Process(target=_temp_run, args=(sample, generation, result))
+    p = _FORK_CONTEXT.Process(target=_temp_run, args=(sample, generation, result))
     p.start()
     p.join(timeout=(timeout + 1) * len(json.loads(sample["input_output"])["inputs"]) + 5)
     if p.is_alive():
@@ -574,7 +578,7 @@ def evaluate_generations(
     ]
 
     with tqdm(total=len(inputs)) as pbar:
-        with ProcessPoolExecutor(max_workers=num_process_evaluate) as executor:
+        with ProcessPoolExecutor(max_workers=num_process_evaluate, mp_context=_SPAWN_CONTEXT) as executor:
             futures = {executor.submit(evaluate_generations_by_problem, arg): index for arg, index in inputs}
 
             results = {}

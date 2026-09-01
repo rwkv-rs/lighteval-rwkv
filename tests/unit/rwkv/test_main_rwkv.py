@@ -643,6 +643,40 @@ def test_scoreboard_splits_rollouts_and_scores_each_one():
     assert samples[0]["metrics"] == {"scoreboard_outcome": "correct", "avg@2": 1.0}
 
 
+def test_lcb_outer_workers_use_spawn_context(monkeypatch):
+    from lighteval.tasks.tasks.lcb import codegen_metrics
+
+    contexts = []
+
+    class Future:
+        @staticmethod
+        def result():
+            return [True]
+
+    class Executor:
+        def __init__(self, *, max_workers, mp_context):
+            assert max_workers == 1
+            contexts.append(mp_context.get_start_method())
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        @staticmethod
+        def submit(_function, _argument):
+            return Future()
+
+    monkeypatch.setattr(codegen_metrics, "ProcessPoolExecutor", Executor)
+    monkeypatch.setattr(codegen_metrics, "as_completed", iter)
+
+    results = codegen_metrics.evaluate_generations([{}], [["code"]], num_process_evaluate=1)
+
+    assert contexts == ["spawn"]
+    assert results == {0: [True]}
+
+
 def test_scoreboard_waits_for_all_internal_leaves_and_publishes_only_selector():
     callback = ScoreboardCallback.__new__(ScoreboardCallback)
     callback._pipeline = SimpleNamespace(
