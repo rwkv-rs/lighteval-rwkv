@@ -523,6 +523,21 @@ def test_rwkv_avg_at_k_averages_the_native_task_scorer():
     assert str(scorer) == "RWKVAvgAtK(k=4)"
 
 
+def test_rwkv_avg_at_k_scores_truncated_rollout_as_zero():
+    metric = main_rwkv.SampleLevelMetric(
+        metric_name="accuracy",
+        sample_level_fn=ExactMatches(strip_strings=True),
+        category=main_rwkv.SamplingMethod.GENERATIVE,
+        corpus_level_fn=lambda values: sum(values) / len(values),
+        higher_is_better=True,
+    )
+    scorer = main_rwkv.RWKVAvgAtK(1, metric)
+    doc = Doc(query="question", choices=["answer"], gold_index=0)
+    response = ModelResponse(text=["answer"], finish_reasons=["length"])
+
+    assert scorer.compute(doc, response) == 0.0
+
+
 def test_rwkv_pipeline_exposes_only_avg_at_k_and_updates_document_counts():
     doc = Doc(
         query="question",

@@ -63,6 +63,8 @@ class RWKVAvgAtK(SampleLevelComputation):
         return sum(self.score_rollout(doc, model_response[index]) for index in range(self.k)) / self.k
 
     def score_rollout(self, doc: Doc, model_response) -> float:
+        if model_response.finish_reasons == ["length"]:
+            return 0.0
         scorer = self.metric.sample_level_fn
         if isinstance(scorer, SamplingMetric):
             return float(scorer.compute_score(doc, model_response))
