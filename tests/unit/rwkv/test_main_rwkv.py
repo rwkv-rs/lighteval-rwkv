@@ -435,6 +435,12 @@ def test_scoreboard_callback_selects_twenty_samples_per_outcome():
     }
 
 
+def test_scoreboard_does_not_discard_truncated_explicit_answer():
+    response = SimpleNamespace(final_text=["B"], finish_reasons=["length"])
+
+    assert ScoreboardCallback._outcome(response, 0.0) == "incorrect"
+
+
 @pytest.mark.parametrize(
     ("num_docs", "effective_docs", "k", "metric_name"),
     [

@@ -437,7 +437,7 @@ class ScoreboardCallback:
     def _outcome(response: ModelResponse, score: float) -> str:
         if score == 1.0:
             return "correct"
-        if not response.final_text[0].strip() or response.finish_reasons == ["length"]:
+        if not response.final_text[0].strip():
             return "unanswered"
         return "incorrect"
 
