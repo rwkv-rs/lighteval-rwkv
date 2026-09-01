@@ -24,6 +24,68 @@ MAX_COMPRESSED_BYTES = 64 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _TASK_CONFIG_FIELDS = ("num_fewshots", "generation_size", "stop_sequence", "original_num_docs", "effective_num_docs")
 _ENVIRONMENT_FIELDS = ("served_model_name", "model_revision", "vllm_version", "pool_fingerprint", "max_model_length")
+_FIELD_CATEGORIES = (
+    ("knowledge", "世界知识", frozenset({"knowledge", "general-knowledge", "factuality", "history", "geography"})),
+    (
+        "science",
+        "科学",
+        frozenset({"science", "scientific", "biology", "chemistry", "physics", "graduate-level"}),
+    ),
+    ("math", "数学", frozenset({"math", "arithmetic"})),
+    ("code", "代码", frozenset({"code-generation", "execution"})),
+    ("medical", "医疗", frozenset({"health", "medical", "biomedical"})),
+    (
+        "reasoning",
+        "推理",
+        frozenset(
+            {
+                "reasoning",
+                "commonsense",
+                "common-sense",
+                "physical-commonsense",
+                "symbolic",
+                "state-tracking",
+                "nli",
+            }
+        ),
+    ),
+    ("instruction", "指令遵循", frozenset({"instruction-following", "multi-turn"})),
+    (
+        "language",
+        "语言",
+        frozenset(
+            {
+                "language",
+                "language-understanding",
+                "language-modeling",
+                "reading-comprehension",
+                "translation",
+                "summarization",
+                "conversational",
+                "dialog",
+                "generation",
+                "classification",
+            }
+        ),
+    ),
+    (
+        "safety",
+        "安全与价值观",
+        frozenset(
+            {
+                "safety",
+                "bias",
+                "ethics",
+                "justice",
+                "morality",
+                "truthfulness",
+                "utilitarianism",
+                "virtue",
+            }
+        ),
+    ),
+    ("multimodal", "多模态", frozenset({"multimodal"})),
+)
 logger = logging.getLogger(__name__)
 
 
@@ -84,6 +146,11 @@ class ScoreboardCallback:
         self._tracker = tracker
         self._model = model
         self._model_variant = self._model_metadata(model.config.model_name)
+        self._task_metadata_by_name = {
+            task["name"]: module["docstring"]
+            for module in pipeline.registry.get_tasks_dump()
+            for task in module["tasks"]
+        }
         self._config_digest = _sha256(
             {
                 "file_sha256": hashlib.sha256(Path(config_path).read_bytes()).hexdigest(),
@@ -184,7 +251,11 @@ class ScoreboardCallback:
             },
             "samples": samples,
             "comparison": self._comparison(
-                selector, metrics, len(samples), truncated / completions if completions else 0.0
+                selector,
+                task_metadata["tags"],
+                metrics,
+                len(samples),
+                truncated / completions if completions else 0.0,
             ),
         }
         identity = task_metadata["identity"]
@@ -211,6 +282,7 @@ class ScoreboardCallback:
         versions = sorted({str(config.version) for config in configs})
         repositories = {config.hf_repo for config in configs}
         subsets = {config.hf_subset for config in configs}
+        metadata = [self._task_metadata_by_name[config.name] for config in configs]
         return {
             "identity": f"{revision}:{self._model.config.wkv_mode}:{selector}",
             "weight_sha256": revision,
@@ -222,8 +294,8 @@ class ScoreboardCallback:
             "dataset": next(iter(repositories)) if len(repositories) == 1 else None,
             "subset": next(iter(subsets)) if len(subsets) == 1 else None,
             "evaluation_splits": sorted({split for config in configs for split in config.evaluation_splits}),
-            "languages": [],
-            "tags": [],
+            "languages": sorted({language for values in metadata for language in values.get("languages", [])}),
+            "tags": sorted({tag for values in metadata for tag in values.get("tags", [])}),
         }
 
     def _task_config(self, tasks, primary_metric) -> dict:
@@ -282,7 +354,17 @@ class ScoreboardCallback:
             "parameters": parameter_match.group(1).upper(),
         }
 
-    def _comparison(self, selector: str, metrics: dict, samples: int, truncation_rate: float) -> dict:
+    @staticmethod
+    def _categories(tags: list[str]) -> list[dict[str, str]]:
+        task_tags = set(tags)
+        categories = [
+            {"id": identifier, "label": label}
+            for identifier, label, field_tags in _FIELD_CATEGORIES
+            if task_tags & field_tags
+        ]
+        return categories or [{"id": "other", "label": "其他"}]
+
+    def _comparison(self, selector: str, tags: list[str], metrics: dict, samples: int, truncation_rate: float) -> dict:
         precision = self._model.config.wkv_mode
         parameter = self._model_variant["parameters"]
         option = {
@@ -305,7 +387,7 @@ class ScoreboardCallback:
             "model": self._model_variant,
             "benchmark": {
                 "label": selector,
-                "categories": [{"id": "benchmark", "label": "Benchmark"}],
+                "categories": self._categories(tags),
                 "evaluation_method": next(iter(metrics)),
                 "score_multiplier": 100.0,
             },

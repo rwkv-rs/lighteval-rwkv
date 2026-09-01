@@ -657,6 +657,68 @@ def test_scoreboard_waits_for_all_internal_leaves_and_publishes_only_selector():
     assert callback._selector_details == {}
 
 
+def test_scoreboard_aggregates_lighteval_metadata_for_selector():
+    callback = ScoreboardCallback.__new__(ScoreboardCallback)
+    callback._model = SimpleNamespace(
+        config=SimpleNamespace(
+            model_name="RWKV7-g1h-7.2B-20260710-ctx10240", model_revision="a" * 64, wkv_mode="fp32io16"
+        )
+    )
+    callback._task_metadata_by_name = {
+        "mmlu:a": {"languages": ["english"], "tags": ["knowledge", "multiple-choice"]},
+        "mmlu:b": {"languages": ["english", "chinese"], "tags": ["math", "multiple-choice"]},
+    }
+    tasks = [
+        SimpleNamespace(
+            config=SimpleNamespace(
+                name=name,
+                version=0,
+                hf_repo="lighteval/mmlu",
+                hf_subset=name,
+                evaluation_splits=("test",),
+            )
+        )
+        for name in ("mmlu:a", "mmlu:b")
+    ]
+
+    metadata = callback._task_metadata("mmlu", tasks)
+
+    assert metadata["benchmark"] == "mmlu"
+    assert metadata["task_name"] == "mmlu"
+    assert metadata["languages"] == ["chinese", "english"]
+    assert metadata["tags"] == ["knowledge", "math", "multiple-choice"]
+
+
+def test_scoreboard_maps_lighteval_tags_to_fields():
+    assert ScoreboardCallback._categories(
+        [
+            "general-knowledge",
+            "biology",
+            "arithmetic",
+            "execution",
+            "biomedical",
+            "common-sense",
+            "multi-turn",
+            "translation",
+            "truthfulness",
+            "multimodal",
+            "multiple-choice",
+        ]
+    ) == [
+        {"id": "knowledge", "label": "世界知识"},
+        {"id": "science", "label": "科学"},
+        {"id": "math", "label": "数学"},
+        {"id": "code", "label": "代码"},
+        {"id": "medical", "label": "医疗"},
+        {"id": "reasoning", "label": "推理"},
+        {"id": "instruction", "label": "指令遵循"},
+        {"id": "language", "label": "语言"},
+        {"id": "safety", "label": "安全与价值观"},
+        {"id": "multimodal", "label": "多模态"},
+    ]
+    assert ScoreboardCallback._categories(["multiple-choice", "qa"]) == [{"id": "other", "label": "其他"}]
+
+
 def test_scoreboard_selector_keeps_unconfigured_generation_size():
     callback = ScoreboardCallback.__new__(ScoreboardCallback)
     configs = [
@@ -761,6 +823,14 @@ def test_scoreboard_publication_keeps_only_display_fields(tmp_path, monkeypatch)
         documents_dict={"gsm8k|0": [SimpleNamespace(num_samples=1)]},
         _task_selectors={"gsm8k|0": "gsm8k"},
         _selector_tasks={"gsm8k": ("gsm8k|0",)},
+        registry=SimpleNamespace(
+            get_tasks_dump=lambda: [
+                {
+                    "docstring": {"languages": ["english"], "tags": ["math", "reasoning"]},
+                    "tasks": [{"name": "gsm8k"}],
+                }
+            ]
+        ),
     )
     tracker = SimpleNamespace(
         metrics_logger=MetricsLogger(),
@@ -796,6 +866,12 @@ def test_scoreboard_publication_keeps_only_display_fields(tmp_path, monkeypatch)
     assert publication["task_config"]["k_metrics"] == "avg@1"
     assert publication["task"]["benchmark"] == "gsm8k"
     assert publication["task"]["task_name"] == "gsm8k"
+    assert publication["task"]["languages"] == ["english"]
+    assert publication["task"]["tags"] == ["math", "reasoning"]
+    assert publication["comparison"]["benchmark"]["categories"] == [
+        {"id": "math", "label": "数学"},
+        {"id": "reasoning", "label": "推理"},
+    ]
     assert publication["comparison"]["coordinates"][0]["comparison"]["id"] == "precision"
     assert publication["comparison"]["coordinates"][0]["arm"] == "b"
     assert publication["comparison"]["samples"] == 1
