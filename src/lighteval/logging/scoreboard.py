@@ -435,6 +435,8 @@ class ScoreboardCallback:
 
     @staticmethod
     def _outcome(response: ModelResponse, score: float) -> str:
+        if response.finish_reasons == ["length"]:
+            return "unanswered"
         if score == 1.0:
             return "correct"
         if not response.final_text[0].strip():
@@ -471,7 +473,7 @@ class ScoreboardCallback:
                 "ground_truth": ground_truth[0]
                 if len(ground_truth) == 1
                 else json.dumps(ground_truth, ensure_ascii=False),
-                "extracted_answer": response.final_text[0],
+                "extracted_answer": "" if response.truncated_tokens_count else response.final_text[0],
                 "assembled_prompt": response.input
                 if isinstance(response.input, str)
                 else json.dumps(response.input, ensure_ascii=False),

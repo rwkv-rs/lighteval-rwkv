@@ -435,10 +435,11 @@ def test_scoreboard_callback_selects_twenty_samples_per_outcome():
     }
 
 
-def test_scoreboard_does_not_discard_truncated_explicit_answer():
+@pytest.mark.parametrize("score", [0.0, 1.0])
+def test_scoreboard_discards_truncated_answer(score):
     response = SimpleNamespace(final_text=["B"], finish_reasons=["length"])
 
-    assert ScoreboardCallback._outcome(response, 0.0) == "incorrect"
+    assert ScoreboardCallback._outcome(response, score) == "unanswered"
 
 
 @pytest.mark.parametrize(
@@ -637,6 +638,7 @@ def test_scoreboard_splits_rollouts_and_scores_each_one():
         (1, 0.0, "unanswered"),
     ]
     assert [sample["answer"]["raw_completion"] for sample in samples] == ["one", ""]
+    assert [sample["answer"]["extracted_answer"] for sample in samples] == ["one", ""]
     assert [sample["answer"]["repeat_id"] for sample in samples] == [0, 1]
     assert samples[0]["metrics"] == {"scoreboard_outcome": "correct", "avg@2": 1.0}
 

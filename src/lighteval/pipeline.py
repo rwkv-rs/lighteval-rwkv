@@ -720,7 +720,12 @@ class Pipeline:
         for doc, response in zip(self.sampling_docs.get(SamplingMethod.GENERATIVE, []), responses):
             if not isinstance(doc.specific, dict) or doc.specific.get("rwkv_choice") is not True:
                 continue
-            response.text_post_processed = [_choice_answer(text, doc.choices, doc.query) for text in response.text]
+            response.text_post_processed = [
+                ""
+                if index < len(response.finish_reasons) and response.finish_reasons[index] == "length"
+                else _choice_answer(text, doc.choices, doc.query)
+                for index, text in enumerate(response.text)
+            ]
 
     def _compute_metrics(self, sampling_method_responses: dict[str, list[ModelResponse]]):
         # To compute the metrics we first group the samples and task and then by metrics.

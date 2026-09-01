@@ -182,6 +182,30 @@ def test_pipeline_converts_single_and_multiselect_logprob_choices(monkeypatch):
     assert task.metrics[0].compute_sample(doc=multiselect, model_response=multiselect_response) == {"acc": 1}
 
 
+def test_pipeline_does_not_extract_truncated_choice_answer(monkeypatch):
+    doc = _choice_doc()
+    parameters = PipelineParameters(
+        launcher_type=ParallelismManager.NONE,
+        convert_logprob_choices_to_generation=True,
+    )
+    pipeline, task, _, _ = _run_pipeline(
+        monkeypatch,
+        [doc],
+        parameters,
+        metrics=(Metrics.loglikelihood_acc.value,),
+    )
+    response = ModelResponse(
+        text=["<think>The answer may be B, but reasoning continues forever"],
+        output_tokens=[[1, 2, 3]],
+        finish_reasons=["length"],
+    )
+
+    pipeline._post_process_outputs({SamplingMethod.GENERATIVE: [response]})
+
+    assert response.text_post_processed == [""]
+    assert task.metrics[0].compute_sample(doc=doc, model_response=response) == {"acc": 0}
+
+
 @pytest.mark.parametrize("choices", [[" A", " B", " C", " D"], ["A", "B", "C", "D", "E"]])
 def test_pipeline_converts_native_generative_letter_choices(monkeypatch, choices):
     doc = Doc(
