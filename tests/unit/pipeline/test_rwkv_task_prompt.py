@@ -316,6 +316,7 @@ def test_olympiad_bench_does_not_emit_an_empty_specific_struct():
         ("<think>x</think>Answer: <final>B</final>", "two"),
         ('<think>x</think>Answer: <span class="choice">B</span>', "two"),
         ("<think>x</think>Answer: <letter>B</letter>", "two"),
+        ("<think>x</think><letter>C</letter>", "three"),
         ('<think>x</think>Answer: {"answer": "B"}', "two"),
         ("<think>x</think>Answer: <function=finish>\n<parameter=message>\nB\n</parameter>\n</function>", "two"),
         ("<think>x</think>C. three", "three"),
@@ -324,6 +325,9 @@ def test_olympiad_bench_does_not_emit_an_empty_specific_struct():
         ("<think>x</think>This makes (B) the correct effect.", "two"),
         ("<think>x</think>Answer: A\nAnswer: B", "two"),
         ("<think>x</think>Answer: A\nI choose B", "two"),
+        ("<think>x</think>C.", "three"),
+        ("<think>x</think>The correct answer is A, as the evidence shows.", "one"),
+        ("<think>x</think>因此，正确选项为B。\nAnswer: <", "two"),
         ("<think>x</think>Answer: C, A", '["one","three"]'),
         ("<think>x</think>Answer: <letter>", ""),
         ("<think>x</think>Answer: E", ""),
@@ -346,6 +350,19 @@ def test_choice_extraction_uses_query_options_for_native_letter_choices():
 
     assert _choice_answer("<think>x</think>Collective defense", ["A", "B", "C"], query) == "B"
     assert _choice_answer("<think>x</think>The correct answer is <collective defense>.", ["A", "B", "C"], query) == "B"
+
+
+def test_choice_extraction_normalizes_numeric_range_option_text():
+    query = "Question?\nA. 14-28 weeks\nB. 3-9 weeks\nC. 28-37weeks\nD. 8-14weeks\nAnswer:"
+
+    assert (
+        _choice_answer(
+            "<think>x</think>The dangerous period is specifically between 8 and 14 weeks of gestation.",
+            ["A", "B", "C", "D"],
+            query,
+        )
+        == "D"
+    )
 
 
 def test_choice_extraction_prefers_the_longest_unique_option_text():

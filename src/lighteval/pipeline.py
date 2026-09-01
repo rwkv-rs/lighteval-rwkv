@@ -78,7 +78,8 @@ logger = logging.getLogger(__name__)
 
 _RWKV_CHOICE_GENERATION_SIZE = 8192
 _CHOICE_MARKUP = re.compile(r"\*\*|__|`+")
-_CHOICE_LABELS = r"[A-Z](?:\s*(?:,|/|&|\+|\band\b)\s*[A-Z])*"
+_CHOICE_SINGLE_LABEL = r"[A-Z](?![A-Z])"
+_CHOICE_LABELS = rf"{_CHOICE_SINGLE_LABEL}(?:\s*(?:,|/|&|\+|\band\b)\s*{_CHOICE_SINGLE_LABEL})*"
 _CHOICE_PATTERNS = (
     re.compile(
         rf"\\boxed\s*\{{\s*(?:\\(?:text|mathrm)\s*\{{\s*)?({_CHOICE_LABELS})\s*\}}?\s*\}}",
@@ -86,21 +87,21 @@ _CHOICE_PATTERNS = (
     ),
     re.compile(
         rf"(?i:(?:final\s+answer|correct\s+answer|answer|choice|option|最终答案|正确答案|答案|选项)\s*"
-        rf"(?:(?:choice|option)\s*)?(?:is\s*|would\s+be\s*|是\s*|[:：=]\s*)"
+        rf"(?:(?:choice|option)\s*)?(?:is\s*|would\s+be\s*|[是为]\s*|[:：=]\s*)"
         rf"(?:<letter>\s*)?(?:<\s*(?:answer|choice|b)\s*>\s*)?[\"'\[(]*\s*)"
         rf"({_CHOICE_LABELS})",
         re.IGNORECASE,
     ),
     re.compile(
         rf"(?i:(?:final\s+answer|correct\s+answer|answer|choice|option|最终答案|正确答案|答案|选项)\s*"
-        rf"(?:(?:choice|option)\s*)?(?:is\s*|would\s+be\s*|是\s*|[:：=]\s*)<\s*)"
+        rf"(?:(?:choice|option)\s*)?(?:is\s*|would\s+be\s*|[是为]\s*|[:：=]\s*)<\s*)"
         rf"({_CHOICE_LABELS})\s*>",
         re.IGNORECASE,
     ),
     re.compile(
-        rf"<\s*(?:answer|choice|b|final|final_answer|span)(?:\s+[^>]*)?\s*>\s*"
+        rf"<\s*(?:answer|choice|b|final|final_answer|letter|span)(?:\s+[^>]*)?\s*>\s*"
         rf"({_CHOICE_LABELS})(?:\s*[.:]\s*[^<]*)?\s*"
-        rf"</\s*(?:answer|choice|b|final|final_answer|span)\s*>",
+        rf"</\s*(?:answer|choice|b|final|final_answer|letter|span)\s*>",
         re.IGNORECASE,
     ),
     re.compile(rf"<\s*({_CHOICE_LABELS})\s*>[^<]+</\s*[A-Z]\s*>", re.IGNORECASE),
@@ -136,7 +137,7 @@ _CHOICE_FALLBACK_PATTERNS = (
 )
 _CHOICE_BARE = re.compile(
     rf"\s*(?:final\s+answer\s*[:=]?\s*)?[\[(<]*({_CHOICE_LABELS})[\])>]*"
-    r"(?:\s*[.:：]\s*\S.*)?\s*",
+    r"(?:\s*[.:：](?:\s*\S.*)?)?\s*",
     re.IGNORECASE,
 )
 _CHOICE_TEXT_EXPLICIT = re.compile(
@@ -247,6 +248,8 @@ def _canonical_choice_answer(indices: tuple[int, ...], choices: list[str]) -> st
 
 def _normalized_choice_text(value: str) -> str:
     normalized = " ".join(_CHOICE_MARKUP.sub("", value).replace("<", "").replace(">", "").casefold().split())
+    normalized = re.sub(r"(?<=\d)\s*(?:[-–—]|\band\b)\s*(?=\d)", "-", normalized)
+    normalized = re.sub(r"(?<=\d)\s+(?=[a-z])", "", normalized)
     normalized = re.sub(r"\s+([%/.,，。])", r"\1", normalized)
     return normalized.strip(" \t\r\n.。,:：;；!?！？()[]{}\"'")
 
