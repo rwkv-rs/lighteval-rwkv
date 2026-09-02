@@ -121,7 +121,3 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
         return 1
     print("All RWKV evaluations completed successfully.", flush=True)
     return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

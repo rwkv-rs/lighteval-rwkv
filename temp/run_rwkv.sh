@@ -11,4 +11,4 @@ if [[ -f .env ]]; then
   set +a
 fi
 
-exec uv run python temp/main_rwkv.py "$@"
+exec uv run python temp/main.py "$@"

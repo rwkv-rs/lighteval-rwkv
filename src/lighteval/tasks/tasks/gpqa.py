@@ -39,11 +39,12 @@ from lighteval.tasks.requests import Doc
 
 
 def record_to_sample(record):
-    gold_index = random.randint(0, 3)
+    question = record["Question"]
+    gold_index = random.Random(question).randint(0, 3)
     choices = [record["Incorrect Answer 1"], record["Incorrect Answer 2"], record["Incorrect Answer 3"]]
     choices.insert(gold_index, record["Correct Answer"])
     return Sample(
-        input=record["Question"].strip(),
+        input=question.strip(),
         choices=choices,
         target=ascii_uppercase[gold_index],
     )
@@ -64,13 +65,12 @@ B) {B}
 C) {C}
 D) {D}
 """.strip()
-    gold_index = random.randint(0, 3)
+    question = line["Question"]
+    gold_index = random.Random(question).randint(0, 3)
     choices = [line["Incorrect Answer 1"], line["Incorrect Answer 2"], line["Incorrect Answer 3"]]
     choices.insert(gold_index, line["Correct Answer"])
 
-    query = GPQA_QUERY_TEMPLATE.format(
-        A=choices[0], B=choices[1], C=choices[2], D=choices[3], Question=line["Question"]
-    )
+    query = GPQA_QUERY_TEMPLATE.format(A=choices[0], B=choices[1], C=choices[2], D=choices[3], Question=question)
 
     return Doc(
         task_name=task_name,
@@ -82,7 +82,8 @@ D) {D}
 
 
 def gpqa_instruct_prompt(line, task_name: str = None):
-    gold_index = random.randint(0, 3)
+    question = line["Question"]
+    gold_index = random.Random(question).randint(0, 3)
     choices = [line["Incorrect Answer 1"], line["Incorrect Answer 2"], line["Incorrect Answer 3"]]
     choices.insert(gold_index, line["Correct Answer"])
     instruction = "Answer the following multiple choice question. The last line of your response should be of the following format: 'Answer: $LETTER' (without quotes) where LETTER is one of ABCD. Think step by step before answering."
@@ -92,7 +93,7 @@ def gpqa_instruct_prompt(line, task_name: str = None):
         B=choices[1].strip(),
         C=choices[2].strip(),
         D=choices[3].strip(),
-        Question=line["Question"].strip(),
+        Question=question.strip(),
         Instruction=instruction,
     )
 
