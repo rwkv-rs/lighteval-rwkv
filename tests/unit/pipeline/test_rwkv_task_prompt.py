@@ -9,6 +9,7 @@ from lighteval.models.model_output import ModelResponse
 from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters, _choice_answer
 from lighteval.tasks.requests import Doc, SamplingMethod
 from lighteval.tasks.tasks.med import med_qa, med_qa_prompt
+from lighteval.tasks.tasks.mmlu_pro import mmlu_pro_prompt_function
 from lighteval.tasks.tasks.olympiade_bench import olympiad_bench_prompt
 
 
@@ -285,6 +286,21 @@ def test_med_qa_uses_official_parquet_schema_and_does_not_repeat_letter_options(
     assert set(med_qa.hf_data_files) == {"train", "validation", "test"}
     assert doc.query.count("A. one") == 1
     assert "Give a letter answer among A, B, C, D or E." in doc.query
+
+
+def test_mmlu_pro_exposes_exact_native_letter_choices_for_rwkv_conversion():
+    doc = mmlu_pro_prompt_function(
+        {
+            "question": "Question?",
+            "options": [f"option {letter}" for letter in "ABCDEFGHIJ"],
+            "answer_index": 9,
+        },
+        "mmlu_pro|0",
+    )
+
+    assert doc.choices == list("ABCDEFGHIJ")
+    assert "where LETTER is one of ABCDEFGHIJ" in doc.query
+    assert "J: option J" in doc.query
 
 
 def test_olympiad_bench_does_not_emit_an_empty_specific_struct():
