@@ -96,6 +96,7 @@ class _Rollout:
     document_index: int
     repeat_id: int
     response: ModelResponse
+    extracted_answer: str
     score: float
     outcome: str
 
@@ -420,6 +421,7 @@ class ScoreboardCallback:
                 response = detail.model_response[repeat_id]
                 response.truncated_tokens_count = int(response.finish_reasons == ["length"])
                 score = float(scorer.score_rollout(detail.doc, response))
+                extracted_answer = scorer.extract_rollout_answer(detail.doc, response)
                 rollouts.append(
                     _Rollout(
                         detail=detail,
@@ -427,20 +429,21 @@ class ScoreboardCallback:
                         document_index=document_index,
                         repeat_id=repeat_id,
                         response=response,
+                        extracted_answer=extracted_answer,
                         score=score,
-                        outcome=cls._outcome(response, score),
+                        outcome=cls._outcome(response, score, extracted_answer),
                     )
                 )
         return rollouts
 
     @staticmethod
-    def _outcome(response: ModelResponse, score: float) -> str:
+    def _outcome(response: ModelResponse, score: float, extracted_answer: str) -> str:
         if response.finish_reasons == ["length"]:
+            return "unanswered"
+        if not extracted_answer.strip():
             return "unanswered"
         if score == 1.0:
             return "correct"
-        if not response.final_text[0].strip():
-            return "unanswered"
         return "incorrect"
 
     @staticmethod
@@ -473,7 +476,7 @@ class ScoreboardCallback:
                 "ground_truth": ground_truth[0]
                 if len(ground_truth) == 1
                 else json.dumps(ground_truth, ensure_ascii=False),
-                "extracted_answer": "" if response.truncated_tokens_count else response.final_text[0],
+                "extracted_answer": rollout.extracted_answer,
                 "assembled_prompt": response.input
                 if isinstance(response.input, str)
                 else json.dumps(response.input, ensure_ascii=False),

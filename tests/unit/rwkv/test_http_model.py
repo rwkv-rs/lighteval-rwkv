@@ -3,10 +3,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from lighteval.models.rwkv.http_model import PROMPT_TEMPLATES, RWKVHttpModel
+from lighteval.models.rwkv.http_model import PROMPT_TEMPLATES, REQUEST_CONTRACT_VERSION, RWKVHttpModel
 from lighteval.models.rwkv.http_pool import Completion
 from lighteval.tasks.prompt_manager import PromptManager
-from lighteval.utils.cache_management import TaskID
+from lighteval.utils.cache_management import SampleCache, TaskID
 
 
 def _document(query, num_samples=1, generation_size=9000, stops=None):
@@ -151,6 +151,7 @@ def test_model_fake_think_parameters_and_provenance(tmp_path, monkeypatch):
     assert model.config.prompt_template == "bot"
     assert model.config.cot_mode == "fake_think"
     assert model.config.pool_fingerprint == "f" * 64
+    assert model.config.request_contract_version == REQUEST_CONTRACT_VERSION
     assert model.config.max_samples == 3
     assert model.config.generation_parameters.max_new_tokens == 8192
     model.cleanup()
@@ -164,6 +165,42 @@ def test_model_rejects_generation_logits():
 
     with pytest.raises(ValueError, match="generation logits"):
         asyncio.run(model.greedy_until([document]))
+
+
+def test_request_contract_version_changes_cache_namespace(tmp_path, monkeypatch):
+    class Cache:
+        def __init__(self, config):
+            self.config = config
+
+    class Pool:
+        model_id = "served"
+        manifest = SimpleNamespace(max_model_len=10240)
+
+        def close(self):
+            pass
+
+    manifest = SimpleNamespace(
+        model_name="RWKV7-g1h-7.2B-20260710-ctx10240",
+        served_model_name="served",
+        model_revision="weight-sha",
+        wkv_mode="fp32io16",
+        vllm_version="0.11.0",
+        max_model_len=10240,
+        fingerprint="f" * 64,
+    )
+    monkeypatch.setattr("lighteval.models.rwkv.http_model.SampleCache", Cache)
+    model = RWKVHttpModel(
+        manifest=manifest,
+        prompt_template="bot",
+        cot_mode="open_think",
+        cache_dir=tmp_path,
+        pool=Pool(),
+    )
+    previous = model.config.model_copy(update={"request_contract_version": "rwkv-generation-v1"})
+    cache = SampleCache.__new__(SampleCache)
+
+    assert cache.get_model_hash(model.config) != cache.get_model_hash(previous)
+    model.cleanup()
 
 
 def test_async_model_cache_preserves_document_order_and_skips_completed_requests():

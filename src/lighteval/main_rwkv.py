@@ -26,9 +26,9 @@ import typer
 
 from lighteval.metrics.metrics_sample import SampleLevelComputation, SamplingMetric
 from lighteval.metrics.utils.metric_utils import SampleLevelMetric
-from lighteval.models.rwkv.http_model import PROMPT_TEMPLATES, SAMPLING_PARAMETERS, RWKVHttpModel
+from lighteval.models.rwkv.http_model import MAX_NEW_TOKENS, PROMPT_TEMPLATES, SAMPLING_PARAMETERS, RWKVHttpModel
 from lighteval.models.rwkv.http_pool import PoolError, PoolManifest, RWKVHttpPool
-from lighteval.pipeline import Pipeline, _choice_metrics, _convert_choice, _is_choice
+from lighteval.pipeline import Pipeline, _choice_answer, _choice_metrics, _convert_choice, _is_choice
 from lighteval.tasks.registry import Registry
 from lighteval.tasks.requests import Doc, SamplingMethod
 from lighteval.tasks.rwkv_prompt import TaskPromptMode, apply_task_prompt_override
@@ -47,6 +47,11 @@ _MIN_COMPLETIONS = 5000
 _LARGE_BENCHMARK_SIZE = 50_000
 _LARGE_BENCHMARK_FRACTION = 0.2
 logger = logging.getLogger(__name__)
+
+
+def _open_think_answer(text: str) -> str:
+    _, closed, answer = text.rpartition("</think>")
+    return answer if closed else text
 
 
 class RWKVAvgAtK(SampleLevelComputation):
@@ -72,6 +77,14 @@ class RWKVAvgAtK(SampleLevelComputation):
         if isinstance(value, (list, tuple)):
             return sum(float(item) for item in value) / len(value)
         return float(value)
+
+    def extract_rollout_answer(self, doc: Doc, model_response) -> str:
+        if model_response.finish_reasons == ["length"]:
+            return ""
+        scorer = self.metric.sample_level_fn
+        if extractor := getattr(scorer, "extract_answer", None):
+            return extractor(doc, model_response)
+        return model_response.final_text[0] if model_response.final_text else ""
 
 
 def _evaluation_plan(num_docs: int) -> tuple[int, int, str]:
@@ -183,8 +196,31 @@ class RWKVPipeline(Pipeline):
         if self.pipeline_parameters.task_prompt is not None:
             self._apply_task_prompt_to_docs(task, docs)
         if self.pipeline_parameters.convert_logprob_choices_to_generation:
+            self._prepare_truthfulqa_mc1(task, docs)
             self._prepare_choice_task(task, docs)
+        if self.model.config.cot_mode == "open_think":
+            self._prepare_open_think_task(task, docs)
         return docs
+
+    @staticmethod
+    def _prepare_truthfulqa_mc1(task, docs) -> None:
+        if task.full_name.rsplit("|", 1)[0] != "truthfulqa:mc":
+            return
+        for doc in docs:
+            len_mc1 = doc.specific["len_mc1"]
+            gold_indices = doc.gold_index if isinstance(doc.gold_index, list) else [doc.gold_index]
+            doc.choices = doc.choices[:len_mc1]
+            doc.gold_index = next(index for index in gold_indices if index < len_mc1)
+            doc.specific = dict(doc.specific, rwkv_truthfulqa_metric="mc1")
+
+    @staticmethod
+    def _prepare_open_think_task(task, docs) -> None:
+        for doc in docs:
+            doc.generation_size = MAX_NEW_TOKENS
+            doc.stop_sequences = []
+        task.config = copy(task.config)
+        task.config.generation_size = MAX_NEW_TOKENS
+        task.config.stop_sequence = []
 
     def _apply_task_prompt_to_docs(self, task, docs) -> None:
         task_prompt = self.pipeline_parameters.task_prompt
@@ -211,13 +247,39 @@ class RWKVPipeline(Pipeline):
         task.config = copy(task.config)
         task.config.original_num_docs = len(docs)
         task.config.effective_num_docs = len(docs)
-        task.metrics = tuple(
+        converted_metrics = tuple(
             converted
             for metric in task.metrics
             for converted in (_choice_metrics(metric) if metric.category == SamplingMethod.LOGPROBS else (metric,))
         )
+        task.metrics = (
+            converted_metrics[:1] if task.full_name.rsplit("|", 1)[0] == "truthfulqa:mc" else converted_metrics
+        )
         task.config.metrics = task.metrics
         task.sampling_methods = list(dict.fromkeys(metric.category for metric in task.metrics))
+
+    def _post_process_outputs(self, sampling_method_responses) -> None:
+        if self.model.config.cot_mode != "open_think":
+            super()._post_process_outputs(sampling_method_responses)
+            return
+
+        logger.info("--- POST-PROCESSING MODEL RESPONSES ---")
+        for responses in sampling_method_responses.values():
+            for response in responses:
+                response.text_post_processed = [_open_think_answer(text) for text in response.text]
+
+        if not self.pipeline_parameters.convert_logprob_choices_to_generation:
+            return
+        responses = sampling_method_responses.get(SamplingMethod.GENERATIVE, [])
+        for doc, response in zip(self.sampling_docs.get(SamplingMethod.GENERATIVE, []), responses):
+            if not isinstance(doc.specific, dict) or doc.specific.get("rwkv_choice") is not True:
+                continue
+            response.text_post_processed = [
+                ""
+                if index < len(response.finish_reasons) and response.finish_reasons[index] == "length"
+                else _choice_answer(text, doc.choices, doc.query)
+                for index, text in enumerate(response.text)
+            ]
 
     def _index_task_documents(self, task, docs) -> None:
         self.documents_dict[task.full_name] = docs

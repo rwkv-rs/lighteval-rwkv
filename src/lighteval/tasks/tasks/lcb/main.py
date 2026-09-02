@@ -77,6 +77,10 @@ def lcb_codegeneration_prompt_fn(line, task_name: str = "lcb:codegeneration") ->
 
 
 class CodegenMetric(SampleLevelComputation):
+    @staticmethod
+    def extract_answer(_doc: Doc, model_response: ModelResponse) -> str:
+        return extract_code(model_response.final_text[0]) if model_response.final_text else ""
+
     def compute(self, model_response: ModelResponse, doc: Doc, **kwargs) -> dict:
         """Estimates the Pass@1 metric for the code generation task.
         Extract the code from each prediction, Runs it for each sample and generations,

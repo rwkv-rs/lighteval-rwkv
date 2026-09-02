@@ -211,6 +211,10 @@ class _ChoiceExactMatches(SampleLevelComputation):
         expected = _canonical_choice_answer(gold_indices, doc.choices)
         return float(any(prediction == expected for prediction in model_response.final_text))
 
+    @staticmethod
+    def extract_answer(_doc, model_response) -> str:
+        return model_response.final_text[0] if model_response.final_text else ""
+
 
 def _choice_metrics(metric):
     names = (metric.metric_name,) if isinstance(metric.metric_name, str) else tuple(metric.metric_name)

@@ -439,7 +439,90 @@ def test_scoreboard_callback_selects_twenty_samples_per_outcome():
 def test_scoreboard_discards_truncated_answer(score):
     response = SimpleNamespace(final_text=["B"], finish_reasons=["length"])
 
-    assert ScoreboardCallback._outcome(response, score) == "unanswered"
+    assert ScoreboardCallback._outcome(response, score, "") == "unanswered"
+
+
+@pytest.mark.parametrize("generation_size", [1, 5, 256, 1280, 2048])
+def test_open_think_uses_full_generation_contract(generation_size):
+    doc = Doc(
+        query="question",
+        choices=["answer"],
+        gold_index=0,
+        generation_size=generation_size,
+        stop_sequences=["\n"],
+    )
+    task = SimpleNamespace(
+        config=SimpleNamespace(generation_size=generation_size, stop_sequence=["\n"]),
+    )
+
+    main_rwkv.RWKVPipeline._prepare_open_think_task(task, [doc])
+
+    assert doc.generation_size == 8192
+    assert doc.stop_sequences == []
+    assert task.config.generation_size == 8192
+    assert task.config.stop_sequence == []
+
+
+def test_truthfulqa_conversion_keeps_only_mc1():
+    doc = Doc(
+        query="question",
+        choices=["true", "false", "true", "also true", "false", "also false"],
+        gold_index=[0, 2, 3],
+        specific={"len_mc1": 2},
+        sampling_methods=[main_rwkv.SamplingMethod.LOGPROBS],
+    )
+    metric = SimpleNamespace(
+        metric_name=["truthfulqa_mc1", "truthfulqa_mc2"],
+        category=main_rwkv.SamplingMethod.LOGPROBS,
+        corpus_level_fn={"truthfulqa_mc1": sum, "truthfulqa_mc2": sum},
+        higher_is_better={"truthfulqa_mc1": True, "truthfulqa_mc2": True},
+    )
+    task = SimpleNamespace(
+        full_name="truthfulqa:mc|0",
+        metrics=(metric,),
+        config=SimpleNamespace(metrics=(metric,), original_num_docs=-1, effective_num_docs=-1),
+    )
+
+    main_rwkv.RWKVPipeline._prepare_truthfulqa_mc1(task, [doc])
+    main_rwkv.RWKVPipeline._prepare_choice_task(task, [doc])
+
+    assert doc.choices == ["true", "false"]
+    assert doc.gold_index == 0
+    assert doc.specific["rwkv_truthfulqa_metric"] == "mc1"
+    assert doc.specific["rwkv_choice"] is True
+    assert [converted.metric_name for converted in task.metrics] == ["truthfulqa_mc1"]
+
+
+def test_open_think_postprocessing_keeps_only_final_answer():
+    pipeline = main_rwkv.RWKVPipeline.__new__(main_rwkv.RWKVPipeline)
+    pipeline.model = SimpleNamespace(config=SimpleNamespace(cot_mode="open_think"))
+    pipeline.pipeline_parameters = SimpleNamespace(convert_logprob_choices_to_generation=False)
+    response = ModelResponse(text=[">reasoning</think>final", "answer without tags"])
+
+    pipeline._post_process_outputs({main_rwkv.SamplingMethod.GENERATIVE: [response]})
+
+    assert response.final_text == ["final", "answer without tags"]
+
+
+def test_lcb_scoreboard_answer_is_extracted_code():
+    from lighteval.tasks.tasks.lcb.main import CodegenMetric
+
+    native_metric = main_rwkv.SampleLevelMetric(
+        metric_name="codegen",
+        sample_level_fn=CodegenMetric(),
+        category=main_rwkv.SamplingMethod.GENERATIVE,
+        corpus_level_fn=sum,
+        higher_is_better=True,
+    )
+    scorer = main_rwkv.RWKVAvgAtK(1, native_metric)
+    response = ModelResponse(
+        text=["reasoning```python\nwrong()\n```final```python\nprint(42)\n```"],
+        text_post_processed=["```python\nprint(42)\n```"],
+        finish_reasons=["stop"],
+    )
+
+    assert scorer.extract_rollout_answer(Doc(query="q", choices=[""], gold_index=0), response) == "print(42)"
+    assert ScoreboardCallback._outcome(response, 0.0, "") == "unanswered"
 
 
 @pytest.mark.parametrize(

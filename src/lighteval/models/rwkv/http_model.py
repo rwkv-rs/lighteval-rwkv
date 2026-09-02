@@ -17,6 +17,7 @@ from .http_pool import Completion, PoolError, PoolManifest, RWKVHttpPool
 
 
 MAX_NEW_TOKENS = 8192
+REQUEST_CONTRACT_VERSION = "rwkv-generation-v2"
 PROMPT_TEMPLATES: dict[str, tuple[str, str]] = {
     "bot": ("\nBot✿", "✿"),
     "assistant": ("\n\nAssistant: ", "\nUser:"),
@@ -50,6 +51,7 @@ class RWKVHTTPModelConfig(ModelConfig):
     prompt_template: str
     cot_mode: str
     pool_fingerprint: str
+    request_contract_version: str
     max_samples: int | None = None
 
 
@@ -98,6 +100,7 @@ class RWKVHttpModel(LightevalModel):
             prompt_template=prompt_template,
             cot_mode=cot_mode,
             pool_fingerprint=manifest.fingerprint,
+            request_contract_version=REQUEST_CONTRACT_VERSION,
             max_samples=max_samples,
             cache_dir=str(cache_dir),
             generation_parameters=GenerationParameters(
