@@ -321,6 +321,7 @@ def test_olympiad_bench_does_not_emit_an_empty_specific_struct():
         ("<think>x</think>Answer: <function=finish>\n<parameter=message>\nB\n</parameter>\n</function>", "two"),
         ("<think>x</think>C. three", "three"),
         ("<think>x</think><<B>>", "two"),
+        ("<think>x</think><<C> three>", "three"),
         ("<think>x</think>This aligns with option B.", "two"),
         ("<think>x</think>This makes (B) the correct effect.", "two"),
         ("<think>x</think>Answer: A\nAnswer: B", "two"),

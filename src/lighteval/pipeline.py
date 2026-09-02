@@ -106,6 +106,7 @@ _CHOICE_PATTERNS = (
     ),
     re.compile(rf"<\s*({_CHOICE_LABELS})\s*>[^<]+</\s*[A-Z]\s*>", re.IGNORECASE),
     re.compile(rf"<\s*(?:answer|choice)\s*[:=]?\s*({_CHOICE_LABELS})\s*>", re.IGNORECASE),
+    re.compile(rf"<<\s*({_CHOICE_LABELS})\s*>\s*[^<>]+\s*>", re.IGNORECASE),
     re.compile(
         rf"\\?[\"']answer\\?[\"']\s*:\s*\\?[\"']({_CHOICE_LABELS})\\?[\"']",
         re.IGNORECASE,
