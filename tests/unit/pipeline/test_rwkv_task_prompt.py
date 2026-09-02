@@ -322,6 +322,8 @@ def test_olympiad_bench_does_not_emit_an_empty_specific_struct():
         ("<think>x</think>C. three", "three"),
         ("<think>x</think><<B>>", "two"),
         ("<think>x</think><<C> three>", "three"),
+        ("<think>x</think>因此，不会发生的反应是选项(D)。", "four"),
+        ("<think>x</think>选项A直接给出了定义，其他选项过于宽泛（C）或不够具体（D）。", "one"),
         ("<think>x</think>This aligns with option B.", "two"),
         ("<think>x</think>This makes (B) the correct effect.", "two"),
         ("<think>x</think>Answer: A\nAnswer: B", "two"),
@@ -336,7 +338,7 @@ def test_olympiad_bench_does_not_emit_an_empty_specific_struct():
     ],
 )
 def test_choice_extraction_handles_dashboard_formats(completion, expected):
-    assert _choice_answer(completion, ["one", "two", "three"]) == expected
+    assert _choice_answer(completion, ["one", "two", "three", "four"]) == expected
 
 
 def test_choice_extraction_uses_unique_full_choice_text_as_last_fallback():
@@ -344,6 +346,10 @@ def test_choice_extraction_uses_unique_full_choice_text_as_last_fallback():
 
     assert _choice_answer("<think>x</think>The gallbladder's function is to store bile.", choices) == "store bile"
     assert _choice_answer("<think>x</think>Both store bile and filter blood are discussed.", choices) == ""
+
+
+def test_choice_extraction_rejects_conflicting_direct_option_references():
+    assert _choice_answer("<think>x</think>选项A正确，选项B也正确。", ["one", "two", "three"]) == ""
 
 
 def test_choice_extraction_uses_query_options_for_native_letter_choices():

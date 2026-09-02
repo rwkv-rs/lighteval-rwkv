@@ -336,6 +336,16 @@ def _choice_answer(raw: str, choices: list[str], query: str | None = None) -> st
         for match in pattern.finditer(answer_text)
         if (parsed := _parse_choice_labels(match.group(1), labels)) is not None
     ]
+    direct_options = [
+        (match.start(), parsed)
+        for match in re.finditer(
+            rf"(?i:(?:option|选项)\s*[\(（<]*)({_CHOICE_SINGLE_LABEL})[\)）>]?",
+            answer_text,
+        )
+        if (parsed := _parse_choice_labels(match.group(1), labels)) is not None
+    ]
+    if len({parsed for _, parsed in direct_options}) == 1:
+        matches.append(max(direct_options, key=lambda item: item[0]))
     if payload := _choice_payload_answer(answer_text, choices, labels, query):
         matches.append(payload)
     for line_match in re.finditer(r"(?m)^.*$", answer_text):
