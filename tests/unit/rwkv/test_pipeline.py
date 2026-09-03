@@ -1,6 +1,8 @@
 import asyncio
+import multiprocessing
 import threading
 from collections import defaultdict
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -20,6 +22,10 @@ def _streaming_pipeline(task_names, model, download, *, max_samples):
     pipeline.tasks_dict = {
         task_name: SimpleNamespace(
             full_name=task_name,
+            dataset_path="dataset",
+            dataset_config_name=None,
+            dataset_revision=None,
+            data_files={"validation": task_name},
             download_dataset_worker=lambda task: download(task.full_name),
         )
         for task_name in task_names
@@ -41,6 +47,70 @@ def _streaming_pipeline(task_names, model, download, *, max_samples):
         )
     ]
     return pipeline
+
+
+def _hold_dataset_cache_lock(cache_dir, data_file, acquired, release, fail=False):
+    rwkv_pipeline.datasets_config.HF_DATASETS_CACHE = Path(cache_dir)
+    task = SimpleNamespace(
+        full_name=data_file,
+        dataset_path="dataset",
+        dataset_config_name=None,
+        dataset_revision=None,
+        data_files={"validation": data_file},
+    )
+    try:
+        with rwkv_pipeline._dataset_cache_lock(task):
+            acquired.set()
+            if fail:
+                raise RuntimeError("dataset load failed")
+            release.wait(5)
+    except RuntimeError:
+        pass
+
+
+@pytest.mark.parametrize(("second_data_file", "blocked"), [("same", True), ("other", False)])
+def test_dataset_cache_lock_is_keyed_across_processes(tmp_path, second_data_file, blocked):
+    context = multiprocessing.get_context("fork")
+    first_acquired = context.Event()
+    second_acquired = context.Event()
+    release = context.Event()
+    first = context.Process(target=_hold_dataset_cache_lock, args=(tmp_path, "same", first_acquired, release))
+    second = context.Process(
+        target=_hold_dataset_cache_lock,
+        args=(tmp_path, second_data_file, second_acquired, release),
+    )
+    first.start()
+    assert first_acquired.wait(2)
+    second.start()
+
+    assert second_acquired.wait(0.2) is not blocked
+    release.set()
+    assert second_acquired.wait(2)
+    first.join(2)
+    second.join(2)
+    assert (first.exitcode, second.exitcode) == (0, 0)
+
+
+def test_dataset_cache_lock_is_released_after_failure(tmp_path):
+    context = multiprocessing.get_context("fork")
+    failed_acquired = context.Event()
+    acquired = context.Event()
+    release = context.Event()
+    failed = context.Process(
+        target=_hold_dataset_cache_lock,
+        args=(tmp_path, "same", failed_acquired, release, True),
+    )
+    retry = context.Process(target=_hold_dataset_cache_lock, args=(tmp_path, "same", acquired, release))
+
+    failed.start()
+    assert failed_acquired.wait(2)
+    failed.join(2)
+    assert failed.exitcode == 0
+    retry.start()
+    assert acquired.wait(2)
+    release.set()
+    retry.join(2)
+    assert retry.exitcode == 0
 
 
 async def _evaluate_streaming_pipeline(pipeline):
