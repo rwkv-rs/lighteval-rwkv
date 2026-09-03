@@ -173,34 +173,14 @@ def test_scoreboard_aggregates_lighteval_metadata_for_selector():
     assert metadata["tags"] == ["knowledge", "math", "multiple-choice"]
 
 
-def test_scoreboard_maps_lighteval_tags_to_fields():
-    assert ScoreboardCallback._categories(
-        [
-            "general-knowledge",
-            "biology",
-            "arithmetic",
-            "execution",
-            "biomedical",
-            "common-sense",
-            "multi-turn",
-            "translation",
-            "truthfulness",
-            "multimodal",
-            "multiple-choice",
-        ]
-    ) == [
-        {"id": "knowledge", "label": "世界知识"},
-        {"id": "science", "label": "科学"},
-        {"id": "math", "label": "数学"},
-        {"id": "code", "label": "代码"},
-        {"id": "medical", "label": "医疗"},
-        {"id": "reasoning", "label": "推理"},
-        {"id": "instruction", "label": "指令遵循"},
-        {"id": "language", "label": "语言"},
-        {"id": "safety", "label": "安全与价值观"},
-        {"id": "multimodal", "label": "多模态"},
-    ]
-    assert ScoreboardCallback._categories(["multiple-choice", "qa"]) == [{"id": "other", "label": "其他"}]
+@pytest.mark.parametrize("model_name", ["RWKV7", "RWKV7-g1j", "RWKV7-1.5B"])
+def test_scoreboard_rejects_model_name_without_generation_or_parameter_size(model_name):
+    with pytest.raises(ValueError, match="model_name to contain generation and parameter size"):
+        ScoreboardCallback._validate_model_name(model_name)
+
+
+def test_scoreboard_accepts_exact_model_name():
+    ScoreboardCallback._validate_model_name("RWKV7-g1j-1.5B-20260831-ctx16384")
 
 
 def test_scoreboard_selector_keeps_unconfigured_generation_size():
@@ -223,7 +203,7 @@ def test_scoreboard_selector_keeps_unconfigured_generation_size():
     assert task_config["effective_num_docs"] == 10
 
 
-def test_scoreboard_publication_keeps_only_display_fields(tmp_path, monkeypatch):
+def test_scoreboard_publication_keeps_only_evaluation_facts(tmp_path, monkeypatch):
     campaign_id = "12345678-1234-5678-1234-567812345678"
     requests = []
 
@@ -345,20 +325,34 @@ def test_scoreboard_publication_keeps_only_display_fields(tmp_path, monkeypatch)
     publication_request = next(request for request in requests if request.method == "PUT")
     publication = json.loads(gzip.decompress(publication_request.data))
     sample = publication["samples"][0]
+    assert set(publication) == {
+        "schema_version",
+        "campaign_id",
+        "task",
+        "result_files",
+        "task_config",
+        "environment",
+        "sampling_config",
+        "primary_metric",
+        "metrics",
+        "diagnostics",
+        "samples",
+    }
+    assert "comparison" not in publication
     assert publication["sampling_config"]["temperature"] == 0.96
     assert publication["sampling_config"]["num_samples"] == 1
+    assert publication["sampling_config"]["chat_template_kwargs"] == {
+        "rwkv_prompt_template": "bot",
+        "rwkv_generation_prompt": "open_think",
+    }
     assert publication["task_config"]["k_metrics"] == "avg@1"
     assert publication["task"]["benchmark"] == "gsm8k"
     assert publication["task"]["task_name"] == "gsm8k"
+    assert publication["task"]["weight_display_name"] == "RWKV7-g1h-7.2B-20260710-ctx10240"
+    assert publication["task"]["weight_sha256"] == "a" * 64
+    assert publication["task"]["wkv_mode"] == "fp32io16"
     assert publication["task"]["languages"] == ["english"]
     assert publication["task"]["tags"] == ["math", "reasoning"]
-    assert publication["comparison"]["benchmark"]["categories"] == [
-        {"id": "math", "label": "数学"},
-        {"id": "reasoning", "label": "推理"},
-    ]
-    assert publication["comparison"]["coordinates"][0]["comparison"]["id"] == "precision"
-    assert publication["comparison"]["coordinates"][0]["arm"] == "b"
-    assert publication["comparison"]["samples"] == 1
     assert sample["document_index"] == 0
     assert sample["metrics"]["scoreboard_outcome"] == "correct"
     assert sample["model_response"]["text"] == ["2"]

@@ -24,68 +24,6 @@ MAX_COMPRESSED_BYTES = 64 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _TASK_CONFIG_FIELDS = ("num_fewshots", "generation_size", "stop_sequence", "original_num_docs", "effective_num_docs")
 _ENVIRONMENT_FIELDS = ("served_model_name", "model_revision", "vllm_version", "pool_fingerprint", "max_model_length")
-_FIELD_CATEGORIES = (
-    ("knowledge", "世界知识", frozenset({"knowledge", "general-knowledge", "factuality", "history", "geography"})),
-    (
-        "science",
-        "科学",
-        frozenset({"science", "scientific", "biology", "chemistry", "physics", "graduate-level"}),
-    ),
-    ("math", "数学", frozenset({"math", "arithmetic"})),
-    ("code", "代码", frozenset({"code-generation", "execution"})),
-    ("medical", "医疗", frozenset({"health", "medical", "biomedical"})),
-    (
-        "reasoning",
-        "推理",
-        frozenset(
-            {
-                "reasoning",
-                "commonsense",
-                "common-sense",
-                "physical-commonsense",
-                "symbolic",
-                "state-tracking",
-                "nli",
-            }
-        ),
-    ),
-    ("instruction", "指令遵循", frozenset({"instruction-following", "multi-turn"})),
-    (
-        "language",
-        "语言",
-        frozenset(
-            {
-                "language",
-                "language-understanding",
-                "language-modeling",
-                "reading-comprehension",
-                "translation",
-                "summarization",
-                "conversational",
-                "dialog",
-                "generation",
-                "classification",
-            }
-        ),
-    ),
-    (
-        "safety",
-        "安全与价值观",
-        frozenset(
-            {
-                "safety",
-                "bias",
-                "ethics",
-                "justice",
-                "morality",
-                "truthfulness",
-                "utilitarianism",
-                "virtue",
-            }
-        ),
-    ),
-    ("multimodal", "多模态", frozenset({"multimodal"})),
-)
 logger = logging.getLogger(__name__)
 
 
@@ -146,7 +84,7 @@ class ScoreboardCallback:
         self._pipeline = pipeline
         self._tracker = tracker
         self._model = model
-        self._model_variant = self._model_metadata(model.config.model_name)
+        self._validate_model_name(model.config.model_name)
         self._task_metadata_by_name = {
             task["name"]: module["docstring"]
             for module in pipeline.registry.get_tasks_dump()
@@ -251,13 +189,6 @@ class ScoreboardCallback:
                 "truncation_rate": truncated / completions if completions else 0.0,
             },
             "samples": samples,
-            "comparison": self._comparison(
-                selector,
-                task_metadata["tags"],
-                metrics,
-                len(samples),
-                truncated / completions if completions else 0.0,
-            ),
         }
         identity = task_metadata["identity"]
         publication_sha256 = _sha256(publication)
@@ -342,67 +273,11 @@ class ScoreboardCallback:
         return parameters
 
     @staticmethod
-    def _model_metadata(model_name: str) -> dict:
-        architecture = "RWKV" if model_name.upper().startswith("RWKV") else "QWEN"
+    def _validate_model_name(model_name: str) -> None:
         generation_match = re.search(r"-(g\d+[a-z]*)-", model_name, re.IGNORECASE)
         parameter_match = re.search(r"(?:^|-)(\d+(?:\.\d+)?b)(?:-|$)", model_name, re.IGNORECASE)
         if generation_match is None or parameter_match is None:
             raise ValueError("Scoreboard publication requires model_name to contain generation and parameter size")
-        return {
-            "label": f"{architecture} {generation_match.group(1).upper()} {parameter_match.group(1).upper()}",
-            "architecture": architecture,
-            "generation": generation_match.group(1).upper(),
-            "parameters": parameter_match.group(1).upper(),
-        }
-
-    @staticmethod
-    def _categories(tags: list[str]) -> list[dict[str, str]]:
-        task_tags = set(tags)
-        categories = [
-            {"id": identifier, "label": label}
-            for identifier, label, field_tags in _FIELD_CATEGORIES
-            if task_tags & field_tags
-        ]
-        return categories or [{"id": "other", "label": "其他"}]
-
-    def _comparison(self, selector: str, tags: list[str], metrics: dict, samples: int, truncation_rate: float) -> dict:
-        precision = self._model.config.wkv_mode
-        parameter = self._model_variant["parameters"]
-        option = {
-            "id": "precision",
-            "label": "fp16 vs fp32io16",
-            "short_label": "精度",
-            "a_label": "fp16",
-            "b_label": "fp32io16",
-            "contract": "同一 checkpoint 与 generation contract，仅改变 WKV precision。",
-        }
-        group = {
-            "id": parameter.lower(),
-            "label": parameter,
-            "a_model": self._model_variant,
-            "b_model": self._model_variant,
-            "parameter_delta_percent": 0.0,
-            "comparable": True,
-        }
-        return {
-            "model": self._model_variant,
-            "benchmark": {
-                "label": selector,
-                "categories": self._categories(tags),
-                "evaluation_method": next(iter(metrics)),
-                "score_multiplier": 100.0,
-            },
-            "evaluation": {
-                "prompt_profile": self._model.config.cot_mode,
-                "prompt_template": self._model.config.prompt_template,
-                "precision": precision,
-            },
-            "coordinates": [
-                {"comparison": option, "parameter_group": group, "arm": "a" if precision == "fp16" else "b"}
-            ],
-            "samples": samples,
-            "truncation_rate": truncation_rate,
-        }
 
     @staticmethod
     def _select_samples(rollouts: list[_Rollout]):
