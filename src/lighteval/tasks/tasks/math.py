@@ -47,13 +47,12 @@ math_algebra = LightevalTaskConfig(
             sample_params={
                 "n": 4,
                 "strip_strings": True,
-                "normalize_pred": math_normalizer,
-                "normalize_gold": math_normalizer,
+                "normalize": math_normalizer,
             }
         ),
     ],
     stop_sequence=["\n"],
-    version=1,
+    version=2,
 )
 
 math_counting_and_probability = LightevalTaskConfig(
@@ -71,13 +70,12 @@ math_counting_and_probability = LightevalTaskConfig(
             sample_params={
                 "n": 4,
                 "strip_strings": True,
-                "normalize_pred": math_normalizer,
-                "normalize_gold": math_normalizer,
+                "normalize": math_normalizer,
             }
         ),
     ],
     stop_sequence=["\n"],
-    version=1,
+    version=2,
 )
 
 math_geometry = LightevalTaskConfig(
@@ -95,13 +93,12 @@ math_geometry = LightevalTaskConfig(
             sample_params={
                 "n": 4,
                 "strip_strings": True,
-                "normalize_pred": math_normalizer,
-                "normalize_gold": math_normalizer,
+                "normalize": math_normalizer,
             }
         ),
     ],
     stop_sequence=["\n"],
-    version=1,
+    version=2,
 )
 
 math_intermediate_algebra = LightevalTaskConfig(
@@ -119,13 +116,12 @@ math_intermediate_algebra = LightevalTaskConfig(
             sample_params={
                 "n": 4,
                 "strip_strings": True,
-                "normalize_pred": math_normalizer,
-                "normalize_gold": math_normalizer,
+                "normalize": math_normalizer,
             }
         ),
     ],
     stop_sequence=["\n"],
-    version=1,
+    version=2,
 )
 
 math_number_theory = LightevalTaskConfig(
@@ -143,13 +139,12 @@ math_number_theory = LightevalTaskConfig(
             sample_params={
                 "n": 4,
                 "strip_strings": True,
-                "normalize_pred": math_normalizer,
-                "normalize_gold": math_normalizer,
+                "normalize": math_normalizer,
             }
         ),
     ],
     stop_sequence=["\n"],
-    version=1,
+    version=2,
 )
 
 math_prealgebra = LightevalTaskConfig(
@@ -167,13 +162,12 @@ math_prealgebra = LightevalTaskConfig(
             sample_params={
                 "n": 4,
                 "strip_strings": True,
-                "normalize_pred": math_normalizer,
-                "normalize_gold": math_normalizer,
+                "normalize": math_normalizer,
             }
         ),
     ],
     stop_sequence=["\n"],
-    version=1,
+    version=2,
 )
 
 math_precalculus = LightevalTaskConfig(
@@ -191,13 +185,12 @@ math_precalculus = LightevalTaskConfig(
             sample_params={
                 "n": 4,
                 "strip_strings": True,
-                "normalize_pred": math_normalizer,
-                "normalize_gold": math_normalizer,
+                "normalize": math_normalizer,
             }
         ),
     ],
     stop_sequence=["\n"],
-    version=1,
+    version=2,
 )
 
 TASKS_TABLE = [

@@ -53,6 +53,7 @@ from lighteval.metrics.metrics_sample import (
     JudgeLLMSimpleQA,
     LoglikelihoodAcc,
     MajAtN,
+    MathVerifyMatch,
     PassAtK,
     Recall,
     StringDistance,
@@ -274,6 +275,13 @@ class Metrics(Enum):
         corpus_level_fn=np.mean,
         higher_is_better=True,
     )
+    math_verify = SampleLevelMetric(
+        metric_name="extractive_match",
+        sample_level_fn=MathVerifyMatch(),
+        category=SamplingMethod.GENERATIVE,
+        corpus_level_fn=np.mean,
+        higher_is_better=True,
+    )
     extractiveness = SampleLevelMetricGrouping(
         metric_name=["summarization_coverage", "summarization_density", "summarization_compression"],
         sample_level_fn=Extractiveness(
@@ -433,7 +441,7 @@ class Metrics(Enum):
     )
     maj_at_n = SampleLevelMetric(
         metric_name="maj@n",
-        sample_level_fn=MajAtN(),
+        sample_level_fn=MajAtN(sample_scoring_function=MathVerifyMatch()),
         category=SamplingMethod.GENERATIVE,
         corpus_level_fn=np.mean,
         higher_is_better=True,

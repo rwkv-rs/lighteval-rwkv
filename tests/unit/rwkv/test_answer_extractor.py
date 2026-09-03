@@ -9,7 +9,11 @@ from lighteval.tasks.rwkv_answer_extractor import (
     extract_rwkv_choice_answer,
     is_rwkv_choice,
 )
+from lighteval.tasks.tasks.aimo import task as aimo_progress_prize_1
+from lighteval.tasks.tasks.arithmetic import TASKS_TABLE as ARITHMETIC_TASKS
+from lighteval.tasks.tasks.asdiv import asdiv_prompt
 from lighteval.tasks.tasks.gpqa import gpqa_instruct_prompt
+from lighteval.tasks.tasks.mathqa import mathqa, mathqa_prompt
 from lighteval.tasks.tasks.med import med_qa, med_qa_prompt
 from lighteval.tasks.tasks.mmlu_pro import mmlu_pro_prompt_function
 from lighteval.tasks.tasks.olympiade_bench import olympiad_bench_prompt
@@ -35,6 +39,44 @@ def test_med_qa_uses_official_parquet_schema_and_does_not_repeat_letter_options(
     assert set(med_qa.hf_data_files) == {"train", "validation", "test"}
     assert doc.query.count("A. one") == 1
     assert "Give a letter answer among A, B, C, D or E." in doc.query
+
+
+def test_new_math_tasks_use_published_parquet_layouts():
+    for task in ARITHMETIC_TASKS:
+        subset = task.name.replace(":", "_")
+        assert task.hf_subset == "default"
+        assert task.hf_data_files == {"validation": f"{subset}/validation/0000.parquet"}
+        assert task.hf_revision == "14413db3567723ff76bc468508333b5c7a9dcf5d"
+
+    assert aimo_progress_prize_1.hf_subset == "default"
+    assert aimo_progress_prize_1.hf_revision == "6e33ae2d1995bcbac59b18536b561669b15ff0b1"
+    assert mathqa.hf_revision == "fafb9f7ee5b9ec4da9499f9c4177a4c91389f2d6"
+
+
+def test_asdiv_prompt_exposes_one_gold_choice():
+    doc = asdiv_prompt(
+        {"body": "There are 20 apples.", "question": "How many?", "answer": "20 (apples)"},
+        "asdiv",
+    )
+
+    assert doc.choices == ["20"]
+
+
+@pytest.mark.parametrize(
+    "serialized_options",
+    [
+        "a ) one , b ) two , c ) three , d ) four , e ) five",
+        "['a ) one', 'b ) two', 'c ) three', 'd ) four', 'e ) five']",
+    ],
+)
+def test_mathqa_prompt_reads_both_published_option_encodings(serialized_options):
+    doc = mathqa_prompt(
+        {"Problem": "Choose three.", "options": serialized_options, "correct": "c"},
+        "mathqa",
+    )
+
+    assert doc.choices == [" one", " two", " three", " four", " five"]
+    assert doc.gold_index == 2
 
 
 def test_mmlu_pro_exposes_exact_native_letter_choices_for_rwkv_conversion():

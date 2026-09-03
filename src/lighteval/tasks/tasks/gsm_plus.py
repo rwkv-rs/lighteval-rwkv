@@ -84,9 +84,9 @@ gsm_plus = LightevalTaskConfig(
     few_shots_split=None,
     few_shots_select=None,
     generation_size=None,
-    metrics=[Metrics.expr_gold_metric],
+    metrics=[Metrics.math_verify],
     stop_sequence=None,
-    version=0,
+    version=1,
 )
 
 TASKS_TABLE = [

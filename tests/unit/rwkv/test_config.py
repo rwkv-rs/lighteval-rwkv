@@ -26,9 +26,15 @@ DEFAULT_BENCHMARKS = {
     "med_qa",
     "med_mcqa",
     "gsm8k",
+    "gsm_plus",
+    "asdiv",
+    "mathqa",
+    "arithmetic",
     "math_500",
+    "math",
     "aime24",
     "aime25",
+    "aimo_progress_prize_1",
     "olympiad_bench",
     "lcb:codegeneration",
     "ifeval",
@@ -57,7 +63,7 @@ EXCLUDED_BENCHMARKS = {
 }
 
 
-def test_default_config_contains_only_the_26_native_selectors(tmp_path):
+def test_default_config_contains_only_the_32_native_selectors(tmp_path):
     manifest = tmp_path / "pool.json"
     manifest.write_text("{}", encoding="utf-8")
 
@@ -66,12 +72,12 @@ def test_default_config_contains_only_the_26_native_selectors(tmp_path):
         env={"RWKV_EVAL_POOL_MANIFEST": str(manifest)},
     )
 
-    assert len(config.benchmarks) == 26
+    assert len(config.benchmarks) == 32
     assert set(config.benchmarks) == DEFAULT_BENCHMARKS
     assert set(config.benchmarks).isdisjoint(EXCLUDED_BENCHMARKS)
     resolved = resolve_benchmarks(config.benchmarks)
-    assert resolved.selector_count == 26
-    assert len(resolved.leaf_tasks) == 226
+    assert resolved.selector_count == 32
+    assert len(resolved.leaf_tasks) == 247
 
 
 def test_config_rejects_unknown_fields_and_duplicate_selectors(tmp_path):
