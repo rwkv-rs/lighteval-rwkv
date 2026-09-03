@@ -12,7 +12,7 @@ languages:
 chinese
 
 tags:
-knowledge, multilingual, multiple-choice
+knowledge, multilingual, multiple-choice, field:knowledge
 
 paper:
 """

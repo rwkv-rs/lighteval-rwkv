@@ -17,7 +17,7 @@ languages:
 english
 
 tags:
-commonsense, multiple-choice, qa
+commonsense, multiple-choice, qa, field:reasoning
 
 paper:
 https://arxiv.org/abs/1811.00937

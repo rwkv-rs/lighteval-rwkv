@@ -12,7 +12,7 @@ languages:
 english
 
 tags:
-general-knowledge, knowledge, multiple-choice
+general-knowledge, knowledge, multiple-choice, field:knowledge
 
 paper:
 https://arxiv.org/abs/2406.04127

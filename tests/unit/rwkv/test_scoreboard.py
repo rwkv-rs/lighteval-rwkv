@@ -7,7 +7,7 @@ import pytest
 
 import lighteval.logging.scoreboard as scoreboard_module
 from lighteval.logging.info_loggers import DetailsLogger, MetricsLogger
-from lighteval.logging.scoreboard import ScoreboardCallback
+from lighteval.logging.scoreboard import ScoreboardCallback, _sha256
 from lighteval.metrics.metrics_sample import ExactMatches
 from lighteval.metrics.utils.metric_utils import SampleLevelMetric
 from lighteval.models.model_output import ModelResponse
@@ -149,9 +149,13 @@ def test_scoreboard_aggregates_lighteval_metadata_for_selector():
         )
     )
     callback._task_metadata_by_name = {
-        "mmlu:a": {"languages": ["english"], "tags": ["knowledge", "multiple-choice"]},
-        "mmlu:b": {"languages": ["english", "chinese"], "tags": ["math", "multiple-choice"]},
+        "mmlu:a": {"languages": ["english"], "tags": ["knowledge", "multiple-choice", "field:knowledge"]},
+        "mmlu:b": {
+            "languages": ["english", "chinese"],
+            "tags": ["math", "multiple-choice", "field:knowledge"],
+        },
     }
+    callback._field_by_selector = {"mmlu": "knowledge"}
     tasks = [
         SimpleNamespace(
             config=SimpleNamespace(
@@ -169,8 +173,118 @@ def test_scoreboard_aggregates_lighteval_metadata_for_selector():
 
     assert metadata["benchmark"] == "mmlu"
     assert metadata["task_name"] == "mmlu"
+    assert metadata["field"] == "knowledge"
     assert metadata["languages"] == ["chinese", "english"]
     assert metadata["tags"] == ["knowledge", "math", "multiple-choice"]
+
+
+@pytest.mark.parametrize(
+    ("marker", "field"),
+    [
+        ("field:math", "math"),
+        ("field:robotics", "robotics"),
+        ("field:instruction_following", "instruction_following"),
+        (f"field:a{'0_-' * 21}", f"a{'0_-' * 21}"),
+    ],
+)
+def test_scoreboard_extracts_valid_open_task_field(marker, field):
+    assert ScoreboardCallback._extract_task_field("task", ["upstream-tag", marker]) == field
+
+
+@pytest.mark.parametrize("tags", [[], ["math"], ["field:math", "field:knowledge"]])
+def test_scoreboard_rejects_missing_or_multiple_task_fields(tags):
+    with pytest.raises(ValueError, match="exactly one field:<id> marker"):
+        ScoreboardCallback._extract_task_field("task", tags)
+
+
+@pytest.mark.parametrize(
+    "marker",
+    ["field:", "field:Math", "field:math/code", "field:math.code", "field:math:algebra", f"field:a{'0' * 64}"],
+)
+def test_scoreboard_rejects_invalid_task_field(marker):
+    with pytest.raises(ValueError, match="invalid field marker"):
+        ScoreboardCallback._extract_task_field("task", [marker])
+
+
+def test_scoreboard_rejects_inconsistent_selector_fields():
+    callback = ScoreboardCallback.__new__(ScoreboardCallback)
+    callback._task_metadata_by_name = {
+        "suite:a": {"tags": ["field:knowledge"]},
+        "suite:b": {"tags": ["field:math"]},
+    }
+    callback._pipeline = SimpleNamespace(
+        tasks_dict={
+            "suite:a|0": SimpleNamespace(config=SimpleNamespace(name="suite:a")),
+            "suite:b|0": SimpleNamespace(config=SimpleNamespace(name="suite:b")),
+        },
+        _selector_tasks={"suite": ("suite:a|0", "suite:b|0")},
+    )
+
+    with pytest.raises(ValueError, match="selector suite has inconsistent field markers"):
+        callback._resolve_task_fields()
+
+
+def test_scoreboard_rejects_task_field_before_network_preflight(tmp_path, monkeypatch):
+    config_path = tmp_path / "eval.toml"
+    config_path.write_text("schema_version = 1\n", encoding="utf-8")
+    task = SimpleNamespace(config=SimpleNamespace(name="task"))
+    pipeline = SimpleNamespace(
+        tasks_dict={"task|0": task},
+        _selector_tasks={"task": ("task|0",)},
+        registry=SimpleNamespace(
+            get_tasks_dump=lambda: [{"docstring": {"tags": ["knowledge"]}, "tasks": [{"name": "task"}]}]
+        ),
+    )
+    model = SimpleNamespace(
+        config=SimpleNamespace(
+            model_name="RWKV7-g1j-1.5B-20260831-ctx16384",
+            model_revision="a" * 64,
+            max_samples=None,
+        )
+    )
+    requests = []
+    monkeypatch.setattr(ScoreboardCallback, "_request", lambda *args, **kwargs: requests.append((args, kwargs)))
+
+    with pytest.raises(ValueError, match="exactly one field:<id> marker"):
+        ScoreboardCallback(
+            base_url="https://scoreboard.example/test",
+            token="secret",
+            config_path=config_path,
+            pipeline=pipeline,
+            tracker=SimpleNamespace(),
+            model=model,
+        )
+
+    assert requests == []
+
+
+def test_scoreboard_field_changes_all_canonical_hashes():
+    callback = ScoreboardCallback.__new__(ScoreboardCallback)
+    callback._config_digest = "a" * 64
+    callback._rerun_reason = None
+    task = {
+        "identity": "task",
+        "weight_sha256": "b" * 64,
+        "weight_display_name": "model",
+        "wkv_mode": "fp32io16",
+        "benchmark": "benchmark",
+        "task_name": "benchmark",
+        "field": "knowledge",
+        "task_version": "0",
+        "dataset": "dataset",
+        "subset": "subset",
+        "evaluation_splits": ["test"],
+        "languages": ["english"],
+        "tags": ["multiple-choice"],
+    }
+    other = {**task, "field": "math"}
+
+    campaign = callback._campaign(task)
+    other_campaign = callback._campaign(other)
+
+    assert campaign["registry_sha256"] != other_campaign["registry_sha256"]
+    assert campaign["run_key"] != other_campaign["run_key"]
+    assert _sha256({"task": task}) != _sha256({"task": other})
 
 
 @pytest.mark.parametrize("model_name", ["RWKV7", "RWKV7-g1j", "RWKV7-1.5B"])
@@ -290,7 +404,7 @@ def test_scoreboard_publication_keeps_only_evaluation_facts(tmp_path, monkeypatc
         registry=SimpleNamespace(
             get_tasks_dump=lambda: [
                 {
-                    "docstring": {"languages": ["english"], "tags": ["math", "reasoning"]},
+                    "docstring": {"languages": ["english"], "tags": ["math", "reasoning", "field:math"]},
                     "tasks": [{"name": "gsm8k"}],
                 }
             ]
@@ -348,6 +462,7 @@ def test_scoreboard_publication_keeps_only_evaluation_facts(tmp_path, monkeypatc
     assert publication["task_config"]["k_metrics"] == "avg@1"
     assert publication["task"]["benchmark"] == "gsm8k"
     assert publication["task"]["task_name"] == "gsm8k"
+    assert publication["task"]["field"] == "math"
     assert publication["task"]["weight_display_name"] == "RWKV7-g1h-7.2B-20260710-ctx10240"
     assert publication["task"]["weight_sha256"] == "a" * 64
     assert publication["task"]["wkv_mode"] == "fp32io16"

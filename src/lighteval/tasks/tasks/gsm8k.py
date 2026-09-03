@@ -12,7 +12,7 @@ languages:
 english
 
 tags:
-math, reasoning
+math, reasoning, field:math
 
 paper:
 https://arxiv.org/abs/2110.14168
