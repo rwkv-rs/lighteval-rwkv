@@ -24,6 +24,7 @@ MAX_COMPRESSED_BYTES = 64 * 1024 * 1024
 MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
 _TASK_CONFIG_FIELDS = ("num_fewshots", "generation_size", "stop_sequence", "original_num_docs", "effective_num_docs")
 _ENVIRONMENT_FIELDS = ("served_model_name", "model_revision", "vllm_version", "pool_fingerprint", "max_model_length")
+_FIELD_MARKER = re.compile(r"field:([a-z][a-z0-9_-]{0,63})")
 logger = logging.getLogger(__name__)
 
 
@@ -90,6 +91,7 @@ class ScoreboardCallback:
             for module in pipeline.registry.get_tasks_dump()
             for task in module["tasks"]
         }
+        self._field_by_selector = self._resolve_task_fields()
         self._config_digest = _sha256(
             {
                 "file_sha256": hashlib.sha256(Path(config_path).read_bytes()).hexdigest(),
@@ -100,6 +102,31 @@ class ScoreboardCallback:
         self._selector_details: dict[str, dict[str, list[DetailsLogger.Detail]]] = {}
         self._request("GET", "/api/v1/evaluation-publication-preflight")
 
+    @staticmethod
+    def _extract_task_field(task_name: str, tags: list[str]) -> str:
+        markers = [tag for tag in tags if tag.startswith("field:")]
+        if len(markers) != 1:
+            raise ValueError(f"Scoreboard task {task_name} must have exactly one field:<id> marker")
+        match = _FIELD_MARKER.fullmatch(markers[0])
+        if match is None:
+            raise ValueError(f"Scoreboard task {task_name} has invalid field marker: {markers[0]}")
+        return match.group(1)
+
+    def _resolve_task_fields(self) -> dict[str, str]:
+        fields = {}
+        for selector, task_names in self._pipeline._selector_tasks.items():
+            leaf_fields = {
+                self._extract_task_field(
+                    task.config.name,
+                    self._task_metadata_by_name[task.config.name].get("tags", []),
+                )
+                for task in (self._pipeline.tasks_dict[task_name] for task_name in task_names)
+            }
+            if len(leaf_fields) != 1:
+                raise ValueError(f"Scoreboard selector {selector} has inconsistent field markers")
+            fields[selector] = next(iter(leaf_fields))
+        return fields
+
     def _campaign(self, task_metadata: dict) -> dict:
         omitted = {"identity", "weight_sha256", "weight_display_name", "wkv_mode"}
         registry = [{key: value for key, value in task_metadata.items() if key not in omitted}]
@@ -108,7 +135,9 @@ class ScoreboardCallback:
             "source": "lighteval",
             "config_sha256": self._config_digest,
             "registry_sha256": _sha256(registry),
-            "contract_sha256": _sha256("scoreboard-v1:lighteval:selector,document,rollout,metrics,model_response"),
+            "contract_sha256": _sha256(
+                "scoreboard-v1:lighteval:selector,field,document,rollout,metrics,model_response"
+            ),
             "configured_benchmarks": [task_metadata["benchmark"]],
             "resolved_benchmarks": [task_metadata["benchmark"]],
             "skipped_benchmarks": [],
@@ -215,6 +244,7 @@ class ScoreboardCallback:
         repositories = {config.hf_repo for config in configs}
         subsets = {config.hf_subset for config in configs}
         metadata = [self._task_metadata_by_name[config.name] for config in configs]
+        tags = {tag for values in metadata for tag in values.get("tags", [])}
         return {
             "identity": f"{revision}:{self._model.config.wkv_mode}:{selector}",
             "weight_sha256": revision,
@@ -222,12 +252,13 @@ class ScoreboardCallback:
             "wkv_mode": self._model.config.wkv_mode,
             "benchmark": selector,
             "task_name": selector,
+            "field": self._field_by_selector[selector],
             "task_version": ",".join(versions),
             "dataset": next(iter(repositories)) if len(repositories) == 1 else None,
             "subset": next(iter(subsets)) if len(subsets) == 1 else None,
             "evaluation_splits": sorted({split for config in configs for split in config.evaluation_splits}),
             "languages": sorted({language for values in metadata for language in values.get("languages", [])}),
-            "tags": sorted({tag for values in metadata for tag in values.get("tags", [])}),
+            "tags": sorted(tag for tag in tags if not tag.startswith("field:")),
         }
 
     def _task_config(self, tasks, primary_metric) -> dict:
