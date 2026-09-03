@@ -8,7 +8,7 @@ import pytest
 import lighteval.main_rwkv as main_rwkv
 import lighteval.models.rwkv.pipeline as rwkv_pipeline
 from lighteval.metrics.metrics import Metrics
-from lighteval.metrics.metrics_sample import AvgAtN, ExactMatches
+from lighteval.metrics.metrics_sample import AvgAtN, ExactMatches, MajAtN, MathVerifyMatch
 from lighteval.metrics.utils.metric_utils import SampleLevelMetric
 from lighteval.models.model_output import ModelResponse
 from lighteval.tasks.requests import Doc, SamplingMethod
@@ -425,6 +425,22 @@ def test_rwkv_avg_at_k_averages_the_native_task_scorer():
 
     assert scorer.compute(doc, response) == 0.5
     assert str(scorer) == "RWKVAvgAtK(k=4)"
+
+
+def test_rwkv_avg_at_k_delegates_answer_extraction_to_sampling_scorer():
+    metric = SampleLevelMetric(
+        metric_name="maj@n",
+        sample_level_fn=MajAtN(n=1, sample_scoring_function=MathVerifyMatch()),
+        category=SamplingMethod.GENERATIVE,
+        corpus_level_fn=lambda values: sum(values) / len(values),
+        higher_is_better=True,
+    )
+    scorer = rwkv_pipeline.RWKVAvgAtK(1, metric)
+    doc = Doc(query="question", choices=["-371"], gold_index=0)
+    response = ModelResponse(text=["230 − 601 = −371\nFinal answer: -371"], finish_reasons=["stop"])
+
+    assert scorer.score_rollout(doc, response) == 1.0
+    assert scorer.extract_rollout_answer(doc, response) == "-371"
 
 
 def test_rwkv_avg_at_k_scores_truncated_rollout_as_zero():

@@ -24,6 +24,7 @@ import pytest
 import sympy
 
 from lighteval.metrics.dynamic_metrics import MultilingualExtractiveMatchMetric
+from lighteval.metrics.metrics_sample import MathVerifyMatch
 from lighteval.metrics.utils.extractive_match_utils import (
     ExprExtractionConfig,
     IndicesExtractionConfig,
@@ -75,6 +76,22 @@ def compare_strings(
         model_response=model_response,
         doc=doc,
     )
+
+
+@pytest.mark.parametrize(
+    ("gold", "prediction", "extracted"),
+    [
+        ("-371", "230 − 601 = −371\n\nThis means that 601 is 371 more than 230.", "-371"),
+        (r"\frac{1}{2}", r"Thus $\boxed{\frac{1}{2}}$.", "1/2"),
+    ],
+)
+def test_math_verify_match_extracts_and_scores_final_answer(gold, prediction, extracted):
+    metric = MathVerifyMatch()
+    doc = Doc(query="question", choices=[gold], gold_index=0)
+    response = ModelResponse(text=[prediction])
+
+    assert metric.compute(doc, response) == 1.0
+    assert metric.extract_answer(doc, response) == extracted
 
 
 # Test basic multiple choice answer extraction

@@ -70,6 +70,9 @@ class RWKVAvgAtK(SampleLevelComputation):
         scorer = self.metric.sample_level_fn
         if extractor := getattr(scorer, "extract_answer", None):
             return extractor(doc, model_response)
+        if scorer_owner := getattr(getattr(scorer, "compute_score", None), "__self__", None):
+            if extractor := getattr(scorer_owner, "extract_answer", None):
+                return extractor(doc, model_response)
         return model_response.final_text[0] if model_response.final_text else ""
 
 

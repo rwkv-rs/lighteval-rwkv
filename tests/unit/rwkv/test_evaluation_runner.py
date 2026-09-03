@@ -87,6 +87,7 @@ def test_four_model_evaluation_runner_forwards_signals_to_every_process(tmp_path
 
     assert result == 128 + signal.SIGTERM
     assert len(processes) == 4
+    assert all(process.command[:3] == ["uv", "run", "--no-sync"] for process in processes)
     assert all(process.command[-2:] == ["--max-samples", "10"] for process in processes)
     assert [process.env["RWKV_EVAL_POOL_MANIFEST"] for process in processes] == [
         str(manifest.resolve()) for manifest in manifests

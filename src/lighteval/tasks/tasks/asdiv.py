@@ -31,7 +31,7 @@ def asdiv_prompt(line, task_name: str = None):
     return Doc(
         task_name=task_name,
         query=f"{line['body']}\nQuestion:{line['question']}\nAnswer:",
-        choices=line["answer"].split(" (")[0],
+        choices=[line["answer"].split(" (")[0]],
         gold_index=[0],
     )
 
@@ -52,9 +52,9 @@ asdiv = LightevalTaskConfig(
     few_shots_split=None,
     few_shots_select=None,
     generation_size=-1,
-    metrics=[Metrics.exact_match],
+    metrics=[Metrics.math_verify],
     stop_sequence=["\n"],
-    version=0,
+    version=1,
     sample_fields=record_to_sample,
     solver=[generate(cache=True)],
     scorer=math_scorer(),

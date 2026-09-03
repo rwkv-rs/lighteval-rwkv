@@ -145,14 +145,9 @@ MODEL_NAME = "meta-llama/Meta-Llama-3-8B-Instruct"
 BENCHMARKS = "gsm8k"
 
 evaluation_tracker = EvaluationTracker(output_dir="./results")
-pipeline_params = PipelineParameters(
-    launcher_type=ParallelismManager.NONE,
-    max_samples=2
-)
+pipeline_params = PipelineParameters(launcher_type=ParallelismManager.NONE, max_samples=2)
 
-model = AutoModelForCausalLM.from_pretrained(
-  MODEL_NAME, device_map="auto"
-)
+model = AutoModelForCausalLM.from_pretrained(MODEL_NAME, device_map="auto")
 config = TransformersModelConfig(model_name=MODEL_NAME, batch_size=1)
 model = TransformersModel.from_model(model, config)
 
@@ -195,11 +190,11 @@ temp/run_rwkv.sh \
   --manifest-13.3b /absolute/path/to/13.3b.json
 ```
 
-The launcher requires aggregate pool capacities of 1024, 1024, 960, and 320 respectively and evaluates 10 samples per leaf benchmark by default. Pass `--dry-run` to validate the four configurations or `--max-samples N` to override that sample count.
+The launcher requires aggregate pool capacities of 1024, 1024, 960, and 320 respectively and evaluates 10 samples per configured selector by default. Superset selectors distribute that budget across their leaf tasks. Pass `--dry-run` to validate the four configurations or `--max-samples N` to override that sample count.
 
 `RWKV_EVAL_API_KEY` may contain an optional bearer token; secrets do not belong in the TOML or pool manifest. See `configs/eval/vllm_pool.example.json` for the strict manifest schema.
 
-The default configuration contains these 26 selectors already registered by this LightEval source: `mmlu`, `mmlu_pro`, `mmlu_redux_2`, `gpqa:diamond`, `gpqa:main`, `arc:challenge`, `arc:easy`, `hellaswag`, `bigbench_hard`, `agieval`, `truthfulqa:mc`, `winogrande`, `openbookqa`, `commonsenseqa`, `ceval_zho_mcf`, `med_qa`, `med_mcqa`, `gsm8k`, `math_500`, `aime24`, `aime25`, `olympiad_bench`, `lcb:codegeneration`, `ifeval`, `ifbench_test`, and `ifbench_multiturn`.
+The default configuration contains these 32 selectors already registered by this LightEval source: `mmlu`, `mmlu_pro`, `mmlu_redux_2`, `gpqa:diamond`, `gpqa:main`, `arc:challenge`, `arc:easy`, `hellaswag`, `bigbench_hard`, `agieval`, `truthfulqa:mc`, `winogrande`, `openbookqa`, `commonsenseqa`, `ceval_zho_mcf`, `med_qa`, `med_mcqa`, `gsm8k`, `gsm_plus`, `asdiv`, `mathqa`, `arithmetic`, `math_500`, `math`, `aime24`, `aime25`, `aimo_progress_prize_1`, `olympiad_bench`, `lcb:codegeneration`, `ifeval`, `ifbench_test`, and `ifbench_multiturn`.
 
 It deliberately excludes `mmlu_sr_question_answer`, `kmmlu`, `minerva_math`, `svamp`, `beyond_aime`, `brumo25`, `hmmt_feb_2025`, `math_odyssey`, `comp_math_24_25`, `gaokao_2023_english`, `answer_judge`, `simpleqa_verified`, `humaneval`, `humaneval_cn`, `humaneval_fix`, `humaneval_plus`, `mbpp`, and `mbpp_plus`. Evaluate those with another framework; this command does not install, alias, skip, or substitute missing tasks.
 

@@ -72,7 +72,7 @@ def _validate(evaluations: Sequence[ModelEvaluation]) -> None:
 
 
 def _command(args: argparse.Namespace) -> list[str]:
-    command = ["uv", "run", "lighteval", "rwkv", "--config", str(args.config)]
+    command = ["uv", "run", "--no-sync", "lighteval", "rwkv", "--config", str(args.config)]
     if args.dry_run:
         command.append("--dry-run")
     if args.max_samples is not None:
@@ -121,3 +121,7 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
         return 1
     print("All RWKV evaluations completed successfully.", flush=True)
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
