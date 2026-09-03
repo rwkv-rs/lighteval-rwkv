@@ -3,16 +3,22 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import hashlib
+import json
 import logging
 import math
 import queue
 import threading
 import time
 from collections import defaultdict
+from contextlib import contextmanager
 from copy import copy
+from pathlib import Path
 from typing import Mapping
 
 import typer
+from datasets import config as datasets_config
 
 from lighteval.metrics.metrics_sample import SampleLevelComputation, SamplingMetric
 from lighteval.metrics.utils.metric_utils import SampleLevelMetric
@@ -33,6 +39,46 @@ _MIN_COMPLETIONS = 5000
 _LARGE_BENCHMARK_SIZE = 50_000
 _LARGE_BENCHMARK_FRACTION = 0.2
 logger = logging.getLogger(__name__)
+
+
+def _dataset_cache_key(task) -> str:
+    identity = json.dumps(
+        {
+            "data_files": task.data_files,
+            "dataset_config_name": task.dataset_config_name,
+            "dataset_path": task.dataset_path,
+            "dataset_revision": task.dataset_revision,
+        },
+        default=str,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+@contextmanager
+def _dataset_cache_lock(task):
+    key = _dataset_cache_key(task)
+    lock_dir = Path(datasets_config.HF_DATASETS_CACHE) / ".rwkv-locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    started_at = time.monotonic()
+    with (lock_dir / key).open("a+b") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        logger.info(
+            "RWKV dataset cache lock acquired: task=%s key=%s wait_seconds=%.3f",
+            task.full_name,
+            key[:12],
+            time.monotonic() - started_at,
+        )
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _download_dataset(task):
+    with _dataset_cache_lock(task):
+        return task.download_dataset_worker(task)
 
 
 def _open_think_answer(text: str) -> str:
@@ -351,7 +397,7 @@ class RWKVPipeline(Pipeline):
                 except asyncio.QueueEmpty:
                     return
                 task = self.tasks_dict[task_name]
-                dataset = await asyncio.to_thread(task.download_dataset_worker, task)
+                dataset = await asyncio.to_thread(_download_dataset, task)
                 self._datasets_loaded += 1
                 logger.info("RWKV dataset ready: task=%s", task_name)
                 if self._datasets_loaded == len(self._task_names):
