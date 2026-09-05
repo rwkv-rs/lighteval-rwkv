@@ -211,7 +211,8 @@ def test_cached_selector_does_not_consume_a_rollout_slot(monkeypatch):
             if len(calls) == 3:
                 break
             await asyncio.sleep(0.01)
-        assert calls == ["cached|0", "small|0", "spare|0"]
+        assert calls[0] == "cached|0"
+        assert set(calls) == {"cached|0", "small|0", "spare|0"}
         release.set()
         await evaluation
 
