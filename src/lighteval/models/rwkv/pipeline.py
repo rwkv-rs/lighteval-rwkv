@@ -96,7 +96,21 @@ class RWKVAvgAtK(SampleLevelComputation):
         return f"RWKVAvgAtK(k={self.k})"
 
     def compute(self, doc: Doc, model_response, **kwargs) -> float:
-        return sum(self.score_rollout(doc, model_response[index]) for index in range(self.k)) / self.k
+        scores = []
+        extracted_answers = []
+        for index in range(self.k):
+            response = model_response[index]
+            scores.append(self.score_rollout(doc, response))
+            extracted_answers.append(self.extract_rollout_answer(doc, response))
+
+        # DetailsLogger serializes Doc.specific with the native details artifact.
+        # Keep the producer's per-rollout facts next to the document so downstream
+        # publishers can report them without invoking a benchmark scorer again.
+        specific = dict(doc.specific or {})
+        specific["rwkv_rollout_scores"] = scores
+        specific["rwkv_rollout_extracted_answers"] = extracted_answers
+        doc.specific = specific
+        return sum(scores) / self.k
 
     def score_rollout(self, doc: Doc, model_response) -> float:
         if model_response.finish_reasons == ["length"]:
