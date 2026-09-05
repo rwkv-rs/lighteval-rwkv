@@ -219,7 +219,13 @@ def _preflight(config: RWKVEvaluationConfig) -> tuple[PoolManifest, RWKVHttpPool
     manifest = PoolManifest.read(config.pool_manifest)
     pool = RWKVHttpPool(manifest, api_key=os.environ.get("RWKV_EVAL_API_KEY"))
     try:
-        pool.preflight()
+        if os.environ.get("RWKV_EVAL_CACHE_ONLY") == "1":
+            # Cache-only replays deliberately avoid touching the live pool. The
+            # manifest is the provenance source and the model adapter rejects
+            # every cache miss before it can issue a request.
+            pool._model_id = manifest.served_model_name
+        else:
+            pool.preflight()
     except Exception:
         pool.close()
         raise

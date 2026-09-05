@@ -293,6 +293,23 @@ def test_async_model_cache_preserves_document_order_and_skips_completed_requests
     assert [response.text for response in second] == [["second"], ["first"]]
 
 
+def test_cache_only_mode_rejects_uncached_rollouts(monkeypatch):
+    class Cache:
+        def get_task_id(self, _task_name, _sampling_method):
+            return "task"
+
+        def get_samples_to_process_and_cache(self, docs, _sampling_method):
+            return docs, []
+
+    model = RWKVHttpModel.__new__(RWKVHttpModel)
+    model._cache = Cache()
+    model._generate = lambda _docs: (_ for _ in ()).throw(AssertionError("generation must be disabled"))
+    monkeypatch.setenv("RWKV_EVAL_CACHE_ONLY", "1")
+
+    with pytest.raises(ValueError, match="cache-only"):
+        asyncio.run(model.greedy_until([_document("uncached")]))
+
+
 def test_prompt_template_contract_is_exact():
     assert PROMPT_TEMPLATES == {
         "bot": ("\nBot✿", "✿"),
