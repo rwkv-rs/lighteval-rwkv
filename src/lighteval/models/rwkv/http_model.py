@@ -196,6 +196,7 @@ class RWKVHttpModel(LightevalModel):
                     )
                 )
 
+        failure: BaseException | None = None
         if jobs:
             await self.pool.start()
 
@@ -228,7 +229,6 @@ class RWKVHttpModel(LightevalModel):
                     ) from error
 
             requests = [asyncio.create_task(execute(job)) for job in jobs]
-            failure: BaseException | None = None
             try:
                 completions = await asyncio.gather(*requests)
             except BaseException as error:

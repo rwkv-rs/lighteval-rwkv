@@ -199,6 +199,13 @@ def test_model_rejects_generation_logits():
         asyncio.run(model.greedy_until([document]))
 
 
+def test_model_empty_documents_do_not_open_the_pool():
+    model = RWKVHttpModel.__new__(RWKVHttpModel)
+    model._cache = None
+
+    assert asyncio.run(model.greedy_until([])) == []
+
+
 def test_request_contract_version_changes_cache_namespace(tmp_path, monkeypatch):
     class Cache:
         def __init__(self, config):
@@ -311,6 +318,8 @@ def test_async_model_cache_preserves_completed_documents_when_a_rollout_fails():
                 raise PoolError("transient failure")
             if name == "pending" and self.failed:
                 await asyncio.Event().wait()
+            if name == "partial" and self.failed and calls.count(name) == 2:
+                await asyncio.Event().wait()
             return Completion(
                 text=name,
                 reasoning=None,
@@ -353,17 +362,31 @@ def test_async_model_cache_preserves_completed_documents_when_a_rollout_fails():
     model._cot_mode = "open_think"
     model._generation_parameters = {}
     model._cache = Cache()
-    docs = [_document("first"), _document("fail"), _document("pending")]
+    docs = [
+        _document("first", num_samples=2),
+        _document("partial", num_samples=2),
+        _document("fail"),
+        _document("pending"),
+        _document("last", num_samples=2),
+    ]
 
     with pytest.raises(PoolError, match="transient failure"):
         asyncio.run(model.greedy_until(docs))
 
-    assert set(model._cache.results) == {"first"}
+    assert set(model._cache.results) == {"first", "last"}
     pool.failed = False
     responses = asyncio.run(model.greedy_until(docs))
 
-    assert [response.text for response in responses] == [["first"], ["fail"], ["pending"]]
-    assert calls.count("first") == 1
+    assert [response.text for response in responses] == [
+        ["first", "first"],
+        ["partial", "partial"],
+        ["fail"],
+        ["pending"],
+        ["last", "last"],
+    ]
+    assert calls.count("first") == 2
+    assert calls.count("last") == 2
+    assert calls.count("partial") == 4
     assert calls.count("fail") == 2
     assert calls.count("pending") == 2
 
