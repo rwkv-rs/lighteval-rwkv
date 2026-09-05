@@ -3,7 +3,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from lighteval.logging.scoreboard import ScoreboardCallback
 from lighteval.main_rwkv import ConfigError, RWKVEvaluationConfig, resolve_benchmarks
 from lighteval.tasks.requests import SamplingMethod
 
@@ -133,7 +132,12 @@ def test_default_config_fields_cover_all_32_selectors_and_247_leaf_tasks(tmp_pat
     assert set(DEFAULT_FIELDS) == set(config.benchmarks)
     assert sum(len(leaves) for _, leaves in resolved.selector_tasks) == 247
     for selector, leaves in resolved.selector_tasks:
-        fields = {ScoreboardCallback._extract_task_field(leaf, metadata[leaf].get("tags", [])) for leaf in leaves}
+        fields = {
+            tag.removeprefix("field:")
+            for leaf in leaves
+            for tag in metadata[leaf].get("tags", [])
+            if tag.startswith("field:")
+        }
         assert fields == {DEFAULT_FIELDS[selector]}
 
 

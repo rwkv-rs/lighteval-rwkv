@@ -192,9 +192,9 @@ Run the same full evaluation against the separately deployed G1j pools without o
 temp/run_g1j.sh
 ```
 
-The full configuration reads `SCOREBOARD_API_BASE_URL` and `SCOREBOARD_PUBLICATION_TOKEN` and evaluates every configured split. The G1i manifests require aggregate pool capacities of 1024, 1024, 960, and 320 respectively; the current G1j deployment manifests require 1024, 1024, 512, and 320.
+The full configuration evaluates every configured split. The G1i manifests require aggregate pool capacities of 1024, 1024, 960, and 320 respectively; the current G1j deployment manifests require 1024, 1024, 512, and 320.
 
-The test configuration is a separate contract. It reads `SCOREBOARD_API_BASE_URL_TEST` and `SCOREBOARD_PUBLICATION_TOKEN_TEST` and evaluates exactly 10 documents per configured selector; superset selectors distribute that budget across their leaf tasks:
+The test configuration is a separate contract. It evaluates exactly 10 documents per configured selector; superset selectors distribute that budget across their leaf tasks:
 
 ```shell
 temp/run_rwkv.sh --config configs/eval/lighteval-test.toml
@@ -203,8 +203,6 @@ temp/run_rwkv.sh --config configs/eval/lighteval-test.toml
 Pass `--dry-run` to validate the selected configuration. Sample limits cannot be overridden from the command line: full and test runs are selected only by their configuration files.
 
 `RWKV_EVAL_API_KEY` may contain an optional bearer token; secrets do not belong in the TOML or pool manifest. See `configs/eval/vllm_pool.example.json` for the strict manifest schema.
-
-Production publication reads `SCOREBOARD_API_BASE_URL` and `SCOREBOARD_PUBLICATION_TOKEN`. Test publication reads only `SCOREBOARD_API_BASE_URL_TEST` and `SCOREBOARD_PUBLICATION_TOKEN_TEST`; it never falls back to production credentials.
 
 The default configuration contains these 32 selectors already registered by this LightEval source: `mmlu`, `mmlu_pro`, `mmlu_redux_2`, `gpqa:diamond`, `gpqa:main`, `arc:challenge`, `arc:easy`, `hellaswag`, `bigbench_hard`, `agieval`, `truthfulqa:mc`, `winogrande`, `openbookqa`, `commonsenseqa`, `ceval_zho_mcf`, `med_qa`, `med_mcqa`, `gsm8k`, `gsm_plus`, `asdiv`, `mathqa`, `arithmetic`, `math_500`, `math`, `aime24`, `aime25`, `aimo_progress_prize_1`, `olympiad_bench`, `lcb:codegeneration`, `ifeval`, `ifbench_test`, and `ifbench_multiturn`.
 

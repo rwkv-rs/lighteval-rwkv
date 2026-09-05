@@ -299,24 +299,9 @@ def rwkv(
             selector_tasks=selector_tasks,
             task_max_samples=task_max_samples,
         )
-        from lighteval.logging.scoreboard import ScoreboardCallback
-
-        scoreboard = ScoreboardCallback.from_environment(
-            variable_suffix="_TEST" if eval_config.run_mode == "test" else "",
-            run_mode=eval_config.run_mode,
-            config_path=config,
-            pipeline=pipeline,
-            tracker=tracker,
-            model=model,
-        )
-        if scoreboard is not None:
-            pipeline.task_callback = scoreboard
         pipeline.evaluate()
         pipeline.show_results()
         pipeline.save_and_push_results()
-        if scoreboard is not None and scoreboard.publication_errors:
-            failures = "; ".join(f"{selector}: {error}" for selector, error in scoreboard.publication_errors)
-            raise ValueError(f"Scoreboard publications remain pending: {failures}")
     except (ConfigError, PoolError, ValueError) as error:
         typer.echo(f"RWKV evaluation failed: {error}", err=True)
         raise typer.Exit(code=2) from error
