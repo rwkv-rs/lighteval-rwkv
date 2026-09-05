@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -141,6 +142,8 @@ class RWKVHttpModel(LightevalModel):
         task_ids = {self._cache.get_task_id(doc.task_name, SamplingMethod.GENERATIVE) for doc in docs}
         pending, _ = self._cache.get_samples_to_process_and_cache(docs, SamplingMethod.GENERATIVE)
         if pending:
+            if os.environ.get("RWKV_EVAL_CACHE_ONLY") == "1":
+                raise ValueError("cache-only evaluation found uncached RWKV rollouts")
             results = await self._generate(pending)
             self._cache.cache_samples(
                 docs=pending,
