@@ -188,8 +188,10 @@ def test_pool_uses_capacity_concurrently_and_preserves_completion_metadata(tmp_p
     assert pool.inflight == (0, 0)
 
 
-def test_pool_fails_over_only_for_retryable_failures(tmp_path, monkeypatch):  # noqa: C901
+@pytest.mark.parametrize("failures_before_success", [1, 6])
+def test_pool_fails_over_only_for_retryable_failures(tmp_path, monkeypatch, failures_before_success):  # noqa: C901
     posts = []
+    delays = []
 
     class Client:
         def __init__(self, *, base_url, **_kwargs):
@@ -207,7 +209,7 @@ def test_pool_fails_over_only_for_retryable_failures(tmp_path, monkeypatch):  # 
 
         async def post(self, path, *, json):
             posts.append((self.base_url, path))
-            if self.base_url.endswith("1:8000"):
+            if len(posts) <= failures_before_success:
                 return Response({"error": "busy"}, status_code=503)
             return _completion(7)
 
@@ -216,6 +218,7 @@ def test_pool_fails_over_only_for_retryable_failures(tmp_path, monkeypatch):  # 
 
     async def no_sleep(_delay):
         assert pool.inflight == (0, 0)
+        delays.append(_delay)
 
     monkeypatch.setattr(http_pool.httpx, "Client", Client)
     monkeypatch.setattr(http_pool.httpx, "AsyncClient", AsyncClient)
@@ -234,6 +237,7 @@ def test_pool_fails_over_only_for_retryable_failures(tmp_path, monkeypatch):  # 
         ("http://10.0.0.1:8000", "/v1/chat/completions"),
         ("http://10.0.0.2:8000", "/v1/chat/completions"),
     ]
+    assert delays == [float(2**attempt) for attempt in range(failures_before_success)]
 
 
 def test_pool_retries_context_limited_completion_with_effective_output_limit(tmp_path, monkeypatch):
