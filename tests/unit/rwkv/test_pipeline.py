@@ -14,6 +14,7 @@ from lighteval.metrics.metrics_sample import AvgAtN, ExactMatches, MajAtN, MathV
 from lighteval.metrics.utils.metric_utils import SampleLevelMetric
 from lighteval.models.model_output import ModelResponse
 from lighteval.tasks.requests import Doc, SamplingMethod
+from lighteval.tasks.tasks.ifbench.instructions import EmojiSentenceChecker, NGramOverlapChecker
 
 
 def _streaming_pipeline(task_names, model, download, *, max_samples):
@@ -270,6 +271,15 @@ def test_selector_priority_uses_shortest_remaining_benchmark_first():
         "spare",
         "large",
     )
+
+
+def test_ifbench_checkers_treat_empty_responses_as_failed():
+    overlap = NGramOverlapChecker("test")
+    overlap.build_description(reference_text="reference text", percentage=50)
+    assert overlap.check_following("") is False
+
+    emoji = EmojiSentenceChecker("test")
+    assert emoji.check_following("!!!") is False
 
 
 def test_duplicate_source_document_ids_are_disambiguated_for_cache():
