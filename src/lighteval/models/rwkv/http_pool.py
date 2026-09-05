@@ -19,7 +19,9 @@ import httpx
 
 
 RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
-RETRY_DELAYS = (1.0, 2.0, 4.0)
+API_MAX_RETRY = 8
+API_RETRY_SLEEP = 1.0
+API_RETRY_MULTIPLIER = 2.0
 logger = logging.getLogger(__name__)
 _CONTEXT_LENGTH_ERROR = re.compile(r"prompt contains at least (\d+) input tokens")
 
@@ -353,8 +355,7 @@ class RWKVHttpPool:
         attempted: set[int] = set()
         failures: list[str] = []
         context_failure: str | None = None
-        total_attempts = len(self._clients) + len(RETRY_DELAYS)
-        for attempt in range(total_attempts):
+        for attempt in range(API_MAX_RETRY):
             if len(attempted) == len(self._clients):
                 attempted.clear()
             async with self._scheduler.lease(frozenset(attempted)) as index:
@@ -376,8 +377,16 @@ class RWKVHttpPool:
                     failures.append(f"{self.manifest.replicas[index].base_url}: HTTP {status}")
                 except httpx.RequestError as error:
                     failures.append(f"{self.manifest.replicas[index].base_url}: {type(error).__name__}: {error}")
-            if attempt < total_attempts - 1:
-                await asyncio.sleep(RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)])
+            if attempt < API_MAX_RETRY - 1:
+                wait_time = min(64, API_RETRY_SLEEP * (API_RETRY_MULTIPLIER**attempt))
+                logger.warning(
+                    "RWKV completion transport retry: attempt=%d/%d wait_seconds=%s error=%s",
+                    attempt + 1,
+                    API_MAX_RETRY,
+                    wait_time,
+                    failures[-1],
+                )
+                await asyncio.sleep(wait_time)
         if context_failure is not None and not failures:
             raise ContextLengthError(context_failure)
         raise PoolError("RWKV completion failed: " + "; ".join(failures))
