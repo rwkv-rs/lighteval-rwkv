@@ -133,6 +133,7 @@ def _evaluation_plan(num_docs: int) -> tuple[int, int, str]:
 
 def _selector_priority(selector_rollouts: Mapping[str, int]) -> tuple[str, ...]:
     """Order benchmarks by their remaining rollout count."""
+    # Preserve the configured order when counts tie; dicts retain insertion order.
     return tuple(sorted(selector_rollouts, key=lambda selector: selector_rollouts[selector]))
 
 
@@ -476,9 +477,10 @@ class RWKVPipeline(Pipeline):
                 while ready_selectors and (
                     evaluation_started or len(ready_selectors) >= initial_ready_target or not preparation_tasks
                 ):
-                    selector = _selector_priority(
-                        {selector: selector_rollouts[selector] for selector in ready_selectors}
-                    )[0]
+                    selector = min(
+                        ready_selectors,
+                        key=lambda value: (selector_rollouts[value], selector_order.index(value)),
+                    )
                     positive_active = sum(
                         selector_rollouts[active_selector] > 0 for active_selector in active_selectors.values()
                     )
