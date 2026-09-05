@@ -1,4 +1,6 @@
 schema_version = 1
+run_mode = "test"
+max_samples = 10
 pool_manifest = "${RWKV_EVAL_POOL_MANIFEST}"
 output_dir = "results"
 prompt_template = "bot"

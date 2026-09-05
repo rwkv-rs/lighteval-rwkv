@@ -103,10 +103,12 @@ def test_default_config_contains_only_the_32_native_selectors(tmp_path):
     manifest.write_text("{}", encoding="utf-8")
 
     config = RWKVEvaluationConfig.read(
-        Path("configs/eval/lighteval.toml"),
+        Path("configs/eval/lighteval-full.toml"),
         env={"RWKV_EVAL_POOL_MANIFEST": str(manifest)},
     )
 
+    assert config.run_mode == "full"
+    assert config.max_samples is None
     assert len(config.benchmarks) == 32
     assert set(config.benchmarks) == DEFAULT_BENCHMARKS
     assert set(config.benchmarks).isdisjoint(EXCLUDED_BENCHMARKS)
@@ -121,7 +123,7 @@ def test_default_config_fields_cover_all_32_selectors_and_247_leaf_tasks(tmp_pat
     manifest = tmp_path / "pool.json"
     manifest.write_text("{}", encoding="utf-8")
     config = RWKVEvaluationConfig.read(
-        Path("configs/eval/lighteval.toml"),
+        Path("configs/eval/lighteval-full.toml"),
         env={"RWKV_EVAL_POOL_MANIFEST": str(manifest)},
     )
     resolved = resolve_benchmarks(config.benchmarks)
@@ -142,6 +144,7 @@ def test_config_rejects_unknown_fields_and_duplicate_selectors(tmp_path):
     config.write_text(
         f"""
 schema_version = 1
+run_mode = "full"
 pool_manifest = "{manifest}"
 output_dir = "results"
 prompt_template = "bot"
@@ -165,6 +168,7 @@ def test_config_requires_referenced_manifest_environment(tmp_path):
     config.write_text(
         """
 schema_version = 1
+run_mode = "full"
 pool_manifest = "${RWKV_EVAL_POOL_MANIFEST}"
 output_dir = "results"
 prompt_template = "bot"
@@ -176,6 +180,49 @@ benchmarks = ["gsm8k"]
 
     with pytest.raises(ConfigError, match="RWKV_EVAL_POOL_MANIFEST"):
         RWKVEvaluationConfig.read(config, env={})
+
+
+def test_full_and_test_configs_have_distinct_fixed_run_contracts(tmp_path):
+    manifest = tmp_path / "pool.json"
+    manifest.write_text("{}", encoding="utf-8")
+    env = {"RWKV_EVAL_POOL_MANIFEST": str(manifest)}
+
+    full = RWKVEvaluationConfig.read(Path("configs/eval/lighteval-full.toml"), env=env)
+    test = RWKVEvaluationConfig.read(Path("configs/eval/lighteval-test.toml"), env=env)
+
+    assert full.run_mode == "full"
+    assert full.max_samples is None
+    assert test.run_mode == "test"
+    assert test.max_samples == 10
+    assert test.benchmarks == full.benchmarks
+
+
+@pytest.mark.parametrize(
+    ("run_mode", "max_samples", "message"),
+    [
+        ("full", "max_samples = 10\n", "full run_mode must not configure max_samples"),
+        ("test", "", "test run_mode requires max_samples = 10"),
+        ("test", "max_samples = 3\n", "test run_mode requires max_samples = 10"),
+    ],
+)
+def test_config_rejects_ambiguous_run_mode(tmp_path, run_mode, max_samples, message):
+    manifest = tmp_path / "pool.json"
+    manifest.write_text("{}", encoding="utf-8")
+    config = tmp_path / "eval.toml"
+    config.write_text(
+        f'''schema_version = 1
+run_mode = "{run_mode}"
+{max_samples}pool_manifest = "{manifest}"
+output_dir = "results"
+prompt_template = "bot"
+cot_mode = "open_think"
+benchmarks = ["gsm8k"]
+''',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match=message):
+        RWKVEvaluationConfig.read(config)
 
 
 def test_resolver_reports_all_missing_selectors(monkeypatch):

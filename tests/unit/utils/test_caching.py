@@ -23,6 +23,7 @@
 import tempfile
 import unittest
 from dataclasses import asdict
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import pytest
@@ -60,6 +61,23 @@ class TestCaching(unittest.TestCase):
             )
             self.docs.append(doc)
             self.model_responses.append(model_resp)
+
+    def test_task_hash_ignores_process_local_callable_addresses(self):
+        class Config:
+            def __init__(self, address):
+                self.address = address
+
+            def __str__(self, lite=False):
+                assert lite
+                return f"solver=[<function solve at {self.address}>]"
+
+        def task_hash(address):
+            cache = SampleCache.__new__(SampleCache)
+            cache.registry = SimpleNamespace(task_to_configs={self.task_name: [Config(address)]})
+            cache._task_hashes = {}
+            return cache._get_task_hash(f"{self.task_name}|0")
+
+        self.assertEqual(task_hash("0x1234abcd"), task_hash("0x9876fedc"))
 
     def test_cache_directory_structure(self):
         """Test that cache directories are created correctly."""

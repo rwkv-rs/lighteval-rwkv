@@ -21,14 +21,16 @@ from lighteval.models.rwkv.http_pool import PoolError, PoolManifest, RWKVHttpPoo
 from lighteval.models.rwkv.pipeline import RWKVPipeline
 
 
-_CONFIG_FIELDS = {
+_REQUIRED_CONFIG_FIELDS = {
     "schema_version",
+    "run_mode",
     "pool_manifest",
     "output_dir",
     "prompt_template",
     "cot_mode",
     "benchmarks",
 }
+_CONFIG_FIELDS = _REQUIRED_CONFIG_FIELDS | {"max_samples"}
 _ENV_REFERENCE = re.compile(r"^\$\{([A-Z][A-Z0-9_]*)\}$")
 
 
@@ -38,6 +40,8 @@ class ConfigError(ValueError):
 
 @dataclass(frozen=True)
 class RWKVEvaluationConfig:
+    run_mode: str
+    max_samples: int | None
     pool_manifest: Path
     output_dir: Path
     prompt_template: str
@@ -63,11 +67,23 @@ class RWKVEvaluationConfig:
         unknown = sorted(set(raw) - _CONFIG_FIELDS)
         if unknown:
             raise ConfigError("unknown RWKV eval config fields: " + ", ".join(unknown))
-        missing = sorted(_CONFIG_FIELDS - set(raw))
+        missing = sorted(_REQUIRED_CONFIG_FIELDS - set(raw))
         if missing:
             raise ConfigError("missing RWKV eval config fields: " + ", ".join(missing))
         if raw["schema_version"] != 1 or isinstance(raw["schema_version"], bool):
             raise ConfigError("RWKV eval schema_version must be 1")
+
+        run_mode = raw["run_mode"]
+        if run_mode not in {"full", "test"}:
+            raise ConfigError("run_mode must be full or test")
+        if run_mode == "full":
+            if "max_samples" in raw:
+                raise ConfigError("full run_mode must not configure max_samples")
+            max_samples = None
+        else:
+            max_samples = raw.get("max_samples")
+            if max_samples != 10 or isinstance(max_samples, bool):
+                raise ConfigError("test run_mode requires max_samples = 10")
 
         pool_value = cls._expand_environment(raw["pool_manifest"], env, "pool_manifest")
         pool_manifest = Path(pool_value).expanduser()
@@ -102,6 +118,8 @@ class RWKVEvaluationConfig:
             raise ConfigError("duplicate benchmark selectors: " + ", ".join(duplicates))
 
         return cls(
+            run_mode=run_mode,
+            max_samples=max_samples,
             pool_manifest=pool_manifest,
             output_dir=output_dir,
             prompt_template=prompt_template,
@@ -212,7 +230,6 @@ def _print_preflight(
     config: RWKVEvaluationConfig,
     manifest: PoolManifest,
     resolved: ResolvedBenchmarks,
-    max_samples: int | None,
 ) -> None:
     typer.echo(f"selectors: {resolved.selector_count}")
     typer.echo(f"leaf tasks: {len(resolved.leaf_tasks)}")
@@ -226,7 +243,7 @@ def _print_preflight(
     typer.echo(f"prompt template: {config.prompt_template}")
     typer.echo(f"CoT mode: {config.cot_mode}")
     typer.echo(f"output directory: {config.output_dir}")
-    typer.echo("run mode: full" if max_samples is None else f"run mode: partial (max_samples={max_samples})")
+    typer.echo("run mode: full" if config.run_mode == "full" else f"run mode: test (max_samples={config.max_samples})")
 
 
 def rwkv(
@@ -238,10 +255,6 @@ def rwkv(
         bool,
         typer.Option("--dry-run", help="Validate tasks and every pool endpoint without evaluating datasets."),
     ] = False,
-    max_samples: Annotated[
-        int | None,
-        typer.Option("--max-samples", min=1, help="Partial smoke-test limit; omit for full benchmark splits."),
-    ] = None,
 ) -> None:
     """Evaluate the configured native LightEval benchmarks on an existing RWKV endpoint pool."""
     pool: RWKVHttpPool | None = None
@@ -249,7 +262,7 @@ def rwkv(
     try:
         eval_config = RWKVEvaluationConfig.read(config)
         manifest, pool, resolved = _preflight(eval_config)
-        _print_preflight(eval_config, manifest, resolved, max_samples)
+        _print_preflight(eval_config, manifest, resolved)
         if dry_run:
             pool.close()
             return
@@ -262,16 +275,16 @@ def rwkv(
             prompt_template=eval_config.prompt_template,
             cot_mode=eval_config.cot_mode,
             cache_dir=eval_config.output_dir / ".cache",
-            max_samples=max_samples,
+            max_samples=eval_config.max_samples,
             pool=pool,
         )
         tracker = EvaluationTracker(output_dir=str(eval_config.output_dir), save_details=True)
         parameters = PipelineParameters(
             launcher_type=ParallelismManager.NONE,
-            max_samples=max_samples,
+            max_samples=eval_config.max_samples,
             load_tasks_multilingual=True,
         )
-        selector_tasks, task_max_samples = _selector_sample_budgets(resolved, max_samples)
+        selector_tasks, task_max_samples = _selector_sample_budgets(resolved, eval_config.max_samples)
         pipeline = RWKVPipeline(
             tasks=",".join(eval_config.benchmarks),
             pipeline_parameters=parameters,
@@ -283,6 +296,8 @@ def rwkv(
         from lighteval.logging.scoreboard import ScoreboardCallback
 
         scoreboard = ScoreboardCallback.from_environment(
+            variable_suffix="_TEST" if eval_config.run_mode == "test" else "",
+            run_mode=eval_config.run_mode,
             config_path=config,
             pipeline=pipeline,
             tracker=tracker,
@@ -293,6 +308,9 @@ def rwkv(
         pipeline.evaluate()
         pipeline.show_results()
         pipeline.save_and_push_results()
+        if scoreboard is not None and scoreboard.publication_errors:
+            failures = "; ".join(f"{selector}: {error}" for selector, error in scoreboard.publication_errors)
+            raise ValueError(f"Scoreboard publications remain pending: {failures}")
     except (ConfigError, PoolError, ValueError) as error:
         typer.echo(f"RWKV evaluation failed: {error}", err=True)
         raise typer.Exit(code=2) from error

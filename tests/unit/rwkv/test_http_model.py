@@ -3,8 +3,13 @@ from types import SimpleNamespace
 
 import pytest
 
-from lighteval.models.rwkv.http_model import PROMPT_TEMPLATES, REQUEST_CONTRACT_VERSION, RWKVHttpModel
-from lighteval.models.rwkv.http_pool import Completion
+from lighteval.models.rwkv.http_model import (
+    CACHE_POOL_FINGERPRINT,
+    PROMPT_TEMPLATES,
+    REQUEST_CONTRACT_VERSION,
+    RWKVHttpModel,
+)
+from lighteval.models.rwkv.http_pool import Completion, ContextLengthError
 from lighteval.tasks.prompt_manager import PromptManager
 from lighteval.utils.cache_management import SampleCache, TaskID
 
@@ -106,6 +111,32 @@ def test_model_uses_prompt_template_stops_and_preserves_document_order(template,
     }
 
 
+def test_model_records_context_limited_rollout_as_truncated():
+    class Pool:
+        async def start(self):
+            pass
+
+        async def complete(self, _messages, _parameters):
+            raise ContextLengthError("prompt cannot fit")
+
+    model = RWKVHttpModel.__new__(RWKVHttpModel)
+    model.pool = Pool()
+    model.prompt_manager = PromptManager(use_chat_template=True, tokenizer=None)
+    model._prompt_template = "bot"
+    model._assistant_prefix = "\nBot✿"
+    model._template_stop = "✿"
+    model._cot_mode = "open_think"
+    model._generation_parameters = {}
+    model._cache = None
+
+    response = asyncio.run(model.greedy_until([_document("too long")]))[0]
+
+    assert response.text == [""]
+    assert response.finish_reasons == ["length"]
+    assert response.stop_reasons == ["context_length"]
+    assert response.truncated_tokens_count == 1
+
+
 def test_model_fake_think_parameters_and_provenance(tmp_path, monkeypatch):
     class Cache:
         def __init__(self, config):
@@ -154,6 +185,7 @@ def test_model_fake_think_parameters_and_provenance(tmp_path, monkeypatch):
     assert model.config.request_contract_version == REQUEST_CONTRACT_VERSION
     assert model.config.max_samples == 3
     assert model.config.generation_parameters.max_new_tokens == 8192
+    assert model._cache.config.pool_fingerprint == CACHE_POOL_FINGERPRINT
     model.cleanup()
 
 
@@ -251,7 +283,9 @@ def test_async_model_cache_preserves_document_order_and_skips_completed_requests
     model._cache = Cache()
     docs = [_document("first"), _document("second")]
 
+    assert model.pending_rollouts(docs) == 2
     first = asyncio.run(model.greedy_until(docs))
+    assert model.pending_rollouts(docs) == 0
     second = asyncio.run(model.greedy_until(list(reversed(docs))))
 
     assert calls == ["first", "second"]

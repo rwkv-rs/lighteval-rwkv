@@ -1,4 +1,5 @@
 import signal
+from io import BytesIO
 from types import SimpleNamespace
 
 import pytest
@@ -13,6 +14,7 @@ def _args(tmp_path, models="1.5b,2.9b,7.2b,13.3b"):
         manifest_2_9b=tmp_path / "2.9b.json",
         manifest_7_2b=tmp_path / "7.2b.json",
         manifest_13_3b=tmp_path / "13.3b.json",
+        dry_run=False,
     )
 
 
@@ -40,15 +42,24 @@ def test_evaluation_runner_validates_manifest_capacity(tmp_path, monkeypatch):
         evaluation_runner._validate(evaluation_runner._evaluations(_args(tmp_path, "1.5b")))
 
 
+def test_g1j_profile_uses_deployed_7_2b_capacity(tmp_path):
+    evaluations = evaluation_runner._evaluations(_args(tmp_path, "7.2b"), evaluation_runner.G1J_CAPACITIES)
+
+    assert evaluations == (evaluation_runner.ModelEvaluation("7.2B", 256, tmp_path / "7.2b.json"),)
+
+
 def test_four_model_evaluation_runner_forwards_signals_to_every_process(tmp_path, monkeypatch):
     handlers = {}
     processes = []
 
     class Process:
-        def __init__(self, command, *, cwd, env):
+        def __init__(self, command, *, cwd, env, stdout, stderr):
+            assert stdout is evaluation_runner.subprocess.PIPE
+            assert stderr is evaluation_runner.subprocess.STDOUT
             self.command = command
             self.cwd = cwd
             self.env = env
+            self.stdout = BytesIO(b"RWKV evaluation started: selector=winogrande\n")
             self.done = False
             self.signals = []
             processes.append(self)
@@ -66,6 +77,7 @@ def test_four_model_evaluation_runner_forwards_signals_to_every_process(tmp_path
             return 0
 
     monkeypatch.setattr(evaluation_runner, "_validate", lambda _evaluations: None)
+    monkeypatch.setattr(evaluation_runner, "DATASET_RATE_WINDOW_SECONDS", 0)
     monkeypatch.setattr(
         evaluation_runner.signal, "signal", lambda signum, handler: handlers.setdefault(signum, handler)
     )
@@ -88,7 +100,8 @@ def test_four_model_evaluation_runner_forwards_signals_to_every_process(tmp_path
     assert result == 128 + signal.SIGTERM
     assert len(processes) == 4
     assert all(process.command[:3] == ["uv", "run", "--no-sync"] for process in processes)
-    assert all(process.command[-2:] == ["--max-samples", "10"] for process in processes)
+    assert all("--max-samples" not in process.command for process in processes)
+    assert all(str(evaluation_runner.DEFAULT_CONFIG) in process.command for process in processes)
     assert [process.env["RWKV_EVAL_POOL_MANIFEST"] for process in processes] == [
         str(manifest.resolve()) for manifest in manifests
     ]

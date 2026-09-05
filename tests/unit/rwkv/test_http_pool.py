@@ -5,7 +5,13 @@ import httpx
 import pytest
 
 from lighteval.models.rwkv import http_pool
-from lighteval.models.rwkv.http_pool import CapacityScheduler, PoolError, PoolManifest, RWKVHttpPool
+from lighteval.models.rwkv.http_pool import (
+    CapacityScheduler,
+    ContextLengthError,
+    PoolError,
+    PoolManifest,
+    RWKVHttpPool,
+)
 
 
 def _manifest(tmp_path, replicas=None, served_model_name="rwkv-current"):
@@ -19,7 +25,10 @@ def _manifest(tmp_path, replicas=None, served_model_name="rwkv-current"):
                 "model_revision": "weight-sha",
                 "wkv_mode": "fp32io16",
                 "vllm_version": "0.11.0",
+                "torch_version": "2.10.0",
+                "gpu": "NVIDIA RTX PRO 6000 Blackwell Workstation Edition",
                 "max_model_len": 10240,
+                "max_num_batched_tokens": 64,
                 "replicas": replicas
                 or [
                     {"base_url": "http://10.0.0.1:8000", "max_concurrency": 2},
@@ -225,6 +234,95 @@ def test_pool_fails_over_only_for_retryable_failures(tmp_path, monkeypatch):  # 
         ("http://10.0.0.1:8000", "/v1/chat/completions"),
         ("http://10.0.0.2:8000", "/v1/chat/completions"),
     ]
+
+
+def test_pool_retries_context_limited_completion_with_effective_output_limit(tmp_path, monkeypatch):
+    posted_limits = []
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def get(self, path):
+            return Response({}) if path == "/health" else Response({"data": [{"id": "rwkv-current"}]})
+
+        def close(self):
+            pass
+
+    class AsyncClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def post(self, _path, *, json):
+            posted_limits.append(json["max_completion_tokens"])
+            if len(posted_limits) <= 2:
+                return Response(
+                    {
+                        "error": {
+                            "message": (
+                                "requested output tokens and your prompt contains at least "
+                                f"{8999 + len(posted_limits)} input tokens"
+                            )
+                        }
+                    },
+                    status_code=400,
+                )
+            return _completion(7)
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(http_pool.httpx, "Client", Client)
+    monkeypatch.setattr(http_pool.httpx, "AsyncClient", AsyncClient)
+    pool = RWKVHttpPool(_manifest(tmp_path))
+    pool.preflight()
+
+    async def run():
+        completion = await pool.complete(
+            [{"role": "user", "content": "q"}], {"max_completion_tokens": 2000}
+        )
+        await pool.aclose()
+        return completion
+
+    assert asyncio.run(run()).text == "answer-7"
+    assert posted_limits == [2000, 1240, 1239]
+
+
+def test_pool_reports_context_limit_when_prompt_cannot_fit(tmp_path, monkeypatch):
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        def get(self, path):
+            return Response({}) if path == "/health" else Response({"data": [{"id": "rwkv-current"}]})
+
+        def close(self):
+            pass
+
+    class AsyncClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def post(self, _path, *, json):
+            return Response(
+                {"error": {"message": "your prompt contains at least 10240 input tokens"}},
+                status_code=400,
+            )
+
+        async def aclose(self):
+            pass
+
+    monkeypatch.setattr(http_pool.httpx, "Client", Client)
+    monkeypatch.setattr(http_pool.httpx, "AsyncClient", AsyncClient)
+    pool = RWKVHttpPool(_manifest(tmp_path))
+    pool.preflight()
+
+    async def run():
+        with pytest.raises(ContextLengthError, match="10240 input tokens"):
+            await pool.complete([{"role": "user", "content": "q"}], {"max_completion_tokens": 2000})
+        await pool.aclose()
+
+    asyncio.run(run())
 
 
 def test_pool_fails_closed_on_schema_errors_without_trying_another_replica(tmp_path, monkeypatch):

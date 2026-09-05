@@ -15,6 +15,38 @@ from lighteval.models.rwkv.pipeline import RWKVAvgAtK
 from lighteval.tasks.requests import Doc, SamplingMethod
 
 
+def test_scoreboard_environment_suffix_selects_test_credentials(monkeypatch):
+    captured = {}
+    monkeypatch.setenv("SCOREBOARD_API_BASE_URL", "https://scoreboard.example")
+    monkeypatch.setenv("SCOREBOARD_PUBLICATION_TOKEN", "production-secret")
+    monkeypatch.setenv("SCOREBOARD_API_BASE_URL_TEST", "https://scoreboard.example/test")
+    monkeypatch.setenv("SCOREBOARD_PUBLICATION_TOKEN_TEST", "test-secret")
+    monkeypatch.setattr(
+        ScoreboardCallback,
+        "__init__",
+        lambda _self, **kwargs: captured.update(kwargs),
+    )
+
+    ScoreboardCallback.from_environment(variable_suffix="_TEST", run_mode="test", marker="value")
+
+    assert captured == {
+        "base_url": "https://scoreboard.example/test",
+        "token": "test-secret",
+        "run_mode": "test",
+        "rerun_reason": None,
+        "marker": "value",
+    }
+
+
+def test_missing_test_credentials_do_not_fall_back_to_production(monkeypatch):
+    monkeypatch.setenv("SCOREBOARD_API_BASE_URL", "https://scoreboard.example")
+    monkeypatch.setenv("SCOREBOARD_PUBLICATION_TOKEN", "production-secret")
+    monkeypatch.delenv("SCOREBOARD_API_BASE_URL_TEST", raising=False)
+    monkeypatch.delenv("SCOREBOARD_PUBLICATION_TOKEN_TEST", raising=False)
+
+    assert ScoreboardCallback.from_environment(variable_suffix="_TEST") is None
+
+
 def test_scoreboard_callback_selects_twenty_samples_per_outcome():
     details = []
     for outcome in ("correct", "incorrect", "unanswered"):
@@ -141,8 +173,42 @@ def test_scoreboard_waits_for_all_internal_leaves_and_publishes_only_selector():
     assert callback._selector_details == {}
 
 
+def test_scoreboard_defers_publication_error_without_retaining_details():
+    callback = ScoreboardCallback.__new__(ScoreboardCallback)
+    callback._pipeline = SimpleNamespace(
+        _task_selectors={"task|0": "task"},
+        _selector_tasks={"task": ("task|0",)},
+    )
+    callback._selector_details = {}
+    callback.publication_errors = []
+    callback._publish_selector = lambda *_args: (_ for _ in ()).throw(ValueError("payload too large"))
+
+    callback("task|0", ["detail"])
+
+    assert callback.publication_errors == [("task", "payload too large")]
+    assert callback._selector_details == {}
+
+
+def test_scoreboard_finalizes_campaign_without_pair_lookup():
+    callback = ScoreboardCallback.__new__(ScoreboardCallback)
+    callback._run_mode = "full"
+    requests = []
+
+    def request(method, path, *args, **kwargs):
+        requests.append((method, path, args, kwargs))
+
+    callback._request = request
+
+    callback._finalize_campaign("campaign")
+
+    assert [(method, path) for method, path, *_ in requests] == [
+        ("POST", "/api/v1/evaluation-campaigns/campaign/finalize")
+    ]
+
+
 def test_scoreboard_aggregates_lighteval_metadata_for_selector():
     callback = ScoreboardCallback.__new__(ScoreboardCallback)
+    callback._run_mode = "test"
     callback._model = SimpleNamespace(
         config=SimpleNamespace(
             model_name="RWKV7-g1h-7.2B-20260710-ctx10240", model_revision="a" * 64, wkv_mode="fp32io16"
@@ -154,6 +220,10 @@ def test_scoreboard_aggregates_lighteval_metadata_for_selector():
             "languages": ["english", "chinese"],
             "tags": ["math", "multiple-choice", "field:knowledge"],
         },
+    }
+    callback._task_registry_by_name = {
+        name: {"module": "lighteval.tasks.tasks.mmlu", "docstring": metadata}
+        for name, metadata in callback._task_metadata_by_name.items()
     }
     callback._field_by_selector = {"mmlu": "knowledge"}
     tasks = [
@@ -232,7 +302,13 @@ def test_scoreboard_rejects_task_field_before_network_preflight(tmp_path, monkey
         tasks_dict={"task|0": task},
         _selector_tasks={"task": ("task|0",)},
         registry=SimpleNamespace(
-            get_tasks_dump=lambda: [{"docstring": {"tags": ["knowledge"]}, "tasks": [{"name": "task"}]}]
+            get_tasks_dump=lambda: [
+                {
+                    "module": "lighteval.tasks.tasks.task",
+                    "docstring": {"tags": ["knowledge"]},
+                    "tasks": [{"name": "task"}],
+                }
+            ]
         ),
     )
     model = SimpleNamespace(
@@ -253,6 +329,7 @@ def test_scoreboard_rejects_task_field_before_network_preflight(tmp_path, monkey
             pipeline=pipeline,
             tracker=SimpleNamespace(),
             model=model,
+            run_mode="test",
         )
 
     assert requests == []
@@ -260,6 +337,7 @@ def test_scoreboard_rejects_task_field_before_network_preflight(tmp_path, monkey
 
 def test_scoreboard_field_changes_all_canonical_hashes():
     callback = ScoreboardCallback.__new__(ScoreboardCallback)
+    callback._run_mode = "test"
     callback._config_digest = "a" * 64
     callback._rerun_reason = None
     task = {
@@ -285,6 +363,47 @@ def test_scoreboard_field_changes_all_canonical_hashes():
     assert campaign["registry_sha256"] != other_campaign["registry_sha256"]
     assert campaign["run_key"] != other_campaign["run_key"]
     assert _sha256({"task": task}) != _sha256({"task": other})
+
+
+def test_full_scoreboard_uses_scoreboard_v1_campaign_contract():
+    callback = ScoreboardCallback.__new__(ScoreboardCallback)
+    callback._run_mode = "full"
+    callback._config_digest = "a" * 64
+    callback._rerun_reason = None
+    task = {
+        "identity": f"{'b' * 64}:fp32io16:winogrande",
+        "weight_sha256": "b" * 64,
+        "weight_display_name": "RWKV7-g1i-1.5B-20260805-ctx16384",
+        "wkv_mode": "fp32io16",
+        "benchmark": "winogrande",
+        "field": "reasoning",
+        "task_name": "winogrande",
+        "task_version": "0",
+        "dataset": "allenai/winogrande",
+        "subset": "winogrande_xl",
+        "evaluation_splits": ["validation"],
+        "languages": ["english"],
+        "tags": ["commonsense", "reasoning"],
+    }
+
+    campaign = callback._campaign(task)
+
+    assert set(campaign) == {
+        "schema_version",
+        "run_key",
+        "source",
+        "config_sha256",
+        "registry_sha256",
+        "contract_sha256",
+        "configured_benchmarks",
+        "resolved_benchmarks",
+        "skipped_benchmarks",
+        "expected_tasks",
+        "rerun_reason",
+    }
+    assert campaign["schema_version"] == "scoreboard-v1"
+    assert campaign["configured_benchmarks"] == ["winogrande"]
+    assert campaign["expected_tasks"] == [task]
 
 
 @pytest.mark.parametrize("model_name", ["RWKV7", "RWKV7-g1j", "RWKV7-1.5B"])
@@ -338,7 +457,7 @@ def test_scoreboard_publication_keeps_only_evaluation_facts(tmp_path, monkeypatc
         requests.append(SimpleNamespace(method=method, url=url, data=content, headers=headers))
         assert timeout == 60
         if method == "GET":
-            return Response({"status": "ready"})
+            return Response({"status": "ready", "schema_version": "scoreboard-v1"})
         if url.endswith("/api/v1/evaluation-campaigns"):
             return Response({"campaign_id": campaign_id})
         return Response({"action": "created"})
@@ -404,6 +523,7 @@ def test_scoreboard_publication_keeps_only_evaluation_facts(tmp_path, monkeypatc
         registry=SimpleNamespace(
             get_tasks_dump=lambda: [
                 {
+                    "module": "lighteval.tasks.tasks.gsm8k",
                     "docstring": {"languages": ["english"], "tags": ["math", "reasoning", "field:math"]},
                     "tasks": [{"name": "gsm8k"}],
                 }
@@ -421,6 +541,7 @@ def test_scoreboard_publication_keeps_only_evaluation_facts(tmp_path, monkeypatc
         pipeline=pipeline,
         tracker=tracker,
         model=model,
+        run_mode="test",
     )
     detail = DetailsLogger.Detail(
         doc=Doc(query="What is 1 + 1?", choices=["2"], gold_index=0, id="7"),

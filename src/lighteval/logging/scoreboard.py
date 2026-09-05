@@ -20,8 +20,8 @@ from lighteval.models.model_output import ModelResponse
 
 
 MAX_SAMPLES_PER_OUTCOME = 20
-MAX_COMPRESSED_BYTES = 64 * 1024 * 1024
-MAX_UNCOMPRESSED_BYTES = 256 * 1024 * 1024
+MAX_COMPRESSED_BYTES = 128 * 1024 * 1024
+MAX_UNCOMPRESSED_BYTES = 512 * 1024 * 1024
 _TASK_CONFIG_FIELDS = ("num_fewshots", "generation_size", "stop_sequence", "original_num_docs", "effective_num_docs")
 _ENVIRONMENT_FIELDS = ("served_model_name", "model_revision", "vllm_version", "pool_fingerprint", "max_model_length")
 _FIELD_MARKER = re.compile(r"field:([a-z][a-z0-9_-]{0,63})")
@@ -58,12 +58,18 @@ def _sha256(value: object) -> str:
 def _campaign_run_key(campaign: dict) -> str:
     normalized = dict(campaign)
     normalized.pop("run_key", None)
-    for name in ("configured_benchmarks", "resolved_benchmarks", "skipped_benchmarks"):
+    selector_fields = (
+        ("configured_benchmarks", "resolved_benchmarks", "skipped_benchmarks")
+        if campaign["schema_version"] == "scoreboard-v1"
+        else ("configured_selectors", "resolved_selectors", "skipped_selectors")
+    )
+    for name in selector_fields:
         normalized[name] = sorted(normalized[name])
     tasks = []
     for value in normalized["expected_tasks"]:
         task = dict(value)
-        for name in ("evaluation_splits", "languages", "tags"):
+        tag_field = "tags" if campaign["schema_version"] == "scoreboard-v1" else "upstream_tags"
+        for name in ("evaluation_splits", "languages", tag_field):
             task[name] = sorted(task[name])
         tasks.append(task)
     normalized["expected_tasks"] = sorted(tasks, key=lambda task: (task["identity"], _canonical_json(task)))
@@ -73,7 +79,7 @@ def _campaign_run_key(campaign: dict) -> str:
 class ScoreboardCallback:
     """Publish one configured benchmark selector as one finalized campaign."""
 
-    def __init__(self, *, base_url, token, config_path, pipeline, tracker, model, rerun_reason=None) -> None:
+    def __init__(self, *, base_url, token, config_path, pipeline, tracker, model, run_mode, rerun_reason=None) -> None:
         parsed = urlsplit(base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.query or parsed.fragment:
             raise ValueError("SCOREBOARD_API_BASE_URL must be an HTTP(S) URL without query or fragment")
@@ -85,12 +91,14 @@ class ScoreboardCallback:
         self._pipeline = pipeline
         self._tracker = tracker
         self._model = model
+        self._run_mode = run_mode
         self._validate_model_name(model.config.model_name)
-        self._task_metadata_by_name = {
-            task["name"]: module["docstring"]
+        self._task_registry_by_name = {
+            task["name"]: {"module": module["module"], "docstring": module["docstring"]}
             for module in pipeline.registry.get_tasks_dump()
             for task in module["tasks"]
         }
+        self._task_metadata_by_name = {name: entry["docstring"] for name, entry in self._task_registry_by_name.items()}
         self._field_by_selector = self._resolve_task_fields()
         self._config_digest = _sha256(
             {
@@ -100,7 +108,13 @@ class ScoreboardCallback:
         )
         self._rerun_reason = rerun_reason
         self._selector_details: dict[str, dict[str, list[DetailsLogger.Detail]]] = {}
-        self._request("GET", "/api/v1/evaluation-publication-preflight")
+        self.publication_errors: list[tuple[str, str]] = []
+        preflight = self._request("GET", "/api/v1/evaluation-publication-preflight")
+        expected_schema = "scoreboard-v1"
+        if preflight.get("schema_version") != expected_schema:
+            raise ValueError(
+                f"Scoreboard {run_mode} endpoint requires {preflight.get('schema_version')}, expected {expected_schema}"
+            )
 
     @staticmethod
     def _extract_task_field(task_name: str, tags: list[str]) -> str:
@@ -148,13 +162,15 @@ class ScoreboardCallback:
         return campaign
 
     @classmethod
-    def from_environment(cls, **kwargs) -> "ScoreboardCallback | None":
-        base_url = os.environ.get("SCOREBOARD_API_BASE_URL")
-        token = os.environ.get("SCOREBOARD_PUBLICATION_TOKEN")
+    def from_environment(cls, *, variable_suffix: str = "", **kwargs) -> "ScoreboardCallback | None":
+        base_url_name = f"SCOREBOARD_API_BASE_URL{variable_suffix}"
+        token_name = f"SCOREBOARD_PUBLICATION_TOKEN{variable_suffix}"
+        base_url = os.environ.get(base_url_name)
+        token = os.environ.get(token_name)
         if base_url is None and token is None:
             return None
         if not base_url or not token:
-            raise ValueError("SCOREBOARD_API_BASE_URL and SCOREBOARD_PUBLICATION_TOKEN must be set together")
+            raise ValueError(f"{base_url_name} and {token_name} must be set together")
         return cls(base_url=base_url, token=token, rerun_reason=os.environ.get("SCOREBOARD_RERUN_REASON"), **kwargs)
 
     def __call__(self, task_name: str, details: list[DetailsLogger.Detail]) -> None:
@@ -164,8 +180,13 @@ class ScoreboardCallback:
         expected = self._pipeline._selector_tasks[selector]
         if any(expected_task not in selector_details for expected_task in expected):
             return
-        self._publish_selector(selector, expected, selector_details)
-        del self._selector_details[selector]
+        try:
+            self._publish_selector(selector, expected, selector_details)
+        except ValueError as error:
+            self.publication_errors.append((selector, str(error)))
+            logger.error("Scoreboard publication deferred: selector=%s error=%s", selector, error)
+        finally:
+            del self._selector_details[selector]
 
     def _publish_selector(self, selector, task_names, details_by_task) -> None:
         tasks = [self._pipeline.tasks_dict[task_name] for task_name in task_names]
@@ -231,6 +252,9 @@ class ScoreboardCallback:
             return
         path = f"/api/v1/evaluation-campaigns/{campaign_id}/tasks/{quote(identity, safe='')}"
         self._request("PUT", path, publication, f"publish:{publication_sha256}")
+        self._finalize_campaign(campaign_id)
+
+    def _finalize_campaign(self, campaign_id: str) -> None:
         self._request(
             "POST",
             f"/api/v1/evaluation-campaigns/{campaign_id}/finalize",
@@ -245,7 +269,7 @@ class ScoreboardCallback:
         subsets = {config.hf_subset for config in configs}
         metadata = [self._task_metadata_by_name[config.name] for config in configs]
         tags = {tag for values in metadata for tag in values.get("tags", [])}
-        return {
+        task_metadata = {
             "identity": f"{revision}:{self._model.config.wkv_mode}:{selector}",
             "weight_sha256": revision,
             "weight_display_name": self._model.config.model_name,
@@ -260,6 +284,7 @@ class ScoreboardCallback:
             "languages": sorted({language for values in metadata for language in values.get("languages", [])}),
             "tags": sorted(tag for tag in tags if not tag.startswith("field:")),
         }
+        return task_metadata
 
     def _task_config(self, tasks, primary_metric) -> dict:
         configs = [task.config for task in tasks]
@@ -277,6 +302,7 @@ class ScoreboardCallback:
                 unique = list(dict.fromkeys(field_values))
                 values[name] = unique[0] if len(unique) == 1 else unique
         values["k_metrics"] = primary_metric
+        values["skipped_multiselect_docs"] = values["original_num_docs"] - values["effective_num_docs"]
         return values
 
     @staticmethod
@@ -294,12 +320,13 @@ class ScoreboardCallback:
         parameters = dict(self._model._generation_parameters)
         chat_kwargs = {"rwkv_prompt_template": config.prompt_template, "rwkv_generation_prompt": config.cot_mode}
         documents = [doc for task in tasks for doc in self._pipeline.documents_dict[task.full_name]]
+        max_new_tokens = max(self._model._completion_limit(doc) for doc in documents)
         parameters.update(
-            max_completion_tokens=max(self._model._completion_limit(doc) for doc in documents),
-            num_samples=max(doc.num_samples for doc in documents),
+            num_samples=max(doc.num_samples for doc in documents), seed=42, chat_template_kwargs=chat_kwargs
+        )
+        parameters.update(
+            max_completion_tokens=max_new_tokens,
             stop=list(dict.fromkeys(stop for doc in documents for stop in self._model._stop_sequences(doc))),
-            seed=42,
-            chat_template_kwargs=chat_kwargs,
         )
         return parameters
 

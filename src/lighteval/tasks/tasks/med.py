@@ -107,15 +107,15 @@ med_qa = LightevalTaskConfig(
     name="med_qa",
     prompt_function=med_qa_prompt,
     hf_repo="bigbio/med_qa",
-    hf_subset="default",
+    hf_subset="med_qa_en_source",
     hf_data_files={
         split: (
             "https://huggingface.co/datasets/bigbio/med_qa/resolve/"
-            f"e04abdc0672c54547fa1dbe36cfefc000e4f2657/med_qa_en_source/{split}/0000.parquet"
+            f"484a6c066fe8e75c83edea0c88b5169316714fcd/med_qa_en_source/{split}-00000-of-00001.parquet"
         )
         for split in ("train", "validation", "test")
     },
-    hf_revision="e04abdc0672c54547fa1dbe36cfefc000e4f2657",
+    hf_revision="484a6c066fe8e75c83edea0c88b5169316714fcd",
     hf_avail_splits=["train", "test", "validation"],
     evaluation_splits=["validation", "test"],
     few_shots_split=None,
