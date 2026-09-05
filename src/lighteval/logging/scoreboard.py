@@ -55,21 +55,20 @@ def _sha256(value: object) -> str:
     return hashlib.sha256(_canonical_json(value)).hexdigest()
 
 
+def _finalized_task_matches(receipt: dict, identity: str, publication_sha256: str) -> bool:
+    """Check that an idempotent retry describes the already finalized task."""
+    return receipt.get("task_hashes", {}).get(identity) == publication_sha256
+
+
 def _campaign_run_key(campaign: dict) -> str:
     normalized = dict(campaign)
     normalized.pop("run_key", None)
-    selector_fields = (
-        ("configured_benchmarks", "resolved_benchmarks", "skipped_benchmarks")
-        if campaign["schema_version"] == "scoreboard-v1"
-        else ("configured_selectors", "resolved_selectors", "skipped_selectors")
-    )
-    for name in selector_fields:
+    for name in ("configured_benchmarks", "resolved_benchmarks", "skipped_benchmarks"):
         normalized[name] = sorted(normalized[name])
     tasks = []
     for value in normalized["expected_tasks"]:
         task = dict(value)
-        tag_field = "tags" if campaign["schema_version"] == "scoreboard-v1" else "upstream_tags"
-        for name in ("evaluation_splits", "languages", tag_field):
+        for name in ("evaluation_splits", "languages", "tags"):
             task[name] = sorted(task[name])
         tasks.append(task)
     normalized["expected_tasks"] = sorted(tasks, key=lambda task: (task["identity"], _canonical_json(task)))
@@ -243,11 +242,14 @@ class ScoreboardCallback:
         identity = task_metadata["identity"]
         publication_sha256 = _sha256(publication)
         if receipt.get("status") == "complete":
+            if not _finalized_task_matches(receipt, identity, publication_sha256):
+                raise ValueError(
+                    f"Scoreboard task is finalized with different content: campaign={campaign_id} task={selector}"
+                )
             logger.info(
-                "Scoreboard task already finalized: campaign=%s task=%s hash_matches=%s",
+                "Scoreboard task already finalized: campaign=%s task=%s",
                 campaign_id,
                 selector,
-                receipt.get("task_hashes", {}).get(identity) == publication_sha256,
             )
             return
         path = f"/api/v1/evaluation-campaigns/{campaign_id}/tasks/{quote(identity, safe='')}"
