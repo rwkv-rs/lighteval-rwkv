@@ -131,10 +131,10 @@ def _evaluation_plan(num_docs: int) -> tuple[int, int, str]:
     return num_docs, k, f"avg@{k}"
 
 
-def _selector_priority(selector_rollouts: Mapping[str, int]) -> tuple[str, ...]:
+def _selector_priority(selector_rollouts: Mapping[str, int], configured_order: tuple[str, ...] = ()) -> tuple[str, ...]:
     """Order benchmarks by their remaining rollout count."""
-    # Preserve the configured order when counts tie; dicts retain insertion order.
-    return tuple(sorted(selector_rollouts, key=lambda selector: selector_rollouts[selector]))
+    order = {selector: index for index, selector in enumerate(configured_order)}
+    return tuple(sorted(selector_rollouts, key=lambda selector: (selector_rollouts[selector], order.get(selector, 0))))
 
 
 def _make_document_ids_unique(docs: list[Doc]) -> None:
@@ -477,10 +477,9 @@ class RWKVPipeline(Pipeline):
                 while ready_selectors and (
                     evaluation_started or len(ready_selectors) >= initial_ready_target or not preparation_tasks
                 ):
-                    selector = min(
-                        ready_selectors,
-                        key=lambda value: (selector_rollouts[value], selector_order.index(value)),
-                    )
+                    selector = _selector_priority(
+                        {value: selector_rollouts[value] for value in ready_selectors}, tuple(selector_order)
+                    )[0]
                     positive_active = sum(
                         selector_rollouts[active_selector] > 0 for active_selector in active_selectors.values()
                     )
@@ -493,7 +492,11 @@ class RWKVPipeline(Pipeline):
                     (*preparation_tasks, *active_selectors),
                     return_when=asyncio.FIRST_COMPLETED,
                 )
-                for task in done:
+                preparation_order = {
+                    task: selector_order.index(selector)
+                    for task, selector in preparation_tasks.items()
+                }
+                for task in sorted(done, key=lambda completed: preparation_order.get(completed, len(selector_order))):
                     if task in active_selectors:
                         del active_selectors[task]
                         await task
