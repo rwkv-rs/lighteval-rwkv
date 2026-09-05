@@ -7,7 +7,7 @@ import pytest
 
 import lighteval.logging.scoreboard as scoreboard_module
 from lighteval.logging.info_loggers import DetailsLogger, MetricsLogger
-from lighteval.logging.scoreboard import ScoreboardCallback, _sha256
+from lighteval.logging.scoreboard import ScoreboardCallback, _finalized_task_matches, _sha256
 from lighteval.metrics.metrics_sample import ExactMatches
 from lighteval.metrics.utils.metric_utils import SampleLevelMetric
 from lighteval.models.model_output import ModelResponse
@@ -204,6 +204,14 @@ def test_scoreboard_finalizes_campaign_without_pair_lookup():
     assert [(method, path) for method, path, *_ in requests] == [
         ("POST", "/api/v1/evaluation-campaigns/campaign/finalize")
     ]
+
+
+def test_scoreboard_finalized_task_requires_matching_content_hash():
+    receipt = {"status": "complete", "task_hashes": {"revision:fp16:gsm8k": "expected"}}
+
+    assert _finalized_task_matches(receipt, "revision:fp16:gsm8k", "expected")
+    assert not _finalized_task_matches(receipt, "revision:fp16:gsm8k", "different")
+    assert not _finalized_task_matches(receipt, "revision:fp16:winogrande", "expected")
 
 
 def test_scoreboard_aggregates_lighteval_metadata_for_selector():
