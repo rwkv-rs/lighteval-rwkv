@@ -228,19 +228,25 @@ class RWKVHttpModel(LightevalModel):
                     ) from error
 
             requests = [asyncio.create_task(execute(job)) for job in jobs]
+            failure: BaseException | None = None
             try:
                 completions = await asyncio.gather(*requests)
-            except BaseException:
+            except BaseException as error:
+                failure = error
                 for request in requests:
                     request.cancel()
-                await asyncio.gather(*requests, return_exceptions=True)
-                raise
+                completions = await asyncio.gather(*requests, return_exceptions=True)
             for job, completion in zip(jobs, completions):
+                if isinstance(completion, BaseException):
+                    continue
                 response_slots[job.document_index][job.sample_index] = completion
 
         responses: list[ModelResponse] = []
-        for slots in response_slots:
+        completed_docs: list[Doc] = []
+        for document_index, slots in enumerate(response_slots):
             if any(completion is None for completion in slots):
+                if failure is not None:
+                    continue
                 raise RuntimeError("RWKV HTTP evaluation returned incomplete samples")
             completions = [completion for completion in slots if completion is not None]
             prompt_text = completions[0].prompt_text
@@ -263,6 +269,19 @@ class RWKVHttpModel(LightevalModel):
                     truncated_tokens_count=sum(completion.finish_reason == "length" for completion in completions),
                 )
             )
+            completed_docs.append(docs[document_index])
+        if failure is not None:
+            if self._cache is not None and completed_docs:
+                self._cache.cache_samples(
+                    docs=completed_docs,
+                    results=responses,
+                    task_ids={
+                        self._cache.get_task_id(doc.task_name, SamplingMethod.GENERATIVE)
+                        for doc in completed_docs
+                    },
+                    sampling_method=SamplingMethod.GENERATIVE,
+                )
+            raise failure
         return responses
 
     @staticmethod

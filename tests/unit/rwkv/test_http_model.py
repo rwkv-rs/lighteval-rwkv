@@ -9,7 +9,7 @@ from lighteval.models.rwkv.http_model import (
     REQUEST_CONTRACT_VERSION,
     RWKVHttpModel,
 )
-from lighteval.models.rwkv.http_pool import Completion, ContextLengthError
+from lighteval.models.rwkv.http_pool import Completion, ContextLengthError, PoolError
 from lighteval.tasks.prompt_manager import PromptManager
 from lighteval.utils.cache_management import SampleCache, TaskID
 
@@ -291,6 +291,81 @@ def test_async_model_cache_preserves_document_order_and_skips_completed_requests
     assert calls == ["first", "second"]
     assert [response.text for response in first] == [["first"], ["second"]]
     assert [response.text for response in second] == [["second"], ["first"]]
+
+
+def test_async_model_cache_preserves_completed_documents_when_a_rollout_fails():  # noqa: C901
+    calls = []
+
+    class Pool:
+        def __init__(self):
+            self.failed = True
+
+        async def start(self):
+            pass
+
+        async def complete(self, messages, _parameters):
+            name = messages[-1]["content"]
+            calls.append(name)
+            if name == "fail" and self.failed:
+                await asyncio.sleep(0)
+                raise PoolError("transient failure")
+            if name == "pending" and self.failed:
+                await asyncio.Event().wait()
+            return Completion(
+                text=name,
+                reasoning=None,
+                finish_reason="stop",
+                stop_reason=None,
+                terminal_token_id=1,
+                prompt_text=name,
+                prompt_token_ids=(1,),
+                output_token_ids=(2,),
+            )
+
+    class Cache:
+        def __init__(self):
+            self.results = {}
+
+        def get_task_id(self, task_name, sampling_method):
+            return TaskID(task_name, "hash", sampling_method)
+
+        def get_samples_to_process_and_cache(self, docs, sampling_method):
+            missing = [doc for doc in docs if doc.id not in self.results]
+            cached = {
+                self.get_task_id(doc.task_name, sampling_method)
+                for doc in docs
+                if doc.id in self.results
+            }
+            return missing, cached
+
+        def cache_samples(self, docs, results, **_kwargs):
+            self.results.update((doc.id, result) for doc, result in zip(docs, results))
+
+        def get_samples_from_cache(self, docs, _task_ids, _sampling_method):
+            return [self.results[doc.id] for doc in docs]
+
+    pool = Pool()
+    model = RWKVHttpModel.__new__(RWKVHttpModel)
+    model.pool = pool
+    model.prompt_manager = PromptManager(use_chat_template=True, tokenizer=None)
+    model._prompt_template = "bot"
+    model._template_stop = "✿"
+    model._cot_mode = "open_think"
+    model._generation_parameters = {}
+    model._cache = Cache()
+    docs = [_document("first"), _document("fail"), _document("pending")]
+
+    with pytest.raises(PoolError, match="transient failure"):
+        asyncio.run(model.greedy_until(docs))
+
+    assert set(model._cache.results) == {"first"}
+    pool.failed = False
+    responses = asyncio.run(model.greedy_until(docs))
+
+    assert [response.text for response in responses] == [["first"], ["fail"], ["pending"]]
+    assert calls.count("first") == 1
+    assert calls.count("fail") == 2
+    assert calls.count("pending") == 2
 
 
 def test_cache_only_mode_rejects_uncached_rollouts(monkeypatch):
