@@ -60,7 +60,16 @@ def test_scoreboard_callback_selects_twenty_samples_per_outcome():
             )
             details.append(
                 DetailsLogger.Detail(
-                    doc=Doc(query="question", choices=["answer"], gold_index=0, id=str(index)),
+                    doc=Doc(
+                        query="question",
+                        choices=["answer"],
+                        gold_index=0,
+                        id=str(index),
+                        specific={
+                            "rwkv_rollout_scores": [float(outcome == "correct")],
+                            "rwkv_rollout_extracted_answers": [text],
+                        },
+                    ),
                     model_response=response,
                     metric={"avg@1": float(outcome == "correct")},
                 )
@@ -117,7 +126,15 @@ def test_lcb_scoreboard_answer_is_extracted_code():
 
 def test_scoreboard_splits_rollouts_and_scores_each_one():
     detail = DetailsLogger.Detail(
-        doc=Doc(query="question", choices=["one"], gold_index=0),
+        doc=Doc(
+            query="question",
+            choices=["one"],
+            gold_index=0,
+            specific={
+                "rwkv_rollout_scores": [1.0, 0.0],
+                "rwkv_rollout_extracted_answers": ["one", ""],
+            },
+        ),
         model_response=ModelResponse(
             text=["one", ""],
             text_post_processed=["one", ""],
@@ -149,6 +166,25 @@ def test_scoreboard_splits_rollouts_and_scores_each_one():
     assert [sample["answer"]["extracted_answer"] for sample in samples] == ["one", ""]
     assert [sample["answer"]["repeat_id"] for sample in samples] == [0, 1]
     assert samples[0]["metrics"] == {"scoreboard_outcome": "correct", "avg@2": 1.0}
+
+
+def test_rwkv_avg_at_k_persists_rollout_facts_on_document():
+    native_metric = SampleLevelMetric(
+        metric_name="accuracy",
+        sample_level_fn=ExactMatches(strip_strings=True),
+        category=SamplingMethod.GENERATIVE,
+        corpus_level_fn=lambda values: sum(values) / len(values),
+        higher_is_better=True,
+    )
+    doc = Doc(query="question", choices=["one"], gold_index=0, specific={"source": "native"})
+    response = ModelResponse(text=["one", "wrong"], finish_reasons=["stop", "stop"])
+
+    assert RWKVAvgAtK(2, native_metric).compute(doc, response) == 0.5
+    assert doc.specific == {
+        "source": "native",
+        "rwkv_rollout_scores": [1.0, 0.0],
+        "rwkv_rollout_extracted_answers": ["one", "wrong"],
+    }
 
 
 def test_scoreboard_waits_for_all_internal_leaves_and_publishes_only_selector():
@@ -552,7 +588,16 @@ def test_scoreboard_publication_keeps_only_evaluation_facts(tmp_path, monkeypatc
         run_mode="test",
     )
     detail = DetailsLogger.Detail(
-        doc=Doc(query="What is 1 + 1?", choices=["2"], gold_index=0, id="7"),
+        doc=Doc(
+            query="What is 1 + 1?",
+            choices=["2"],
+            gold_index=0,
+            id="7",
+            specific={
+                "rwkv_rollout_scores": [1.0],
+                "rwkv_rollout_extracted_answers": ["2"],
+            },
+        ),
         model_response=ModelResponse(
             input="User: What is 1 + 1?",
             input_tokens=[1, 2, 3],

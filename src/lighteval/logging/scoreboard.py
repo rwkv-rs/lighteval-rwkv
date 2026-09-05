@@ -349,14 +349,23 @@ class ScoreboardCallback:
 
     @classmethod
     def _rollouts(cls, task, details: list[DetailsLogger.Detail], document_offset: int = 0) -> list[_Rollout]:
-        scorer = task.metrics[0].sample_level_fn
         rollouts = []
         for document_index, detail in enumerate(details, start=document_offset):
+            specific = detail.doc.specific or {}
+            scores = specific.get("rwkv_rollout_scores")
+            extracted_answers = specific.get("rwkv_rollout_extracted_answers")
+            if scores is None or extracted_answers is None:
+                raise ValueError(
+                    f"details for {task.full_name} are missing producer rollout facts "
+                    "(rwkv_rollout_scores/rwkv_rollout_extracted_answers)"
+                )
+            if len(scores) != len(detail.model_response.text) or len(extracted_answers) != len(scores):
+                raise ValueError(f"details for {task.full_name} have inconsistent producer rollout facts")
             for repeat_id in range(len(detail.model_response.text)):
                 response = detail.model_response[repeat_id]
                 response.truncated_tokens_count = int(response.finish_reasons == ["length"])
-                score = float(scorer.score_rollout(detail.doc, response))
-                extracted_answer = scorer.extract_rollout_answer(detail.doc, response)
+                score = float(scores[repeat_id])
+                extracted_answer = str(extracted_answers[repeat_id])
                 rollouts.append(
                     _Rollout(
                         detail=detail,
