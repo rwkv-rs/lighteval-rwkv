@@ -770,3 +770,22 @@ def test_lcb_outer_workers_use_spawn_context(monkeypatch):
 
     assert contexts == ["spawn"]
     assert results == {0: [True]}
+
+
+def test_rwkv_avg_at_k_persists_producer_rollout_facts():
+    native_metric = SampleLevelMetric(
+        metric_name="accuracy",
+        sample_level_fn=ExactMatches(strip_strings=True),
+        category=SamplingMethod.GENERATIVE,
+        corpus_level_fn=lambda values: sum(values) / len(values),
+        higher_is_better=True,
+    )
+    doc = Doc(query="question", choices=["one"], gold_index=0, specific={"source": "native"})
+    response = ModelResponse(text=["one", "wrong"], finish_reasons=["stop", "stop"])
+
+    assert rwkv_pipeline.RWKVAvgAtK(2, native_metric).compute(doc, response) == 0.5
+    assert doc.specific == {
+        "source": "native",
+        "rwkv_rollout_scores": [1.0, 0.0],
+        "rwkv_rollout_extracted_answers": ["one", "wrong"],
+    }

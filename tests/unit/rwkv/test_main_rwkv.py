@@ -88,8 +88,6 @@ def test_test_run_uses_configured_limit_and_standard_saving(tmp_path, monkeypatc
         selector_tasks=(("gsm8k", ("gsm8k",)), ("ifeval", ("ifeval",))),
     )
     calls = []
-    monkeypatch.delenv("SCOREBOARD_API_BASE_URL_TEST", raising=False)
-    monkeypatch.delenv("SCOREBOARD_PUBLICATION_TOKEN_TEST", raising=False)
 
     class Model:
         def __init__(self, **kwargs):
