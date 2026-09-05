@@ -34,8 +34,8 @@ def test_med_qa_uses_official_parquet_schema_and_does_not_repeat_letter_options(
         },
         "med_qa|0",
     )
-    assert med_qa.hf_subset == "default"
-    assert med_qa.hf_revision == "e04abdc0672c54547fa1dbe36cfefc000e4f2657"
+    assert med_qa.hf_subset == "med_qa_en_source"
+    assert med_qa.hf_revision == "484a6c066fe8e75c83edea0c88b5169316714fcd"
     assert set(med_qa.hf_data_files) == {"train", "validation", "test"}
     assert doc.query.count("A. one") == 1
     assert "Give a letter answer among A, B, C, D or E." in doc.query

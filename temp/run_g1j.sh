@@ -14,4 +14,4 @@ fi
 unset ALL_PROXY all_proxy
 ulimit -n "$(ulimit -Hn)"
 
-exec uv run --no-sync python temp/main.py "$@"
+exec uv run --no-sync python temp/main_g1j.py "$@"

@@ -7,7 +7,6 @@ import fcntl
 import hashlib
 import json
 import logging
-import math
 import queue
 import threading
 import time
@@ -132,6 +131,23 @@ def _evaluation_plan(num_docs: int) -> tuple[int, int, str]:
     return num_docs, k, f"avg@{k}"
 
 
+def _selector_priority(selector_rollouts: Mapping[str, int]) -> tuple[str, ...]:
+    """Order benchmarks by their remaining rollout count."""
+    return tuple(sorted(selector_rollouts, key=lambda selector: selector_rollouts[selector]))
+
+
+def _make_document_ids_unique(docs: list[Doc]) -> None:
+    """Disambiguate repeated source IDs for the cache while retaining provenance."""
+    occurrences = defaultdict(int)
+    for doc in docs:
+        source_id = str(doc.id)
+        occurrence = occurrences[source_id]
+        occurrences[source_id] += 1
+        if occurrence:
+            doc.specific = {**(doc.specific or {}), "rwkv_source_document_id": source_id}
+            doc.id = f"{source_id}#{occurrence}"
+
+
 def _configure_task_evaluation_plan(pipeline, task, docs) -> list[Doc]:
     original_num_docs = len(task.eval_docs())
     max_samples = pipeline.pipeline_parameters.max_samples
@@ -141,6 +157,7 @@ def _configure_task_evaluation_plan(pipeline, task, docs) -> list[Doc]:
         task_max_samples = getattr(pipeline, "_task_max_samples", {}).get(task.full_name, max_samples)
         effective_num_docs, k, metric_name = min(original_num_docs, task_max_samples), 1, "avg@1"
     docs = docs[:effective_num_docs]
+    _make_document_ids_unique(docs)
     source_metric = task.metrics[0]
     source_name = source_metric.metric_name[0] if isinstance(source_metric.metric_name, (list, tuple)) else None
     corpus_level_fn = source_metric.corpus_level_fn[source_name] if source_name else source_metric.corpus_level_fn
@@ -166,7 +183,7 @@ def _configure_task_evaluation_plan(pipeline, task, docs) -> list[Doc]:
 
 
 class RWKVPipeline(Pipeline):
-    """Run each native LightEval task as soon as its dataset is ready."""
+    """Run native LightEval selectors in shortest-remaining-rollout order."""
 
     _DATASET_LOADERS = 8
 
@@ -217,7 +234,6 @@ class RWKVPipeline(Pipeline):
         self.sampling_docs = defaultdict(list)
         self.task_callback = None
         self._datasets_loaded = 0
-        self._all_datasets_ready_at = None
         if self._metric_options:
             self._update_num_samples(list(self.tasks_dict.values()))
 
@@ -351,18 +367,12 @@ class RWKVPipeline(Pipeline):
                     self._score_task(task_name, sampling_docs, outputs)
                 except BaseException as error:
                     scoring_error = error
-            future.get_loop().call_soon_threadsafe(self._resolve_score, future, scoring_error)
+            self._resolve_score_threadsafe(future, scoring_error)
         evaluation_thread.join()
         typer.echo(
             "RWKV pool peak in-flight: "
             f"observed={self.model.pool.peak_inflight} "
             f"capacity={tuple(replica.max_concurrency for replica in self.model.pool.manifest.replicas)}"
-        )
-        typer.echo(
-            "RWKV task-ready evidence: "
-            "first_http_before_all_datasets="
-            f"{self.model.pool.first_request_at is not None and (self._all_datasets_ready_at is None or self.model.pool.first_request_at < self._all_datasets_ready_at)} "
-            f"datasets={self._datasets_loaded}/{len(self._task_names)}"
         )
         if scoring_error is not None:
             raise scoring_error
@@ -384,63 +394,118 @@ class RWKVPipeline(Pipeline):
                 )
 
     async def _evaluate_tasks(self, score_task) -> None:  # noqa: C901
-        task_concurrency = self._task_concurrency()
-        task_queue = asyncio.Queue()
-        prepared_queue = asyncio.Queue(maxsize=min(self._DATASET_LOADERS, task_concurrency))
-        for task_name in self._task_names:
-            task_queue.put_nowait(task_name)
+        load_semaphore = asyncio.Semaphore(min(self._DATASET_LOADERS, len(self._task_names)))
 
-        async def load_datasets() -> None:
-            while not task_queue.empty():
-                try:
-                    task_name = task_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    return
+        async def prepare_task(task_name):
+            async with load_semaphore:
                 task = self.tasks_dict[task_name]
                 dataset = await asyncio.to_thread(_download_dataset, task)
                 self._datasets_loaded += 1
                 logger.info("RWKV dataset ready: task=%s", task_name)
                 if self._datasets_loaded == len(self._task_names):
-                    self._all_datasets_ready_at = time.monotonic()
                     typer.echo(f"RWKV datasets ready: {self._datasets_loaded}/{len(self._task_names)}")
-                await prepared_queue.put((task_name, dataset))
+            task.dataset = dataset
+            docs = self._prepare_task_documents(task)
+            docs = _configure_task_evaluation_plan(self, task, docs)
+            self._index_task_documents(task, docs)
+            return task_name, docs, self.model.pending_rollouts(docs)
 
-        async def evaluate_tasks() -> None:
-            while True:
-                prepared = await prepared_queue.get()
-                if prepared is None:
-                    return
-                task_name, dataset = prepared
-                task = self.tasks_dict[task_name]
-                task.dataset = dataset
-                docs = self._prepare_task_documents(task)
-                docs = _configure_task_evaluation_plan(self, task, docs)
-                self._index_task_documents(task, docs)
-                sampling_docs = defaultdict(list)
-                for doc in docs:
-                    for sampling_method in doc.sampling_methods:
-                        sampling_docs[sampling_method].append(doc)
-                rollouts = sum(doc.num_samples for doc in docs)
-                logger.info(
-                    "RWKV task model call started: task=%s documents=%d rollouts=%d", task_name, len(docs), rollouts
-                )
-                outputs = {SamplingMethod.GENERATIVE: await self.model.greedy_until(docs)}
-                await score_task(task_name, sampling_docs, outputs)
+        async def evaluate_task(task_name, docs, pending_rollouts) -> None:
+            sampling_docs = defaultdict(list)
+            for doc in docs:
+                for sampling_method in doc.sampling_methods:
+                    sampling_docs[sampling_method].append(doc)
+            logger.info(
+                "RWKV task model call started: task=%s documents=%d pending_rollouts=%d",
+                task_name,
+                len(docs),
+                pending_rollouts,
+            )
+            outputs = {SamplingMethod.GENERATIVE: await self.model.greedy_until(docs)}
+            await score_task(task_name, sampling_docs, outputs)
 
-        loaders = [
-            asyncio.create_task(load_datasets()) for _ in range(min(self._DATASET_LOADERS, len(self._task_names)))
+        selector_order = sorted(self._selector_tasks, key=lambda selector: len(self._selector_tasks[selector]))
+        ordered_task_names = [
+            task_names[index]
+            for index in range(max(map(len, self._selector_tasks.values())))
+            for selector in selector_order
+            if index < len(task_names := self._selector_tasks[selector])
         ]
-        consumers = [asyncio.create_task(evaluate_tasks()) for _ in range(task_concurrency)]
-
-        async def finish_loading() -> None:
-            await asyncio.gather(*loaders)
-            for _ in consumers:
-                await prepared_queue.put(None)
-
-        coordinator = asyncio.create_task(finish_loading())
-        running = [coordinator, *loaders, *consumers]
+        preparation_tasks = {
+            asyncio.create_task(prepare_task(task_name)): self._task_selectors[task_name]
+            for task_name in ordered_task_names
+        }
+        running = list(preparation_tasks)
         try:
-            await asyncio.gather(coordinator, *consumers)
+            prepared_by_selector = defaultdict(list)
+            selector_rollouts = {}
+            ready_selectors = {}
+            active_selectors: dict[asyncio.Task, str] = {}
+            evaluation_started = False
+            initial_ready_target = min(self._DATASET_LOADERS, max(1, len(self._selector_tasks) - 1))
+
+            async def evaluate_selector(selector, queued: asyncio.Event) -> None:
+                task_calls = []
+                for task_name, docs, pending_rollouts in sorted(
+                    prepared_by_selector[selector], key=lambda item: item[2]
+                ):
+                    task_call = asyncio.create_task(evaluate_task(task_name, docs, pending_rollouts))
+                    task_calls.append(task_call)
+                    running.append(task_call)
+                    await asyncio.sleep(0)
+                queued.set()
+                await asyncio.gather(*task_calls)
+
+            async def admit_selector(selector) -> None:
+                nonlocal evaluation_started
+                if not evaluation_started:
+                    typer.echo(f"RWKV evaluation started: selector={selector}")
+                    evaluation_started = True
+                logger.info(
+                    "RWKV selector admitted: selector=%s pending_rollouts=%d",
+                    selector,
+                    selector_rollouts[selector],
+                )
+                queued = asyncio.Event()
+                selector_task = asyncio.create_task(evaluate_selector(selector, queued))
+                active_selectors[selector_task] = selector
+                running.append(selector_task)
+                await queued.wait()
+
+            while preparation_tasks or ready_selectors or active_selectors:
+                while ready_selectors and (
+                    evaluation_started or len(ready_selectors) >= initial_ready_target or not preparation_tasks
+                ):
+                    selector = _selector_priority(
+                        {selector: selector_rollouts[selector] for selector in ready_selectors}
+                    )[0]
+                    positive_active = sum(
+                        selector_rollouts[active_selector] > 0 for active_selector in active_selectors.values()
+                    )
+                    if selector_rollouts[selector] > 0 and positive_active >= 2:
+                        break
+                    del ready_selectors[selector]
+                    await admit_selector(selector)
+
+                done, _ = await asyncio.wait(
+                    (*preparation_tasks, *active_selectors),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in done:
+                    if task in active_selectors:
+                        del active_selectors[task]
+                        await task
+                        continue
+                    selector = preparation_tasks.pop(task)
+                    prepared_by_selector[selector].append(await task)
+                    if len(prepared_by_selector[selector]) == len(self._selector_tasks[selector]):
+                        selector_rollouts[selector] = sum(item[2] for item in prepared_by_selector[selector])
+                        ready_selectors[selector] = None
+                        logger.info(
+                            "RWKV selector ready: selector=%s pending_rollouts=%d",
+                            selector,
+                            selector_rollouts[selector],
+                        )
             self.evaluation_tracker.task_config_logger.log(self.tasks_dict)
         except BaseException:
             for task in running:
@@ -449,14 +514,6 @@ class RWKVPipeline(Pipeline):
             raise
         finally:
             await self.model.acleanup()
-
-    def _task_concurrency(self) -> int:
-        if self.pipeline_parameters.max_samples is None:
-            return 1
-        return min(
-            len(self._task_names),
-            math.ceil(self.model.pool.http_worker_limit / self.pipeline_parameters.max_samples),
-        )
 
     @staticmethod
     async def _submit_score(scoring_queue, task_name, sampling_docs, outputs) -> None:
@@ -472,6 +529,12 @@ class RWKVPipeline(Pipeline):
             future.set_result(None)
         else:
             future.set_exception(error)
+
+    @classmethod
+    def _resolve_score_threadsafe(cls, future, error) -> None:
+        loop = future.get_loop()
+        if not loop.is_closed():
+            loop.call_soon_threadsafe(cls._resolve_score, future, error)
 
     def _score_task(self, task_name, sampling_docs, outputs) -> None:
         self.sampling_docs = sampling_docs

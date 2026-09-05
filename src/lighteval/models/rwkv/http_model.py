@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -13,11 +14,13 @@ from lighteval.tasks.prompt_manager import PromptManager
 from lighteval.tasks.requests import Doc, SamplingMethod
 from lighteval.utils.cache_management import SampleCache
 
-from .http_pool import Completion, PoolError, PoolManifest, RWKVHttpPool
+from .http_pool import Completion, ContextLengthError, PoolError, PoolManifest, RWKVHttpPool
 
 
+logger = logging.getLogger(__name__)
 MAX_NEW_TOKENS = 8192
 REQUEST_CONTRACT_VERSION = "rwkv-generation-v2"
+CACHE_POOL_FINGERPRINT = "transport-independent"
 PROMPT_TEMPLATES: dict[str, tuple[str, str]] = {
     "bot": ("\nBot✿", "✿"),
     "assistant": ("\n\nAssistant: ", "\nUser:"),
@@ -112,7 +115,8 @@ class RWKVHttpModel(LightevalModel):
                 frequency_penalty=generation_parameters.get("frequency_penalty"),
             ),
         )
-        self._cache = SampleCache(self.config)
+        cache_config = self.config.model_copy(update={"pool_fingerprint": CACHE_POOL_FINGERPRINT})
+        self._cache = SampleCache(cache_config)
         self.prompt_manager = PromptManager(use_chat_template=True, tokenizer=None)
         self._prompt_template = prompt_template
         self._assistant_prefix, self._template_stop = PROMPT_TEMPLATES[prompt_template]
@@ -148,6 +152,13 @@ class RWKVHttpModel(LightevalModel):
         if any(result is None for result in results):
             raise ValueError("Problem while loading and aggregating items from cache.")
         return results
+
+    def pending_rollouts(self, docs: list[Doc]) -> int:
+        """Return the uncached rollout count used by the benchmark scheduler."""
+        if self._cache is None:
+            return sum(doc.num_samples for doc in docs)
+        pending, _ = self._cache.get_samples_to_process_and_cache(docs, SamplingMethod.GENERATIVE)
+        return sum(doc.num_samples for doc in pending)
 
     async def _generate(self, docs: list[Doc]) -> list[ModelResponse]:  # noqa: C901
         jobs: list[_Job] = []
@@ -188,6 +199,25 @@ class RWKVHttpModel(LightevalModel):
             async def execute(job: _Job) -> Completion:
                 try:
                     return await self.pool.complete(job.messages, job.parameters)
+                except ContextLengthError as error:
+                    task_name = docs[job.document_index].task_name
+                    logger.warning(
+                        "RWKV context limit reached: task=%s document=%d rollout=%d error=%s",
+                        task_name,
+                        job.document_index,
+                        job.sample_index,
+                        error,
+                    )
+                    return Completion(
+                        text="",
+                        reasoning=None,
+                        finish_reason="length",
+                        stop_reason="context_length",
+                        terminal_token_id=None,
+                        prompt_text=job.messages[-1]["content"],
+                        prompt_token_ids=(),
+                        output_token_ids=(),
+                    )
                 except PoolError as error:
                     task_name = docs[job.document_index].task_name
                     raise PoolError(

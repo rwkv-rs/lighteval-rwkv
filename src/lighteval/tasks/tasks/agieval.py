@@ -45,6 +45,8 @@ def record_to_sample(record):
 
 
 def agieval_prompt(line, task_name: str = None):
+    if any(not 0 <= index < len(line["choices"]) for index in line["gold"]):
+        return None
     return Doc(
         task_name=task_name,
         query=line["query"],

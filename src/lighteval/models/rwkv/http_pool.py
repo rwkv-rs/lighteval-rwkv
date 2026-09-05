@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -20,10 +21,15 @@ import httpx
 RETRYABLE_STATUS_CODES = frozenset({408, 429, 500, 502, 503, 504})
 RETRY_DELAYS = (1.0, 2.0, 4.0)
 logger = logging.getLogger(__name__)
+_CONTEXT_LENGTH_ERROR = re.compile(r"prompt contains at least (\d+) input tokens")
 
 
 class PoolError(RuntimeError):
     """Raised when a configured RWKV endpoint pool cannot be used safely."""
+
+
+class ContextLengthError(PoolError):
+    """Raised when a completion cannot fit after reducing its output limit."""
 
 
 @dataclass(frozen=True)
@@ -49,7 +55,10 @@ class PoolManifest:
     model_revision: str
     wkv_mode: str
     vllm_version: str
+    torch_version: str
+    gpu: str
     max_model_len: int
+    max_num_batched_tokens: int
     replicas: tuple[Replica, ...]
 
     @classmethod
@@ -71,7 +80,10 @@ class PoolManifest:
             "model_revision",
             "wkv_mode",
             "vllm_version",
+            "torch_version",
+            "gpu",
             "max_model_len",
+            "max_num_batched_tokens",
             "replicas",
         }
         unknown = sorted(set(raw) - allowed)
@@ -90,7 +102,10 @@ class PoolManifest:
         if wkv_mode not in {"fp16", "fp32io16"}:
             raise PoolError("RWKV pool manifest wkv_mode must be fp16 or fp32io16")
         vllm_version = cls._nonempty_string(raw["vllm_version"], "vllm_version")
+        torch_version = cls._nonempty_string(raw["torch_version"], "torch_version")
+        gpu = cls._nonempty_string(raw["gpu"], "gpu")
         max_model_len = cls._positive_int(raw["max_model_len"], "max_model_len")
+        max_num_batched_tokens = cls._positive_int(raw["max_num_batched_tokens"], "max_num_batched_tokens")
 
         configured_replicas = raw["replicas"]
         if not isinstance(configured_replicas, list) or not configured_replicas:
@@ -107,7 +122,10 @@ class PoolManifest:
             model_revision=model_revision,
             wkv_mode=wkv_mode,
             vllm_version=vllm_version,
+            torch_version=torch_version,
+            gpu=gpu,
             max_model_len=max_model_len,
+            max_num_batched_tokens=max_num_batched_tokens,
             replicas=replicas,
         )
 
@@ -320,7 +338,9 @@ class RWKVHttpPool:
             for replica in self.manifest.replicas
         )
 
-    async def complete(self, messages: list[dict[str, str]], parameters: Mapping[str, object]) -> Completion:
+    async def complete(  # noqa: C901
+        self, messages: list[dict[str, str]], parameters: Mapping[str, object]
+    ) -> Completion:
         if self._model_id is None:
             raise PoolError("RWKV pool must pass preflight before evaluation")
         if not isinstance(messages, list):
@@ -332,6 +352,7 @@ class RWKVHttpPool:
 
         attempted: set[int] = set()
         failures: list[str] = []
+        context_failure: str | None = None
         total_attempts = len(self._clients) + len(RETRY_DELAYS)
         for attempt in range(total_attempts):
             if len(attempted) == len(self._clients):
@@ -342,6 +363,13 @@ class RWKVHttpPool:
                     return await self._complete_on(index, messages, parameters)
                 except httpx.HTTPStatusError as error:
                     status = error.response.status_code
+                    adjusted = self._context_limited_parameters(error, parameters)
+                    if adjusted is not None:
+                        context_failure = error.response.text[:500]
+                        parameters = adjusted
+                        continue
+                    if self._context_error_message(error) is not None:
+                        raise ContextLengthError(error.response.text[:500]) from error
                     if status not in RETRYABLE_STATUS_CODES:
                         detail = error.response.text[:500]
                         raise PoolError(f"RWKV endpoint rejected completion with HTTP {status}: {detail}") from error
@@ -350,7 +378,40 @@ class RWKVHttpPool:
                     failures.append(f"{self.manifest.replicas[index].base_url}: {type(error).__name__}: {error}")
             if attempt < total_attempts - 1:
                 await asyncio.sleep(RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)])
+        if context_failure is not None and not failures:
+            raise ContextLengthError(context_failure)
         raise PoolError("RWKV completion failed: " + "; ".join(failures))
+
+    @staticmethod
+    def _context_error_message(error: httpx.HTTPStatusError) -> str | None:
+        if error.response.status_code != 400:
+            return None
+        try:
+            message = error.response.json()["error"]["message"]
+        except (KeyError, TypeError, ValueError):
+            return None
+        return message if isinstance(message, str) and _CONTEXT_LENGTH_ERROR.search(message) else None
+
+    def _context_limited_parameters(
+        self, error: httpx.HTTPStatusError, parameters: Mapping[str, object]
+    ) -> dict[str, object] | None:
+        message = self._context_error_message(error)
+        match = _CONTEXT_LENGTH_ERROR.search(message) if message is not None else None
+        requested = parameters.get("max_completion_tokens")
+        if match is None or isinstance(requested, bool) or not isinstance(requested, int):
+            return None
+        available = self.manifest.max_model_len - int(match.group(1))
+        if available <= 0 or available >= requested:
+            return None
+        adjusted = dict(parameters)
+        adjusted["max_completion_tokens"] = available
+        logger.info(
+            "RWKV completion limited by context: prompt_tokens=%s requested=%s effective=%s",
+            match.group(1),
+            requested,
+            available,
+        )
+        return adjusted
 
     async def _complete_on(  # noqa: C901
         self,

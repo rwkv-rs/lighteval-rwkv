@@ -17,8 +17,12 @@ from lighteval.tasks.requests import Doc, SamplingMethod
 
 
 def _streaming_pipeline(task_names, model, download, *, max_samples):
+    if not hasattr(model, "pending_rollouts"):
+        model.pending_rollouts = lambda docs: sum(doc.num_samples for doc in docs)
     pipeline = rwkv_pipeline.RWKVPipeline.__new__(rwkv_pipeline.RWKVPipeline)
     pipeline._task_names = tuple(task_names)
+    pipeline._selector_tasks = {task_name: (task_name,) for task_name in task_names}
+    pipeline._task_selectors = {task_name: task_name for task_name in task_names}
     pipeline.tasks_dict = {
         task_name: SimpleNamespace(
             full_name=task_name,
@@ -33,7 +37,6 @@ def _streaming_pipeline(task_names, model, download, *, max_samples):
     pipeline.documents_dict = {}
     pipeline.sampling_docs = defaultdict(list)
     pipeline._datasets_loaded = 0
-    pipeline._all_datasets_ready_at = None
     pipeline.pipeline_parameters = SimpleNamespace(max_samples=max_samples)
     pipeline.model = model
     pipeline.evaluation_tracker = SimpleNamespace(
@@ -120,10 +123,9 @@ async def _evaluate_streaming_pipeline(pipeline):
     await pipeline._evaluate_tasks(score)
 
 
-def test_rwkv_pipeline_starts_fast_task_before_slow_dataset_finishes(monkeypatch):
+def test_rwkv_pipeline_starts_ready_selector_before_all_datasets_finish(monkeypatch):
     slow_release = threading.Event()
     slow_finished = threading.Event()
-    model_called = threading.Event()
     calls = []
 
     def download(task_name):
@@ -135,38 +137,152 @@ def test_rwkv_pipeline_starts_fast_task_before_slow_dataset_finishes(monkeypatch
     class Model:
         pool = SimpleNamespace(http_worker_limit=20)
 
+        def pending_rollouts(self, docs):
+            return sum(doc.num_samples for doc in docs)
+
         async def greedy_until(self, docs):
             calls.append(docs[0].task_name)
-            model_called.set()
             return []
 
         async def acleanup(self):
             pass
 
     pipeline = _streaming_pipeline(("fast|0", "slow|0"), Model(), download, max_samples=10)
+    pipeline._selector_tasks = {"small": ("slow|0",), "large": ("fast|0",)}
+    pipeline._task_selectors = {"slow|0": "small", "fast|0": "large"}
+    pipeline._prepare_task_documents = lambda task: [
+        SimpleNamespace(
+            task_name=task.full_name,
+            num_samples=1 if task.full_name == "slow|0" else 30,
+            sampling_methods=[SamplingMethod.GENERATIVE],
+        )
+    ]
     pipeline._score_task = lambda *_args: None
     monkeypatch.setattr(rwkv_pipeline, "_configure_task_evaluation_plan", lambda _pipeline, _task, docs: docs)
 
     async def run():
         evaluation = asyncio.create_task(_evaluate_streaming_pipeline(pipeline))
         try:
-            assert await asyncio.to_thread(model_called.wait, 1)
-            assert calls[0] == "fast|0"
+            for _ in range(20):
+                if calls:
+                    break
+                await asyncio.sleep(0.01)
+            assert calls == ["fast|0"]
             assert not slow_finished.is_set()
         finally:
             slow_release.set()
+        await evaluation
+        assert calls == ["fast|0", "slow|0"]
+
+    asyncio.run(run())
+
+
+def test_cached_selector_does_not_consume_a_rollout_slot(monkeypatch):
+    release = asyncio.Event()
+    calls = []
+
+    class Model:
+        pool = SimpleNamespace(http_worker_limit=20)
+
+        def pending_rollouts(self, docs):
+            return {"cached|0": 0, "small|0": 10, "spare|0": 20}[docs[0].task_name]
+
+        async def greedy_until(self, docs):
+            calls.append(docs[0].task_name)
+            await release.wait()
+            return []
+
+        async def acleanup(self):
+            pass
+
+    pipeline = _streaming_pipeline(
+        ("cached|0", "small|0", "spare|0"),
+        Model(),
+        lambda task_name: task_name,
+        max_samples=10,
+    )
+    pipeline._score_task = lambda *_args: None
+    monkeypatch.setattr(rwkv_pipeline, "_configure_task_evaluation_plan", lambda _pipeline, _task, docs: docs)
+
+    async def run():
+        evaluation = asyncio.create_task(_evaluate_streaming_pipeline(pipeline))
+        for _ in range(20):
+            if len(calls) == 3:
+                break
+            await asyncio.sleep(0.01)
+        assert calls == ["cached|0", "small|0", "spare|0"]
+        release.set()
         await evaluation
 
     asyncio.run(run())
 
 
-def test_rwkv_pipeline_task_concurrency_matches_run_mode():
-    model = SimpleNamespace(pool=SimpleNamespace(http_worker_limit=25))
-    pipeline = _streaming_pipeline(("a|0", "b|0", "c|0"), model, lambda task_name: task_name, max_samples=None)
+def test_cached_selector_bypasses_full_rollout_slots(monkeypatch):
+    cached_dataset_ready = threading.Event()
+    release = asyncio.Event()
+    rollout_slots_full = asyncio.Event()
+    cached_started = asyncio.Event()
+    calls = []
 
-    assert pipeline._task_concurrency() == 1
-    pipeline.pipeline_parameters.max_samples = 10
-    assert pipeline._task_concurrency() == 3
+    def download(task_name):
+        if task_name == "cached|0":
+            cached_dataset_ready.wait(2)
+        return task_name
+
+    class Model:
+        pool = SimpleNamespace(http_worker_limit=20)
+
+        def pending_rollouts(self, docs):
+            return 0 if docs[0].task_name == "cached|0" else 10
+
+        async def greedy_until(self, docs):
+            calls.append(docs[0].task_name)
+            if len(calls) == 2:
+                rollout_slots_full.set()
+            if docs[0].task_name == "cached|0":
+                cached_started.set()
+            await release.wait()
+            return []
+
+        async def acleanup(self):
+            pass
+
+    pipeline = _streaming_pipeline(("cached|0", "first|0", "second|0"), Model(), download, max_samples=10)
+    pipeline._score_task = lambda *_args: None
+    monkeypatch.setattr(rwkv_pipeline, "_configure_task_evaluation_plan", lambda _pipeline, _task, docs: docs)
+
+    async def run():
+        evaluation = asyncio.create_task(_evaluate_streaming_pipeline(pipeline))
+        await asyncio.wait_for(rollout_slots_full.wait(), 1)
+        assert calls == ["first|0", "second|0"]
+        cached_dataset_ready.set()
+        await asyncio.wait_for(cached_started.wait(), 1)
+        assert calls == ["first|0", "second|0", "cached|0"]
+        release.set()
+        await evaluation
+
+    asyncio.run(run())
+
+
+def test_selector_priority_uses_shortest_remaining_benchmark_first():
+    assert rwkv_pipeline._selector_priority({"large": 9, "small": 5, "spare": 7}) == (
+        "small",
+        "spare",
+        "large",
+    )
+
+
+def test_duplicate_source_document_ids_are_disambiguated_for_cache():
+    docs = [
+        Doc(query="first", choices=["answer"], gold_index=0, id="939"),
+        Doc(query="second", choices=["answer"], gold_index=0, id="939", specific={"split": "test"}),
+    ]
+
+    rwkv_pipeline._make_document_ids_unique(docs)
+
+    assert [doc.id for doc in docs] == ["939", "939#1"]
+    assert docs[0].specific is None
+    assert docs[1].specific == {"split": "test", "rwkv_source_document_id": "939"}
 
 
 def test_rwkv_pipeline_runs_scorer_on_process_main_thread():
@@ -179,7 +295,6 @@ def test_rwkv_pipeline_runs_scorer_on_process_main_thread():
             manifest=SimpleNamespace(replicas=(SimpleNamespace(max_concurrency=4),)),
         )
     )
-    pipeline._all_datasets_ready_at = 2.0
     pipeline._datasets_loaded = 1
     pipeline._task_names = ("task|0",)
     pipeline.evaluation_tracker = SimpleNamespace(

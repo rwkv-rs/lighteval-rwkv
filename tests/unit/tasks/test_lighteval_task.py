@@ -26,6 +26,7 @@ from datasets import Dataset, DatasetDict
 import lighteval.tasks.lighteval_task as lighteval_task_module
 from lighteval.tasks.lighteval_task import LightevalTask, LightevalTaskConfig
 from lighteval.tasks.requests import Doc
+from lighteval.tasks.tasks.agieval import agieval_prompt
 
 
 def dummy_prompt_function(item, task_name):
@@ -95,6 +96,10 @@ def test_dataset_filter(monkeypatch):
     assert task.dataset["train"].num_rows == 1
     assert len(filtered_docs) == 1
     assert filtered_docs[0].query == "hi"
+
+
+def test_agieval_prompt_filters_out_of_range_gold_index():
+    assert agieval_prompt({"query": "question", "choices": ["A", "B", "C"], "gold": [3]}) is None
 
 
 def test_hf_data_files(tmp_path):
