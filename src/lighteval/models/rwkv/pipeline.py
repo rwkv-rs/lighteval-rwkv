@@ -111,7 +111,7 @@ class RWKVAvgAtK(SampleLevelComputation):
         specific["rwkv_rollout_extracted_answers"] = extracted_answers
         specific["rwkv_model_answers"] = extracted_answers
         if self.k == 1:
-            specific["rwkv_model_answer"] = extracted_answers[0]
+            specific["rwkv_model_answer"] = extracted_answers[0] if extracted_answers else ""
         doc.specific = specific
         return sum(scores) / self.k
 
