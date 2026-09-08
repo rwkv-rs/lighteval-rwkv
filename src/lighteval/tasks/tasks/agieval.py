@@ -18,7 +18,7 @@ languages:
 english, chinese
 
 tags:
-biology, chemistry, geography, history, knowledge, language, multiple-choice, physics, reasoning, field:knowledge
+biology, chemistry, geography, history, knowledge, language, multiple-choice, physics, reasoning
 
 paper:
 https://arxiv.org/abs/2304.06364

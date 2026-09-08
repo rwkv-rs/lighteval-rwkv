@@ -12,7 +12,7 @@ languages:
 english
 
 tags:
-health, medical, field:medical
+health, medical
 
 paper:
 https://medmcqa.github.io/

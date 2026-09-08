@@ -16,7 +16,7 @@ languages:
 english
 
 tags:
-multiple-choice, field:science
+multiple-choice
 
 paper:
 https://arxiv.org/abs/1803.05457

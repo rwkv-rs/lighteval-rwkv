@@ -10,7 +10,7 @@ abstract:
 languages:
 
 tags:
-reasoning, field:reasoning
+reasoning
 
 paper:
 """

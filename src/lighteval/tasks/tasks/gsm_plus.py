@@ -14,7 +14,7 @@ languages:
 english
 
 tags:
-math, reasoning, field:math
+math, reasoning
 
 paper:
 https://arxiv.org/abs/2402.19255
@@ -84,9 +84,9 @@ gsm_plus = LightevalTaskConfig(
     few_shots_split=None,
     few_shots_select=None,
     generation_size=None,
-    metrics=[Metrics.math_verify],
+    metrics=[Metrics.expr_gold_metric],
     stop_sequence=None,
-    version=1,
+    version=0,
 )
 
 TASKS_TABLE = [

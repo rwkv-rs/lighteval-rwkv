@@ -10,10 +10,11 @@ import pytest
 import lighteval.main_rwkv as main_rwkv
 import lighteval.models.rwkv.pipeline as rwkv_pipeline
 from lighteval.metrics.metrics import Metrics
-from lighteval.metrics.metrics_sample import AvgAtN, ExactMatches, MajAtN, MathVerifyMatch, SampleLevelComputation
+from lighteval.metrics.metrics_sample import AvgAtN, ExactMatches, MajAtN, SampleLevelComputation
 from lighteval.metrics.utils.metric_utils import SampleLevelMetric
 from lighteval.models.model_output import ModelResponse
 from lighteval.tasks.requests import Doc, SamplingMethod
+from lighteval.tasks.rwkv_free_response import RWKVFreeResponseMatch
 from lighteval.tasks.tasks.ifbench.instructions import (
     EmojiSentenceChecker,
     NGramOverlapChecker,
@@ -516,9 +517,9 @@ def test_open_think_postprocessing_ignores_duplicate_closing_tag():
     assert response.final_text == ["final"]
 
 
-def test_rwkv_pipeline_always_converts_choices_after_task_prompt_override():
+def test_rwkv_pipeline_always_converts_choices():
     doc = Doc(
-        query="Upstream instruction: Question?",
+        query="Question?",
         instruction="Upstream instruction: ",
         choices=["one", "two"],
         gold_index=1,
@@ -533,15 +534,10 @@ def test_rwkv_pipeline_always_converts_choices_after_task_prompt_override():
     )
     pipeline = rwkv_pipeline.RWKVPipeline.__new__(rwkv_pipeline.RWKVPipeline)
     pipeline._task_max_samples = {}
-    pipeline.pipeline_parameters = SimpleNamespace(
-        max_samples=None,
-        task_prompt="Evaluation: ",
-        task_prompt_mode="replace",
-    )
+    pipeline.pipeline_parameters = SimpleNamespace(max_samples=None)
     pipeline.model = SimpleNamespace(config=SimpleNamespace(cot_mode="fake_think"))
 
     assert pipeline._prepare_task_documents(task) == [doc]
-    assert doc.instruction == "Evaluation: "
     assert doc.query.startswith("Question?")
     assert "A. one" in doc.query
     assert doc.sampling_methods == [SamplingMethod.GENERATIVE]
@@ -674,7 +670,7 @@ def test_rwkv_avg_at_k_averages_the_native_task_scorer():
 def test_rwkv_avg_at_k_delegates_answer_extraction_to_sampling_scorer():
     metric = SampleLevelMetric(
         metric_name="maj@n",
-        sample_level_fn=MajAtN(n=1, sample_scoring_function=MathVerifyMatch()),
+        sample_level_fn=MajAtN(n=1, sample_scoring_function=RWKVFreeResponseMatch()),
         category=SamplingMethod.GENERATIVE,
         corpus_level_fn=lambda values: sum(values) / len(values),
         higher_is_better=True,
@@ -690,7 +686,7 @@ def test_rwkv_avg_at_k_delegates_answer_extraction_to_sampling_scorer():
 def test_rwkv_math_rollouts_keep_the_prediction_used_for_each_score():
     metric = SampleLevelMetric(
         metric_name="accuracy",
-        sample_level_fn=MathVerifyMatch(),
+        sample_level_fn=RWKVFreeResponseMatch(),
         category=SamplingMethod.GENERATIVE,
         corpus_level_fn=lambda values: sum(values) / len(values),
         higher_is_better=True,

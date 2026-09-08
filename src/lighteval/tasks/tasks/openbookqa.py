@@ -16,7 +16,7 @@ languages:
 english
 
 tags:
-multiple-choice, qa, field:science
+multiple-choice, qa
 
 paper:
 https://arxiv.org/abs/1809.02789

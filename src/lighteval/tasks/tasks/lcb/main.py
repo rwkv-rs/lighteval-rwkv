@@ -15,7 +15,7 @@ languages:
 english
 
 tags:
-code-generation, field:coding
+code-generation
 
 paper:
 https://livecodebench.github.io/

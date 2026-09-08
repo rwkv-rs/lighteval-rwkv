@@ -13,7 +13,7 @@ languages:
 english
 
 tags:
-math, reasoning, field:math
+math, reasoning
 
 paper:
 https://arxiv.org/abs/2410.12853
@@ -52,7 +52,7 @@ asdiv = LightevalTaskConfig(
     few_shots_split=None,
     few_shots_select=None,
     generation_size=-1,
-    metrics=[Metrics.math_verify],
+    metrics=[Metrics.exact_match],
     stop_sequence=["\n"],
     version=1,
     sample_fields=record_to_sample,
