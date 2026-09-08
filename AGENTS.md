@@ -59,7 +59,8 @@ param_size: 参数规模, 仅有 0.1b, 0.4b, 1.5b(often used in RL), 2.9b, 7.2b(
 ## 中断续跑
 采用允许后台执行与自动重启的方式启动评估任务.
 需求变动或 bug 修复导致的评估重启, 优先在 /tmp 创建临时迁移脚本, 复用已有结果, 而非全量重跑.
-已完成的 rollout 立即落盘；异常时只丢正在执行的 rollout，续跑时补缺失部分。
+已完成的 rollout 立即落盘; 异常时只丢正在执行的 rollout, 续跑时补缺失部分.
+任务结束后需要清理, 避免留下用户服务等残留.
 
 ## 结果保存
 记录详细 (benchmark_name, model_name, n_samples, k_metrics, cot_mode, prompt_template), [_可选完成 wkv_mode fp32io16 vs fp16 对比] 对应的 (正确率, 截断率) , 其中截断率定义为达到输出上限未能完成作答的样本数 / 总样本数
