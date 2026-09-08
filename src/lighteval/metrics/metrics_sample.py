@@ -114,16 +114,23 @@ class MathVerifyMatch(SampleLevelComputation):
         parsed_predictions = [
             parsed for prediction in model_response.final_text for parsed in self._parsed_candidates(prediction)
         ]
+        if doc.specific is None:
+            doc.specific = {}
+        doc.specific["extracted_predictions"] = [str(parsed_predictions[0][0])] if parsed_predictions else []
         for gold in parsed_golds:
             for prediction in parsed_predictions:
                 try:
                     if gold and prediction and self._verify(gold, prediction):
+                        doc.specific["extracted_predictions"] = [str(prediction[0])]
                         return 1.0
                 except Exception:
                     continue
         return 0.0
 
     def extract_answer(self, doc: Doc, model_response: ModelResponse) -> str:
+        if "extracted_predictions" in (doc.specific or {}):
+            extracted = doc.specific["extracted_predictions"]
+            return str(extracted[0]) if extracted else ""
         parsed_candidates = self._parsed_candidates(model_response.final_text[0])
         parsed = parsed_candidates[0] if parsed_candidates else []
         return str(parsed[0]) if parsed else ""

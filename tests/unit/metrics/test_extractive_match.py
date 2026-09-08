@@ -83,6 +83,12 @@ def compare_strings(
     [
         ("-371", "230 − 601 = −371\n\nThis means that 601 is 371 more than 230.", "-371"),
         (r"\frac{1}{2}", r"Thus $\boxed{\frac{1}{2}}$.", "1/2"),
+        ("19", r"The area condition gives the result $\boxed{19}$.", "19"),
+        ("19", "The final answer is 19 cm^2.", "19"),
+        ("19", "Final answer: 019", "19"),
+        ("19", "x = 20\n\nThe value is 19", "19"),
+        ("0", "Final answer: 000", "0"),
+        ("999", "Final answer: 999", "999"),
     ],
 )
 def test_math_verify_match_extracts_and_scores_final_answer(gold, prediction, extracted):

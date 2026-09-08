@@ -34,9 +34,9 @@ from lighteval.tasks.rwkv_answer_extractor import (
 from lighteval.tasks.rwkv_prompt import TaskPromptMode, apply_task_prompt_override
 
 
-_MIN_COMPLETIONS = 5000
-_LARGE_BENCHMARK_SIZE = 50_000
-_LARGE_BENCHMARK_FRACTION = 0.2
+_TARGET_COMPLETIONS = 4096
+_MIN_COMPLETIONS = 3000
+_MAX_COMPLETIONS = 6000
 logger = logging.getLogger(__name__)
 
 
@@ -109,6 +109,9 @@ class RWKVAvgAtK(SampleLevelComputation):
         specific = dict(doc.specific or {})
         specific["rwkv_rollout_scores"] = scores
         specific["rwkv_rollout_extracted_answers"] = extracted_answers
+        specific["rwkv_model_answers"] = extracted_answers
+        if self.k == 1:
+            specific["rwkv_model_answer"] = extracted_answers[0]
         doc.specific = specific
         return sum(scores) / self.k
 
@@ -132,20 +135,37 @@ class RWKVAvgAtK(SampleLevelComputation):
         if scorer_owner := getattr(getattr(scorer, "compute_score", None), "__self__", None):
             if extractor := getattr(scorer_owner, "extract_answer", None):
                 return extractor(doc, model_response)
+        # Native extractive scorers record their canonical prediction in the
+        # document during scoring (for example, MultilingualExtractiveMatchMetric).
+        # Reuse that producer-owned value instead of leaking the full reasoning
+        # response into the details artifact.
+        if extracted := (doc.specific or {}).get("extracted_predictions"):
+            return str(extracted[0])
         return model_response.final_text[0] if model_response.final_text else ""
 
 
 def _evaluation_plan(num_docs: int) -> tuple[int, int, str]:
     """Return evaluated documents, completions per document, and the only metric name."""
-    if num_docs > _LARGE_BENCHMARK_SIZE:
-        return int(num_docs * _LARGE_BENCHMARK_FRACTION), 1, "avg@0.2"
+    if num_docs == 0:
+        return 0, 1, "avg@1"
+    # Pick the power-of-two rollout count whose total is in the agreed
+    # 3000--6000 window and closest to the 4096 target.  This deliberately
+    # allows the lower side of 4096 (e.g. AIME: 30*128=3840) so that we do
+    # not jump to an 8192-sized workload.
+    candidates = []
     k = 1
-    while k * num_docs <= _MIN_COMPLETIONS:
+    while k * num_docs <= _MAX_COMPLETIONS:
+        if k * num_docs >= _MIN_COMPLETIONS:
+            candidates.append(k)
         k *= 2
+    if candidates:
+        k = min(candidates, key=lambda candidate: (abs(candidate * num_docs - _TARGET_COMPLETIONS), candidate))
     return num_docs, k, f"avg@{k}"
 
 
-def _selector_priority(selector_rollouts: Mapping[str, int], configured_order: tuple[str, ...] = ()) -> tuple[str, ...]:
+def _selector_priority(
+    selector_rollouts: Mapping[str, int], configured_order: tuple[str, ...] = ()
+) -> tuple[str, ...]:
     """Order benchmarks by their remaining rollout count."""
     order = {selector: index for index, selector in enumerate(configured_order)}
     return tuple(sorted(selector_rollouts, key=lambda selector: (selector_rollouts[selector], order.get(selector, 0))))
@@ -410,6 +430,8 @@ class RWKVPipeline(Pipeline):
 
     async def _evaluate_tasks(self, score_task) -> None:  # noqa: C901
         load_semaphore = asyncio.Semaphore(min(self._DATASET_LOADERS, len(self._task_names)))
+        scoring_tasks: set[asyncio.Task] = set()
+        scoring_failures: list[BaseException] = []
 
         async def prepare_task(task_name):
             async with load_semaphore:
@@ -437,7 +459,23 @@ class RWKVPipeline(Pipeline):
                 pending_rollouts,
             )
             outputs = {SamplingMethod.GENERATIVE: await self.model.greedy_until(docs)}
-            await score_task(task_name, sampling_docs, outputs)
+            scoring_task = asyncio.create_task(score_task(task_name, sampling_docs, outputs))
+            scoring_tasks.add(scoring_task)
+            running.append(scoring_task)
+
+            def on_scoring_done(completed: asyncio.Task) -> None:
+                scoring_tasks.discard(completed)
+                if completed.cancelled():
+                    return
+                error = completed.exception()
+                if error is None:
+                    return
+                scoring_failures.append(error)
+                for running_task in running:
+                    if running_task is not completed and not running_task.done():
+                        running_task.cancel()
+
+            scoring_task.add_done_callback(on_scoring_done)
 
         selector_order = sorted(self._selector_tasks, key=lambda selector: len(self._selector_tasks[selector]))
         ordered_task_names = [
@@ -507,8 +545,7 @@ class RWKVPipeline(Pipeline):
                     return_when=asyncio.FIRST_COMPLETED,
                 )
                 preparation_order = {
-                    task: selector_order.index(selector)
-                    for task, selector in preparation_tasks.items()
+                    task: selector_order.index(selector) for task, selector in preparation_tasks.items()
                 }
                 for task in sorted(done, key=lambda completed: preparation_order.get(completed, len(selector_order))):
                     if task in active_selectors:
@@ -525,11 +562,17 @@ class RWKVPipeline(Pipeline):
                             selector,
                             selector_rollouts[selector],
                         )
+            if scoring_tasks:
+                await asyncio.gather(*tuple(scoring_tasks))
+            if scoring_failures:
+                raise scoring_failures[0]
             self.evaluation_tracker.task_config_logger.log(self.tasks_dict)
         except BaseException:
             for task in running:
                 task.cancel()
             await asyncio.gather(*running, return_exceptions=True)
+            if scoring_failures:
+                raise scoring_failures[0]
             raise
         finally:
             await self.model.acleanup()

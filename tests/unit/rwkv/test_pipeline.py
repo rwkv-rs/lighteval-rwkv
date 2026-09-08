@@ -10,11 +10,15 @@ import pytest
 import lighteval.main_rwkv as main_rwkv
 import lighteval.models.rwkv.pipeline as rwkv_pipeline
 from lighteval.metrics.metrics import Metrics
-from lighteval.metrics.metrics_sample import AvgAtN, ExactMatches, MajAtN, MathVerifyMatch
+from lighteval.metrics.metrics_sample import AvgAtN, ExactMatches, MajAtN, MathVerifyMatch, SampleLevelComputation
 from lighteval.metrics.utils.metric_utils import SampleLevelMetric
 from lighteval.models.model_output import ModelResponse
 from lighteval.tasks.requests import Doc, SamplingMethod
-from lighteval.tasks.tasks.ifbench.instructions import EmojiSentenceChecker, NGramOverlapChecker
+from lighteval.tasks.tasks.ifbench.instructions import (
+    EmojiSentenceChecker,
+    NGramOverlapChecker,
+    ParagraphLastFirstWordMatchChecker,
+)
 
 
 def _streaming_pipeline(task_names, model, download, *, max_samples):
@@ -274,6 +278,41 @@ def test_selector_priority_uses_shortest_remaining_benchmark_first():
     )
 
 
+def test_pending_scoring_releases_generation_slots_without_finishing_evaluation(monkeypatch):
+    calls = []
+
+    class Model:
+        async def greedy_until(self, docs):
+            calls.append(docs[0].task_name)
+            return []
+
+        async def acleanup(self):
+            pass
+
+    pipeline = _streaming_pipeline(("first|0", "second|0", "third|0"), Model(), lambda name: name, max_samples=10)
+    monkeypatch.setattr(rwkv_pipeline, "_configure_task_evaluation_plan", lambda _pipeline, _task, docs: docs)
+
+    async def run():
+        release = asyncio.Event()
+        all_generated = asyncio.Event()
+
+        async def score(*_args):
+            if len(calls) == 3:
+                all_generated.set()
+            await release.wait()
+
+        evaluation = asyncio.create_task(pipeline._evaluate_tasks(score))
+        try:
+            await asyncio.wait_for(all_generated.wait(), 2)
+            assert set(calls) == {"first|0", "second|0", "third|0"}
+            assert not evaluation.done()
+        finally:
+            release.set()
+            await evaluation
+
+    asyncio.run(run())
+
+
 def test_ifbench_checkers_treat_empty_responses_as_failed():
     overlap = NGramOverlapChecker("test")
     overlap.build_description(reference_text="reference text", percentage=50)
@@ -281,6 +320,12 @@ def test_ifbench_checkers_treat_empty_responses_as_failed():
 
     emoji = EmojiSentenceChecker("test")
     assert emoji.check_following("!!!") is False
+
+    paragraph = ParagraphLastFirstWordMatchChecker("test")
+    paragraph.build_description()
+    assert paragraph.check_following("!!!") is False
+    assert paragraph.check_following("word other word\n---") is False
+    assert paragraph.check_following("word other word") is True
 
 
 def test_duplicate_source_document_ids_are_disambiguated_for_cache():
@@ -546,20 +591,23 @@ def test_rwkv_pipeline_discards_truncated_choice_answer():
 @pytest.mark.parametrize(
     ("num_docs", "effective_docs", "k", "metric_name"),
     [
-        (30, 30, 256, "avg@256"),
-        (500, 500, 16, "avg@16"),
+        (30, 30, 128, "avg@128"),
+        (0, 0, 1, "avg@1"),
+        (500, 500, 8, "avg@8"),
         (1251, 1251, 4, "avg@4"),
-        (5000, 5000, 2, "avg@2"),
+        (4096, 4096, 1, "avg@1"),
+        (5000, 5000, 1, "avg@1"),
         (5001, 5001, 1, "avg@1"),
-        (50_001, 10_000, 1, "avg@0.2"),
+        (50_001, 50_001, 1, "avg@1"),
     ],
 )
-def test_evaluation_plan_uses_power_of_two_k_or_twenty_percent(num_docs, effective_docs, k, metric_name):
+def test_evaluation_plan_uses_bounded_power_of_two_completion_budget(num_docs, effective_docs, k, metric_name):
     assert rwkv_pipeline._evaluation_plan(num_docs) == (effective_docs, k, metric_name)
-    if num_docs <= 50_000:
+    if 0 < num_docs <= 50_000:
         assert k & (k - 1) == 0
-        assert k * num_docs > 5000
-        assert k == 1 or (k // 2) * num_docs <= 5000
+        if num_docs * k >= 3000:
+            assert 3000 <= k * num_docs <= 6000
+            assert abs(k * num_docs - 4096) <= abs((k // 2) * num_docs - 4096) if k > 1 else True
 
 
 def test_partial_budget_is_ten_per_selector_not_ten_per_leaf():
@@ -639,6 +687,48 @@ def test_rwkv_avg_at_k_delegates_answer_extraction_to_sampling_scorer():
     assert scorer.extract_rollout_answer(doc, response) == "-371"
 
 
+def test_rwkv_math_rollouts_keep_the_prediction_used_for_each_score():
+    metric = SampleLevelMetric(
+        metric_name="accuracy",
+        sample_level_fn=MathVerifyMatch(),
+        category=SamplingMethod.GENERATIVE,
+        corpus_level_fn=lambda values: sum(values) / len(values),
+        higher_is_better=True,
+    )
+    scorer = rwkv_pipeline.RWKVAvgAtK(2, metric)
+    doc = Doc(query="question", choices=["19"], gold_index=0)
+    response = ModelResponse(
+        text=["x = 20\n\nThe value is 19", "The final answer is 20"],
+        finish_reasons=["stop", "stop"],
+    )
+
+    assert scorer.compute(doc, response) == 0.5
+    assert doc.specific["rwkv_rollout_scores"] == [1.0, 0.0]
+    assert doc.specific["rwkv_rollout_extracted_answers"] == ["19", "20"]
+
+
+def test_rwkv_avg_at_k_reuses_native_extractive_prediction():
+    class NativeExtractor(SampleLevelComputation):
+        def compute(self, doc, model_response=None, **_kwargs):
+            doc.specific = {"extracted_predictions": ["19"]}
+            return 1.0
+
+    metric = SampleLevelMetric(
+        metric_name="accuracy",
+        sample_level_fn=NativeExtractor(),
+        category=SamplingMethod.GENERATIVE,
+        corpus_level_fn=lambda values: sum(values) / len(values),
+        higher_is_better=True,
+    )
+    scorer = rwkv_pipeline.RWKVAvgAtK(1, metric)
+    doc = Doc(query="question", choices=["19"], gold_index=0)
+    response = ModelResponse(text=["long reasoning... final answer: 19"], finish_reasons=["stop"])
+
+    assert scorer.compute(doc, response) == 1.0
+    assert doc.specific["rwkv_rollout_extracted_answers"] == ["19"]
+    assert doc.specific["rwkv_model_answer"] == "19"
+
+
 def test_rwkv_avg_at_k_scores_truncated_rollout_as_zero():
     metric = SampleLevelMetric(
         metric_name="accuracy",
@@ -687,9 +777,9 @@ def test_rwkv_pipeline_exposes_only_avg_at_k_and_updates_document_counts():
         pipeline.documents_dict[task.full_name],
     )
 
-    assert [metric.metric_name for metric in task.metrics] == ["avg@16"]
-    assert doc.num_samples == 16
-    assert task.num_samples == [1, 16]
+    assert [metric.metric_name for metric in task.metrics] == ["avg@8"]
+    assert doc.num_samples == 8
+    assert task.num_samples == [1, 8]
     assert task.config.original_num_docs == 500
     assert task.config.effective_num_docs == 1
 
@@ -738,7 +828,7 @@ def test_rwkv_partial_run_uses_avg_at_one():
     assert task.config.effective_num_docs == 10
 
 
-def test_lcb_outer_workers_use_spawn_context(monkeypatch):
+def test_lcb_outer_workers_reuse_spawn_context(monkeypatch):
     from lighteval.tasks.tasks.lcb import codegen_metrics
 
     contexts = []
@@ -753,12 +843,6 @@ def test_lcb_outer_workers_use_spawn_context(monkeypatch):
             assert max_workers == 1
             contexts.append(mp_context.get_start_method())
 
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *_args):
-            return None
-
         @staticmethod
         def submit(_function, _argument):
             return Future()
@@ -766,10 +850,48 @@ def test_lcb_outer_workers_use_spawn_context(monkeypatch):
     monkeypatch.setattr(codegen_metrics, "ProcessPoolExecutor", Executor)
     monkeypatch.setattr(codegen_metrics, "as_completed", iter)
 
-    results = codegen_metrics.evaluate_generations([{}], [["code"]], num_process_evaluate=1)
+    codegen_metrics._evaluation_executor.cache_clear()
+    try:
+        results = codegen_metrics.evaluate_generations([{}], [["code"]], num_process_evaluate=1)
+        repeated = codegen_metrics.evaluate_generations([{}], [["code"]], num_process_evaluate=1)
+    finally:
+        codegen_metrics._evaluation_executor.cache_clear()
 
     assert contexts == ["spawn"]
-    assert results == {0: [True]}
+    assert results == repeated == {0: [True]}
+
+
+def test_lcb_worker_pool_failure_is_not_scored_as_a_wrong_answer(monkeypatch):
+    from concurrent.futures.process import BrokenProcessPool
+
+    from lighteval.tasks.tasks.lcb import codegen_metrics
+
+    class Future:
+        @staticmethod
+        def result():
+            raise BrokenProcessPool("worker exited")
+
+    class Executor:
+        @staticmethod
+        def shutdown(*_args, **_kwargs):
+            pass
+
+        @staticmethod
+        def submit(_function, _argument):
+            return Future()
+
+    monkeypatch.setattr(codegen_metrics, "ProcessPoolExecutor", lambda **_kwargs: Executor())
+    monkeypatch.setattr(codegen_metrics, "as_completed", iter)
+
+    sample = {"input_output": '{"inputs": ["1", "2"]}'}
+    codegen_metrics._evaluation_executor.cache_clear()
+    try:
+        with pytest.raises(BrokenProcessPool, match="worker exited"):
+            codegen_metrics.evaluate_generations(
+                samples_list=[sample], generations_list=[["code", "code2"]], num_process_evaluate=1
+            )
+    finally:
+        codegen_metrics._evaluation_executor.cache_clear()
 
 
 def test_rwkv_avg_at_k_persists_producer_rollout_facts():
@@ -788,4 +910,5 @@ def test_rwkv_avg_at_k_persists_producer_rollout_facts():
         "source": "native",
         "rwkv_rollout_scores": [1.0, 0.0],
         "rwkv_rollout_extracted_answers": ["one", "wrong"],
+        "rwkv_model_answers": ["one", "wrong"],
     }
