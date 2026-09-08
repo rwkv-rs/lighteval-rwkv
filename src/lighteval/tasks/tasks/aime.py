@@ -18,7 +18,7 @@ languages:
 english
 
 tags:
-math, reasoning, field:math
+math, reasoning
 
 paper:
 https://maa.org/aime-thresholds-are-available/

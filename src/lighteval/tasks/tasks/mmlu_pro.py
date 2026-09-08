@@ -15,7 +15,7 @@ languages:
 english
 
 tags:
-general-knowledge, knowledge, multiple-choice, field:knowledge
+general-knowledge, knowledge, multiple-choice
 
 paper:
 https://arxiv.org/abs/2406.01574

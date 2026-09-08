@@ -15,7 +15,7 @@ languages:
 english
 
 tags:
-math, qa, reasoning, field:math
+math, qa, reasoning
 
 paper:
 https://arxiv.org/abs/1905.13319

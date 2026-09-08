@@ -33,7 +33,6 @@ from typing import Callable, Literal, Union
 import nltk
 import numpy as np
 from huggingface_hub import HfApi
-from math_verify import parse, verify
 from nltk.metrics.distance import edit_distance
 from nltk.tokenize import word_tokenize
 from nltk.tokenize.treebank import TreebankWordTokenizer
@@ -56,7 +55,6 @@ from lighteval.metrics.utils.judge_utils import get_judge_prompt_simpleqa, proce
 from lighteval.metrics.utils.llm_as_judge import JudgeLM
 from lighteval.models.model_output import ModelResponse
 from lighteval.tasks.requests import Doc
-from lighteval.utils.timeout import timeout
 from lighteval.utils.utils import as_list, safe_divide
 
 
@@ -78,62 +76,6 @@ class SampleLevelComputation(ABC):
                 val_str = str(v)
             attr_strs.append(f"{k}={val_str}")
         return f"{self.__class__.__name__}({', '.join(attr_strs)})"
-
-
-class MathVerifyMatch(SampleLevelComputation):
-    """Match mathematical answers with Math-Verify's symbolic parser."""
-
-    @staticmethod
-    @timeout(5)
-    def _parse(text: str):
-        return parse(text)
-
-    @staticmethod
-    @timeout(5)
-    def _verify(gold, prediction) -> bool:
-        return bool(verify(gold, prediction, strict=False))
-
-    @classmethod
-    def _parse_or_empty(cls, text: str):
-        try:
-            return cls._parse(text)
-        except Exception:
-            return []
-
-    @classmethod
-    def _parsed_candidates(cls, text: str):
-        normalized = text.replace("−", "-").replace("＝", "=")
-        equality_lines = [line for line in normalized.splitlines() if "=" in line]
-        candidates = [normalized]
-        if equality_lines and "\\boxed" not in normalized and "answer" not in normalized.lower():
-            candidates.insert(0, equality_lines[-1])
-        return [parsed for candidate in candidates if (parsed := cls._parse_or_empty(candidate))]
-
-    def compute(self, doc: Doc, model_response: ModelResponse, **kwargs) -> float:
-        parsed_golds = [self._parse_or_empty(gold) for gold in doc.get_golds()]
-        parsed_predictions = [
-            parsed for prediction in model_response.final_text for parsed in self._parsed_candidates(prediction)
-        ]
-        if doc.specific is None:
-            doc.specific = {}
-        doc.specific["extracted_predictions"] = [str(parsed_predictions[0][0])] if parsed_predictions else []
-        for gold in parsed_golds:
-            for prediction in parsed_predictions:
-                try:
-                    if gold and prediction and self._verify(gold, prediction):
-                        doc.specific["extracted_predictions"] = [str(prediction[0])]
-                        return 1.0
-                except Exception:
-                    continue
-        return 0.0
-
-    def extract_answer(self, doc: Doc, model_response: ModelResponse) -> str:
-        if "extracted_predictions" in (doc.specific or {}):
-            extracted = doc.specific["extracted_predictions"]
-            return str(extracted[0]) if extracted else ""
-        parsed_candidates = self._parsed_candidates(model_response.final_text[0])
-        parsed = parsed_candidates[0] if parsed_candidates else []
-        return str(parsed[0]) if parsed else ""
 
 
 class ExactMatches(SampleLevelComputation):

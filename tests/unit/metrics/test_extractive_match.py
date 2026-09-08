@@ -24,7 +24,6 @@ import pytest
 import sympy
 
 from lighteval.metrics.dynamic_metrics import MultilingualExtractiveMatchMetric
-from lighteval.metrics.metrics_sample import MathVerifyMatch
 from lighteval.metrics.utils.extractive_match_utils import (
     ExprExtractionConfig,
     IndicesExtractionConfig,
@@ -76,38 +75,6 @@ def compare_strings(
         model_response=model_response,
         doc=doc,
     )
-
-
-@pytest.mark.parametrize(
-    ("gold", "prediction", "extracted"),
-    [
-        ("-371", "230 − 601 = −371\n\nThis means that 601 is 371 more than 230.", "-371"),
-        (r"\frac{1}{2}", r"Thus $\boxed{\frac{1}{2}}$.", "1/2"),
-        ("19", r"The area condition gives the result $\boxed{19}$.", "19"),
-        ("19", "The final answer is 19 cm^2.", "19"),
-        ("19", "Final answer: 019", "19"),
-        ("19", "x = 20\n\nThe value is 19", "19"),
-        ("0", "Final answer: 000", "0"),
-        ("999", "Final answer: 999", "999"),
-    ],
-)
-def test_math_verify_match_extracts_and_scores_final_answer(gold, prediction, extracted):
-    metric = MathVerifyMatch()
-    doc = Doc(query="question", choices=[gold], gold_index=0)
-    response = ModelResponse(text=[prediction])
-
-    assert metric.compute(doc, response) == 1.0
-    assert metric.extract_answer(doc, response) == extracted
-
-
-def test_math_verify_match_records_the_candidate_that_passed_verification():
-    metric = MathVerifyMatch()
-    doc = Doc(query="question", choices=["19"], gold_index=0)
-    response = ModelResponse(text=[r"First $\boxed{20}$, then $\boxed{19}$."])
-
-    assert metric.compute(doc, response) == 1.0
-    assert doc.specific["extracted_predictions"] == ["19"]
-    assert metric.extract_answer(doc, response) == "19"
 
 
 # Test basic multiple choice answer extraction

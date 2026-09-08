@@ -17,7 +17,7 @@ languages:
 english
 
 tags:
-biology, chemistry, graduate-level, multiple-choice, physics, qa, reasoning, science, field:science
+biology, chemistry, graduate-level, multiple-choice, physics, qa, reasoning, science
 
 paper:
 https://arxiv.org/abs/2311.12022

@@ -25,13 +25,13 @@ from lighteval.models.rwkv.http_model import MAX_NEW_TOKENS
 from lighteval.pipeline import Pipeline
 from lighteval.tasks.registry import Registry
 from lighteval.tasks.requests import Doc, SamplingMethod
-from lighteval.tasks.rwkv_answer_extractor import (
+from lighteval.tasks.rwkv_free_response import is_rwkv_free_response, rwkv_free_response_metrics
+from lighteval.tasks.rwkv_single_choice import (
     convert_rwkv_choice,
     extract_rwkv_choice_answer,
     is_rwkv_choice,
     rwkv_choice_metrics,
 )
-from lighteval.tasks.rwkv_prompt import TaskPromptMode, apply_task_prompt_override
 
 
 _TARGET_COMPLETIONS = 4096
@@ -275,10 +275,9 @@ class RWKVPipeline(Pipeline):
     def _prepare_task_documents(self, task):
         max_samples = self._task_max_samples.get(task.full_name, self.pipeline_parameters.max_samples)
         docs = task.get_docs(max_samples)
-        if self.pipeline_parameters.task_prompt is not None:
-            self._apply_task_prompt_to_docs(task, docs)
         self._prepare_truthfulqa_mc1(task, docs)
         self._prepare_choice_task(task, docs)
+        self._prepare_free_response_task(task)
         if self.model.config.cot_mode == "open_think":
             self._prepare_open_think_task(task, docs)
         return docs
@@ -303,14 +302,19 @@ class RWKVPipeline(Pipeline):
         task.config.generation_size = MAX_NEW_TOKENS
         task.config.stop_sequence = []
 
-    def _apply_task_prompt_to_docs(self, task, docs) -> None:
-        task_prompt = self.pipeline_parameters.task_prompt
-        task_prompt_mode = self.pipeline_parameters.task_prompt_mode
+    @staticmethod
+    def _prepare_free_response_task(task) -> None:
+        if not is_rwkv_free_response(task.full_name):
+            return
         task.config = copy(task.config)
-        identities = [apply_task_prompt_override(doc, task_prompt, task_prompt_mode) for doc in docs]
-        task.config.configured_task_prompt = task_prompt
-        task.config.task_prompt_mode = TaskPromptMode(task_prompt_mode).value
-        task.config.task_prompt_digests = sorted({identity.digest for identity in identities})
+        task.metrics = tuple(
+            converted
+            for metric in task.metrics
+            for converted in (
+                rwkv_free_response_metrics(metric) if metric.category == SamplingMethod.GENERATIVE else (metric,)
+            )
+        )
+        task.config.metrics = task.metrics
 
     @staticmethod
     def _prepare_choice_task(task, docs) -> None:
@@ -414,19 +418,7 @@ class RWKVPipeline(Pipeline):
         if evaluation_errors:
             raise evaluation_errors[0]
         if self.is_main_process():
-            self.evaluation_tracker.general_config_logger.log_end_time()
-            self.evaluation_tracker.metrics_logger.aggregate(
-                task_dict=self.tasks_dict,
-                bootstrap_iters=self.pipeline_parameters.bootstrap_iters,
-            )
-            self.evaluation_tracker.details_logger.aggregate()
-            for task_name, summary in self.evaluation_tracker.details_logger.compiled_details.items():
-                self.evaluation_tracker.metrics_logger.metric_aggregated[task_name].update(
-                    n_samples=summary.n_samples,
-                    n_completions=summary.n_completions,
-                    n_truncated=summary.n_truncated,
-                    truncation_rate=summary.truncation_rate,
-                )
+            self._finalize_metrics()
 
     async def _evaluate_tasks(self, score_task) -> None:  # noqa: C901
         load_semaphore = asyncio.Semaphore(min(self._DATASET_LOADERS, len(self._task_names)))

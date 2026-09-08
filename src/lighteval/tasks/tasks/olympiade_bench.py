@@ -13,7 +13,7 @@ languages:
 english, chinese
 
 tags:
-math, reasoning, language, field:math
+math, reasoning, language
 
 paper:
 https://arxiv.org/abs/2402.14008

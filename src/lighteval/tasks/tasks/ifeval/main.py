@@ -13,7 +13,7 @@ languages:
 english
 
 tags:
-instruction-following, field:instruction
+instruction-following
 
 paper:
 https://arxiv.org/abs/2311.07911

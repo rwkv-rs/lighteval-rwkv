@@ -61,40 +61,6 @@ EXCLUDED_BENCHMARKS = {
     "mbpp",
     "mbpp_plus",
 }
-DEFAULT_FIELDS = {
-    "mmlu": "knowledge",
-    "mmlu_pro": "knowledge",
-    "mmlu_redux_2": "knowledge",
-    "gpqa:diamond": "science",
-    "gpqa:main": "science",
-    "arc:challenge": "science",
-    "arc:easy": "science",
-    "hellaswag": "reasoning",
-    "bigbench_hard": "reasoning",
-    "agieval": "knowledge",
-    "truthfulqa:mc": "knowledge",
-    "winogrande": "reasoning",
-    "openbookqa": "science",
-    "commonsenseqa": "reasoning",
-    "ceval_zho_mcf": "knowledge",
-    "med_qa": "medical",
-    "med_mcqa": "medical",
-    "gsm8k": "math",
-    "gsm_plus": "math",
-    "asdiv": "math",
-    "mathqa": "math",
-    "arithmetic": "math",
-    "math_500": "math",
-    "math": "math",
-    "aime24": "math",
-    "aime25": "math",
-    "aimo_progress_prize_1": "math",
-    "olympiad_bench": "math",
-    "lcb:codegeneration": "coding",
-    "ifeval": "instruction",
-    "ifbench_test": "instruction",
-    "ifbench_multiturn": "instruction",
-}
 
 
 def test_default_config_contains_only_the_32_native_selectors(tmp_path):
@@ -114,31 +80,6 @@ def test_default_config_contains_only_the_32_native_selectors(tmp_path):
     resolved = resolve_benchmarks(config.benchmarks)
     assert resolved.selector_count == 32
     assert len(resolved.leaf_tasks) == 247
-
-
-def test_default_config_fields_cover_all_32_selectors_and_247_leaf_tasks(tmp_path):
-    from lighteval.tasks.registry import Registry
-
-    manifest = tmp_path / "pool.json"
-    manifest.write_text("{}", encoding="utf-8")
-    config = RWKVEvaluationConfig.read(
-        Path("configs/eval/lighteval-full.toml"),
-        env={"RWKV_EVAL_POOL_MANIFEST": str(manifest)},
-    )
-    resolved = resolve_benchmarks(config.benchmarks)
-    registry = Registry(tasks=None, load_multilingual=True)
-    metadata = {task["name"]: module["docstring"] for module in registry.get_tasks_dump() for task in module["tasks"]}
-
-    assert set(DEFAULT_FIELDS) == set(config.benchmarks)
-    assert sum(len(leaves) for _, leaves in resolved.selector_tasks) == 247
-    for selector, leaves in resolved.selector_tasks:
-        fields = {
-            tag.removeprefix("field:")
-            for leaf in leaves
-            for tag in metadata[leaf].get("tags", [])
-            if tag.startswith("field:")
-        }
-        assert fields == {DEFAULT_FIELDS[selector]}
 
 
 def test_config_rejects_unknown_fields_and_duplicate_selectors(tmp_path):
