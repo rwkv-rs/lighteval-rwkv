@@ -9,6 +9,8 @@ import subprocess
 import sys
 import threading
 import time
+import hashlib
+import json
 from collections import deque
 from dataclasses import dataclass
 from io import BufferedReader
@@ -73,6 +75,8 @@ def _parse_args(
         metavar="PATH",
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    parser.add_argument("--run-id", default=os.environ.get("RWKV_EVAL_RUN_ID", "default"))
+    parser.add_argument("--output-root", type=Path, default=Path(os.environ.get("RWKV_EVAL_OUTPUT_ROOT", "results")))
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -109,8 +113,18 @@ def _validate(evaluations: Sequence[ModelEvaluation]) -> None:
             )
 
 
-def _command(args: argparse.Namespace) -> list[str]:
-    command = ["uv", "run", "--no-sync", "lighteval", "rwkv", "--config", str(args.config)]
+def _model_config(args: argparse.Namespace, evaluation: ModelEvaluation) -> Path:
+    root = getattr(args, "output_root", Path("results")) / getattr(args, "run_id", "default") / evaluation.size.lower()
+    root.mkdir(parents=True, exist_ok=True)
+    text = args.config.read_text()
+    lines = [f'output_dir = "{root.resolve()}"' if line.strip().startswith("output_dir") else line for line in text.splitlines()]
+    path = root / ".runner-config.toml"
+    path.write_text("\n".join(lines) + "\n")
+    return path
+
+
+def _command(args: argparse.Namespace, config: Path) -> list[str]:
+    command = ["uv", "run", "--no-sync", "lighteval", "rwkv", "--config", str(config)]
     if args.dry_run:
         command.append("--dry-run")
     return command
@@ -139,7 +153,27 @@ def main(  # noqa: C901
         print(f"Invalid RWKV evaluation manifests: {error}", file=sys.stderr, flush=True)
         return 2
 
-    command = _command(args)
+    run_id = getattr(args, "run_id", "default")
+    output_root = getattr(args, "output_root", Path("results"))
+    if not args.dry_run:
+        metadata_dir = output_root / run_id
+        metadata_dir.mkdir(parents=True, exist_ok=True)
+        metadata_path = metadata_dir / "run-manifest.json"
+        config_bytes = args.config.read_bytes()
+        config_hash = hashlib.sha256(config_bytes).hexdigest()
+        metadata = {
+            "run_id": run_id,
+            "config_sha256": config_hash,
+            "models": [e.size for e in evaluations],
+            "manifests": {e.size: str(e.manifest.resolve()) for e in evaluations},
+        }
+        if metadata_path.exists():
+            existing = json.loads(metadata_path.read_text())
+            if existing != metadata:
+                print(f"run metadata mismatch: {metadata_path}; choose a new --run-id", file=sys.stderr)
+                return 2
+        else:
+            metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
     processes: list[tuple[ModelEvaluation, subprocess.Popen[bytes]]] = []
     output_threads: list[threading.Thread] = []
     received_signal: int | None = None
@@ -175,8 +209,9 @@ def main(  # noqa: C901
         environment = os.environ.copy()
         environment["RWKV_EVAL_POOL_MANIFEST"] = str(evaluation.manifest.resolve())
         print(f"Starting {evaluation.size}: {evaluation.manifest}", flush=True)
+        config = args.config if args.dry_run else _model_config(args, evaluation)
         process = subprocess.Popen(
-            command,
+            _command(args, config),
             cwd=PROJECT_ROOT,
             env=environment,
             stdout=subprocess.PIPE,

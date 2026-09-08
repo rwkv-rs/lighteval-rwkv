@@ -94,6 +94,10 @@ def test_four_model_evaluation_runner_forwards_signals_to_every_process(tmp_path
             str(manifests[2]),
             "--manifest-13.3b",
             str(manifests[3]),
+            "--output-root",
+            str(tmp_path / "results"),
+            "--run-id",
+            "test-run",
         ]
     )
 
@@ -101,7 +105,7 @@ def test_four_model_evaluation_runner_forwards_signals_to_every_process(tmp_path
     assert len(processes) == 4
     assert all(process.command[:3] == ["uv", "run", "--no-sync"] for process in processes)
     assert all("--max-samples" not in process.command for process in processes)
-    assert all(str(evaluation_runner.DEFAULT_CONFIG) in process.command for process in processes)
+    assert all(".runner-config.toml" in process.command[-1] for process in processes)
     assert [process.env["RWKV_EVAL_POOL_MANIFEST"] for process in processes] == [
         str(manifest.resolve()) for manifest in manifests
     ]
