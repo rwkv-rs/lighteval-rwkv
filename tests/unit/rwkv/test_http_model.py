@@ -242,7 +242,63 @@ def test_request_contract_version_changes_cache_namespace(tmp_path, monkeypatch)
     model.cleanup()
 
 
-def test_async_model_cache_preserves_document_order_and_skips_completed_requests():
+def test_rollout_count_changes_cache_namespace(tmp_path, monkeypatch):
+    configs = []
+
+    class Cache:
+        def __init__(self, config):
+            self.config = config
+            self.registry = None
+            configs.append(config)
+
+        def _init_registry(self, registry):
+            self.registry = registry
+
+    class Pool:
+        model_id = "served"
+        manifest = SimpleNamespace(max_model_len=10240)
+
+        def close(self):
+            pass
+
+    manifest = SimpleNamespace(
+        model_name="RWKV7-g1h-7.2B-20260710-ctx10240",
+        served_model_name="served",
+        model_revision="weight-sha",
+        wkv_mode="fp32io16",
+        vllm_version="0.11.0",
+        max_model_len=10240,
+        fingerprint="f" * 64,
+    )
+    monkeypatch.setattr("lighteval.models.rwkv.http_model.SampleCache", Cache)
+    model = RWKVHttpModel(
+        manifest=manifest,
+        prompt_template="bot",
+        cot_mode="open_think",
+        cache_dir=tmp_path,
+        pool=Pool(),
+    )
+    registry = object()
+    model._cache._init_registry(registry)
+
+    first = model._cache_for_num_samples(1)
+    second = model._cache_for_num_samples(16)
+
+    assert first.config is configs[0]
+    assert second.config is configs[1]
+    assert configs[0].rwkv_num_samples is None
+    assert "rwkv_num_samples" not in configs[0].model_dump()
+    assert configs[1].rwkv_num_samples == 16
+    assert configs[1].model_dump()["rwkv_num_samples"] == 16
+    assert second.registry is registry
+    cache = SampleCache.__new__(SampleCache)
+    assert cache.get_model_hash(configs[0]) != cache.get_model_hash(configs[1])
+    assert model._cache_for_num_samples(16) is second
+    model.cleanup()
+
+
+@pytest.mark.parametrize("first_num_samples", [1, 2])
+def test_async_model_cache_preserves_document_order_and_skips_completed_requests(first_num_samples):
     calls = []
 
     class Pool:
@@ -288,22 +344,26 @@ def test_async_model_cache_preserves_document_order_and_skips_completed_requests
     model._cot_mode = "open_think"
     model._generation_parameters = {}
     model._cache = Cache()
-    docs = [_document("first"), _document("second")]
+    model._caches_by_num_samples = {2: Cache()}
+    docs = [_document("first", num_samples=first_num_samples), _document("second")]
 
-    assert model.pending_rollouts(docs) == 2
+    assert model.pending_rollouts(docs) == first_num_samples + 1
     first = asyncio.run(model.greedy_until(docs))
     assert model.pending_rollouts(docs) == 0
     second = asyncio.run(model.greedy_until(list(reversed(docs))))
 
-    assert calls == ["first", "second"]
-    assert [response.text for response in first] == [["first"], ["second"]]
-    assert [response.text for response in second] == [["second"], ["first"]]
+    assert calls == ["first"] * first_num_samples + ["second"]
+    assert [response.text for response in first] == [["first"] * first_num_samples, ["second"]]
+    assert [response.text for response in second] == [["second"], ["first"] * first_num_samples]
 
 
-def test_async_model_cache_preserves_completed_documents_when_a_rollout_fails():  # noqa: C901
+def test_async_model_cache_preserves_completed_documents_when_a_rollout_fails(tmp_path, monkeypatch):  # noqa: C901
     calls = []
 
     class Pool:
+        model_id = "served"
+        manifest = SimpleNamespace(max_model_len=10240)
+
         def __init__(self):
             self.failed = True
 
@@ -332,7 +392,9 @@ def test_async_model_cache_preserves_completed_documents_when_a_rollout_fails():
             )
 
     class Cache:
-        def __init__(self):
+        def __init__(self, config):
+            self.config = config
+            self.registry = None
             self.results = {}
 
         def get_task_id(self, task_name, sampling_method):
@@ -340,11 +402,7 @@ def test_async_model_cache_preserves_completed_documents_when_a_rollout_fails():
 
         def get_samples_to_process_and_cache(self, docs, sampling_method):
             missing = [doc for doc in docs if doc.id not in self.results]
-            cached = {
-                self.get_task_id(doc.task_name, sampling_method)
-                for doc in docs
-                if doc.id in self.results
-            }
+            cached = {self.get_task_id(doc.task_name, sampling_method) for doc in docs if doc.id in self.results}
             return missing, cached
 
         def cache_samples(self, docs, results, **_kwargs):
@@ -354,41 +412,52 @@ def test_async_model_cache_preserves_completed_documents_when_a_rollout_fails():
             return [self.results[doc.id] for doc in docs]
 
     pool = Pool()
-    model = RWKVHttpModel.__new__(RWKVHttpModel)
-    model.pool = pool
-    model.prompt_manager = PromptManager(use_chat_template=True, tokenizer=None)
-    model._prompt_template = "bot"
-    model._template_stop = "✿"
-    model._cot_mode = "open_think"
-    model._generation_parameters = {}
-    model._cache = Cache()
+    manifest = SimpleNamespace(
+        model_name="RWKV7-g1h-7.2B-20260710-ctx10240",
+        served_model_name="served",
+        model_revision="weight-sha",
+        wkv_mode="fp32io16",
+        vllm_version="0.11.0",
+        max_model_len=10240,
+        fingerprint="f" * 64,
+    )
+    monkeypatch.setattr("lighteval.models.rwkv.http_model.SampleCache", Cache)
+    model = RWKVHttpModel(
+        manifest=manifest,
+        prompt_template="bot",
+        cot_mode="open_think",
+        cache_dir=tmp_path,
+        pool=pool,
+    )
     docs = [
         _document("first", num_samples=2),
         _document("partial", num_samples=2),
-        _document("fail"),
-        _document("pending"),
+        _document("fail", num_samples=2),
+        _document("pending", num_samples=2),
         _document("last", num_samples=2),
     ]
 
     with pytest.raises(PoolError, match="transient failure"):
         asyncio.run(model.greedy_until(docs))
 
-    assert set(model._cache.results) == {"first", "last"}
+    assert model._cache.results == {}
+    assert set(model._cache_for_num_samples(2).results) == {"first", "last"}
+    assert model.pending_rollouts(docs) == 6
     pool.failed = False
     responses = asyncio.run(model.greedy_until(docs))
 
     assert [response.text for response in responses] == [
         ["first", "first"],
         ["partial", "partial"],
-        ["fail"],
-        ["pending"],
+        ["fail", "fail"],
+        ["pending", "pending"],
         ["last", "last"],
     ]
     assert calls.count("first") == 2
     assert calls.count("last") == 2
     assert calls.count("partial") == 4
-    assert calls.count("fail") == 2
-    assert calls.count("pending") == 2
+    assert calls.count("fail") == 4
+    assert calls.count("pending") == 4
 
 
 def test_cache_only_mode_rejects_uncached_rollouts(monkeypatch):

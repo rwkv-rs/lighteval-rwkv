@@ -192,7 +192,7 @@ Run the same full evaluation against the separately deployed G1j pools without o
 temp/run_g1j.sh
 ```
 
-The full configuration evaluates every configured split. The G1i manifests require aggregate pool capacities of 1024, 1024, 960, and 320 respectively; the current G1j deployment manifests require 1024, 1024, 512, and 320.
+The full configuration evaluates every configured split. The G1i manifests require aggregate pool capacities of 1024, 1024, 960, and 320 respectively; the current G1j deployment manifests require 1024, 512, 256, and 248.
 
 The test configuration is a separate contract. It evaluates exactly 10 documents per configured selector; superset selectors distribute that budget across their leaf tasks:
 

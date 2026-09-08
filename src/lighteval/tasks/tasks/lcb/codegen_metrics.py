@@ -28,8 +28,10 @@ import sys
 import time
 import zlib
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from decimal import Decimal
 from enum import Enum
+from functools import lru_cache
 from io import StringIO
 from types import ModuleType
 from typing import Callable, Optional
@@ -507,19 +509,19 @@ def check_correctness(sample, generation, timeout: int) -> list[int | bool]:
     def _temp_run(sample, generation, result):
         result.append(run_test(sample, test=generation, timeout=timeout))
 
-    manager = _FORK_CONTEXT.Manager()
-    result = manager.list()
-    p = _FORK_CONTEXT.Process(target=_temp_run, args=(sample, generation, result))
-    p.start()
-    p.join(timeout=(timeout + 1) * len(json.loads(sample["input_output"])["inputs"]) + 5)
-    if p.is_alive():
-        p.kill()
-    if not result:
-        in_outs = json.loads(sample["input_output"])
-        # consider that all tests failed
-        result = [[-1 for i in range(len(in_outs["inputs"]))]]
-
-    return result[0]
+    with _FORK_CONTEXT.Manager() as manager:
+        result = manager.list()
+        p = _FORK_CONTEXT.Process(target=_temp_run, args=(sample, generation, result))
+        p.start()
+        p.join(timeout=(timeout + 1) * len(json.loads(sample["input_output"])["inputs"]) + 5)
+        if p.is_alive():
+            p.kill()
+            p.join()
+        if not result:
+            in_outs = json.loads(sample["input_output"])
+            # consider that all tests failed
+            return [-1 for _ in in_outs["inputs"]]
+        return list(result[0])
 
 
 def evaluate_generations_by_problem(args: list[list]) -> list:
@@ -552,6 +554,11 @@ def evaluate_generations_by_problem(args: list[list]) -> list:
     return res
 
 
+@lru_cache(maxsize=None)
+def _evaluation_executor(num_process_evaluate: int) -> ProcessPoolExecutor:
+    return ProcessPoolExecutor(max_workers=num_process_evaluate, mp_context=_SPAWN_CONTEXT)
+
+
 def evaluate_generations(
     samples_list: list,
     generations_list: list[list[str]],
@@ -577,15 +584,20 @@ def evaluate_generations(
         [(generations_list[index], samples_list[index], timeout), index] for index in range(len(generations_list))
     ]
 
+    executor = _evaluation_executor(num_process_evaluate)
     with tqdm(total=len(inputs)) as pbar:
-        with ProcessPoolExecutor(max_workers=num_process_evaluate, mp_context=_SPAWN_CONTEXT) as executor:
-            futures = {executor.submit(evaluate_generations_by_problem, arg): index for arg, index in inputs}
+        futures = {executor.submit(evaluate_generations_by_problem, arg): index for arg, index in inputs}
 
-            results = {}
-            for future in as_completed(futures):
-                index = futures[future]
+        results = {}
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
                 results[index] = future.result()
-                pbar.update(1)
+            except BrokenProcessPool:
+                executor.shutdown(wait=False, cancel_futures=True)
+                _evaluation_executor.cache_clear()
+                raise
+            pbar.update(1)
 
     assert len(results) == len(inputs), f"results = {len(results)} inputs = {len(inputs)} {results=}"
 

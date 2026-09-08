@@ -8,6 +8,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from pydantic import Field
+
 from lighteval.models.abstract_model import LightevalModel, ModelConfig
 from lighteval.models.model_input import GenerationParameters
 from lighteval.models.model_output import ModelResponse
@@ -57,6 +59,7 @@ class RWKVHTTPModelConfig(ModelConfig):
     pool_fingerprint: str
     request_contract_version: str
     max_samples: int | None = None
+    rwkv_num_samples: int | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 @dataclass(frozen=True)
@@ -118,6 +121,7 @@ class RWKVHttpModel(LightevalModel):
         )
         cache_config = self.config.model_copy(update={"pool_fingerprint": CACHE_POOL_FINGERPRINT})
         self._cache = SampleCache(cache_config)
+        self._caches_by_num_samples: dict[int, SampleCache] = {}
         self.prompt_manager = PromptManager(use_chat_template=True, tokenizer=None)
         self._prompt_template = prompt_template
         self._assistant_prefix, self._template_stop = PROMPT_TEMPLATES[prompt_template]
@@ -139,19 +143,31 @@ class RWKVHttpModel(LightevalModel):
     async def greedy_until(self, docs: list[Doc]) -> list[ModelResponse]:
         if self._cache is None:
             return await self._generate(docs)
-        task_ids = {self._cache.get_task_id(doc.task_name, SamplingMethod.GENERATIVE) for doc in docs}
-        pending, _ = self._cache.get_samples_to_process_and_cache(docs, SamplingMethod.GENERATIVE)
+        num_samples = {doc.num_samples for doc in docs}
+        if len(num_samples) > 1:
+            grouped: dict[int, list[tuple[int, Doc]]] = {}
+            for index, doc in enumerate(docs):
+                grouped.setdefault(doc.num_samples, []).append((index, doc))
+            results: dict[int, ModelResponse] = {}
+            for entries in grouped.values():
+                indices, group_docs = zip(*entries, strict=True)
+                for index, result in zip(indices, await self.greedy_until(list(group_docs)), strict=True):
+                    results[index] = result
+            return [results[index] for index in range(len(docs))]
+        cache = self._cache_for_num_samples(next(iter(num_samples), 1))
+        task_ids = {cache.get_task_id(doc.task_name, SamplingMethod.GENERATIVE) for doc in docs}
+        pending, _ = cache.get_samples_to_process_and_cache(docs, SamplingMethod.GENERATIVE)
         if pending:
             if os.environ.get("RWKV_EVAL_CACHE_ONLY") == "1":
                 raise ValueError("cache-only evaluation found uncached RWKV rollouts")
-            results = await self._generate(pending)
-            self._cache.cache_samples(
+            results = await self._generate(pending, cache=cache)
+            cache.cache_samples(
                 docs=pending,
                 results=results,
                 task_ids=task_ids,
                 sampling_method=SamplingMethod.GENERATIVE,
             )
-        results = list(self._cache.get_samples_from_cache(docs, task_ids, SamplingMethod.GENERATIVE))
+        results = list(cache.get_samples_from_cache(docs, task_ids, SamplingMethod.GENERATIVE))
         if any(result is None for result in results):
             raise ValueError("Problem while loading and aggregating items from cache.")
         return results
@@ -160,10 +176,33 @@ class RWKVHttpModel(LightevalModel):
         """Return the uncached rollout count used by the benchmark scheduler."""
         if self._cache is None:
             return sum(doc.num_samples for doc in docs)
-        pending, _ = self._cache.get_samples_to_process_and_cache(docs, SamplingMethod.GENERATIVE)
-        return sum(doc.num_samples for doc in pending)
+        num_samples = {doc.num_samples for doc in docs}
+        pending_rollouts = 0
+        for num_samples_for_group in num_samples:
+            group_docs = [doc for doc in docs if doc.num_samples == num_samples_for_group]
+            pending, _ = self._cache_for_num_samples(num_samples_for_group).get_samples_to_process_and_cache(
+                group_docs, SamplingMethod.GENERATIVE
+            )
+            pending_rollouts += len(pending) * num_samples_for_group
+        return pending_rollouts
 
-    async def _generate(self, docs: list[Doc]) -> list[ModelResponse]:  # noqa: C901
+    def _cache_for_num_samples(self, num_samples: int) -> SampleCache:
+        if num_samples == 1:
+            return self._cache
+        caches = self._caches_by_num_samples
+        if num_samples not in caches:
+            cache_config = self.config.model_copy(
+                update={
+                    "pool_fingerprint": CACHE_POOL_FINGERPRINT,
+                    "rwkv_num_samples": num_samples,
+                }
+            )
+            caches[num_samples] = SampleCache(cache_config)
+            if self._cache.registry is not None:
+                caches[num_samples]._init_registry(self._cache.registry)
+        return caches[num_samples]
+
+    async def _generate(self, docs: list[Doc], *, cache: SampleCache | None = None) -> list[ModelResponse]:  # noqa: C901
         jobs: list[_Job] = []
         response_slots: list[list[Completion | None]] = []
         for document_index, doc in enumerate(docs):
@@ -271,14 +310,11 @@ class RWKVHttpModel(LightevalModel):
             )
             completed_docs.append(docs[document_index])
         if failure is not None:
-            if self._cache is not None and completed_docs:
-                self._cache.cache_samples(
+            if cache is not None and completed_docs:
+                cache.cache_samples(
                     docs=completed_docs,
                     results=responses,
-                    task_ids={
-                        self._cache.get_task_id(doc.task_name, SamplingMethod.GENERATIVE)
-                        for doc in completed_docs
-                    },
+                    task_ids={cache.get_task_id(doc.task_name, SamplingMethod.GENERATIVE) for doc in completed_docs},
                     sampling_method=SamplingMethod.GENERATIVE,
                 )
             raise failure
