@@ -744,6 +744,29 @@ def test_rwkv_avg_at_k_scores_truncated_rollout_as_zero():
     assert scorer.compute(doc, response) == 0.0
 
 
+def test_rwkv_avg_at_k_records_empty_answer_without_index_error():
+    class EmptyExtractor(SampleLevelComputation):
+        def compute(self, doc, model_response=None, **_kwargs):
+            return 0.0
+
+        def extract_answer(self, doc, model_response):
+            return ""
+
+    metric = SampleLevelMetric(
+        metric_name="accuracy",
+        sample_level_fn=EmptyExtractor(),
+        category=SamplingMethod.GENERATIVE,
+        corpus_level_fn=lambda values: sum(values) / len(values),
+        higher_is_better=True,
+    )
+    scorer = rwkv_pipeline.RWKVAvgAtK(1, metric)
+    doc = Doc(query="question", choices=["answer"], gold_index=0)
+    response = ModelResponse(text=["wrong"], finish_reasons=["stop"])
+
+    assert scorer.compute(doc, response) == 0.0
+    assert doc.specific["rwkv_model_answer"] == ""
+
+
 def test_rwkv_pipeline_exposes_only_avg_at_k_and_updates_document_counts():
     doc = Doc(
         query="question",

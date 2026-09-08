@@ -100,6 +100,16 @@ def test_math_verify_match_extracts_and_scores_final_answer(gold, prediction, ex
     assert metric.extract_answer(doc, response) == extracted
 
 
+def test_math_verify_match_records_the_candidate_that_passed_verification():
+    metric = MathVerifyMatch()
+    doc = Doc(query="question", choices=["19"], gold_index=0)
+    response = ModelResponse(text=[r"First $\boxed{20}$, then $\boxed{19}$."])
+
+    assert metric.compute(doc, response) == 1.0
+    assert doc.specific["extracted_predictions"] == ["19"]
+    assert metric.extract_answer(doc, response) == "19"
+
+
 # Test basic multiple choice answer extraction
 @pytest.mark.parametrize(
     "gold,pred,expected",
