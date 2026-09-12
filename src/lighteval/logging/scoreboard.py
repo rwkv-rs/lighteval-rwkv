@@ -245,7 +245,7 @@ class ScoreboardCallback:
             fields[selector] = next(iter(leaf_fields))
         return fields
 
-    def _campaign(self, task_metadata: dict) -> dict:
+    def _campaign(self, task_metadata: dict, primary_metric: str | None = None) -> dict:
         omitted = {"identity", "weight_sha256", "weight_display_name", "wkv_mode"}
         registry = [{key: value for key, value in task_metadata.items() if key not in omitted}]
         campaign = {
@@ -263,6 +263,10 @@ class ScoreboardCallback:
             "rerun_reason": self._rerun_reason,
         }
         campaign["run_key"] = _campaign_run_key(campaign)
+        if primary_metric is not None:
+            campaign["run_key"] = _sha256(
+                {"campaign": campaign["run_key"], "primary_metric": primary_metric}
+            )
         return campaign
 
     @classmethod
@@ -342,7 +346,7 @@ class ScoreboardCallback:
             outcome: len(bucket) for outcome, bucket in accumulator.selected.items()
         }
         completions = accumulator.count
-        campaign = self._campaign(task_metadata)
+        campaign = self._campaign(task_metadata, primary_metric)
         receipt = self._request(
             "POST",
             "/api/v1/evaluation-campaigns",
