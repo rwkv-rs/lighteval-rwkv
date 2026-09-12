@@ -1,0 +1,12 @@
+schema_version = 1
+run_mode = "full"
+pool_manifest = "../vllm_pool.g1j.7.2b.json"
+output_dir = "results"
+prompt_template = "bot"
+cot_mode = "open_think"
+
+benchmarks = [
+  "aime24",
+  "aime25",
+  "aimo_progress_prize_1",
+]

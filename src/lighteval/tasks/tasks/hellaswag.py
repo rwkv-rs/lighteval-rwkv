@@ -13,7 +13,7 @@ languages:
 english
 
 tags:
-multiple-choice, narrative, reasoning
+multiple-choice, narrative, reasoning, field:reasoning
 
 paper:
 https://arxiv.org/abs/1905.07830

@@ -25,12 +25,15 @@ import logging
 import os
 import re
 import time
-from dataclasses import asdict, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
 from enum import Enum
 from io import BytesIO
 from pathlib import Path
+from typing import IO
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import torch
 from datasets import Dataset, load_dataset
 from datasets.utils.metadata import MetadataConfigs
@@ -90,6 +93,15 @@ class EnhancedJSONEncoder(json.JSONEncoder):
         except TypeError:
             # For classes without json serialization
             return type(o).__name__
+
+
+@dataclass
+class _TaskParquetWriter:
+    """Incremental per-task parquet writer state used by the streaming details path."""
+
+    handle: IO[bytes]
+    writer: pq.ParquetWriter | None = None
+    schema: pa.Schema | None = None
 
 
 class EvaluationTracker:
@@ -180,6 +192,11 @@ class EvaluationTracker:
 
         self.public = public
 
+        # Streaming details path (used by RWKVPipeline): a run-wide date-id shared by every
+        # incremental write and the final save(), plus per-task incremental parquet writers.
+        self._run_date_id: str | None = None
+        self._task_parquet_writers: dict[str, _TaskParquetWriter] = {}
+
         if use_wandb is True:
             try:
                 import trackio as wandb
@@ -207,6 +224,13 @@ class EvaluationTracker:
                 resume="allow",
                 **wandb_kwargs,
             )
+
+    @property
+    def run_date_id(self) -> str:
+        """Date-id shared by every incremental streaming write and the final `save()` of this run."""
+        if self._run_date_id is None:
+            self._run_date_id = datetime.now().isoformat().replace(":", "-")
+        return self._run_date_id
 
     @property
     def results(self):
@@ -251,7 +275,7 @@ class EvaluationTracker:
     def save(self) -> None:
         """Saves the experiment information and results to files, and to the hub if requested."""
         logger.info("Saving experiment tracker")
-        date_id = datetime.now().isoformat().replace(":", "-")
+        date_id = self.run_date_id
 
         results_dict = self.results
 
@@ -363,6 +387,59 @@ class EvaluationTracker:
             output_file_details = output_dir_details_sub_folder / f"details_{task_name}_{date_id}.parquet"
             with self.fs.open(str(output_file_details), "wb") as f:
                 dataset.to_parquet(f)
+
+    @staticmethod
+    def _details_rows(details: list["DetailsLogger.Detail"]) -> list[dict]:
+        """Same column handling as `save()` (drop `id`, sort columns), but row-wise for incremental writes."""
+        rows = [asdict(detail) for detail in details]
+        if not rows:
+            return rows
+        columns = sorted(column for column in rows[0].keys() if column != "id")
+        return [{column: row[column] for column in columns} for row in rows]
+
+    def task_details_path(self, task_name: str) -> Path:
+        """Path to a task's incremental parquet file for the current run, once its writer has been closed."""
+        return self._get_details_sub_folder(self.run_date_id) / f"details_{task_name}_{self.run_date_id}.parquet"
+
+    def open_task_writer(self, task_name: str) -> None:
+        """Lazily opens the incremental parquet writer for a task's streamed details, if not already open."""
+        if not self.should_save_details or task_name in self._task_parquet_writers:
+            return
+        output_dir_details_sub_folder = self._get_details_sub_folder(self.run_date_id)
+        self.fs.mkdirs(output_dir_details_sub_folder, exist_ok=True)
+        output_file_details = output_dir_details_sub_folder / f"details_{task_name}_{self.run_date_id}.parquet"
+        handle = self.fs.open(str(output_file_details), "wb")
+        self._task_parquet_writers[task_name] = _TaskParquetWriter(handle=handle)
+
+    def write_task_batch(self, task_name: str, details: list["DetailsLogger.Detail"]) -> None:
+        """Appends one batch of doc-level details to the task's incremental parquet file."""
+        if not self.should_save_details or not details:
+            return
+        rows = self._details_rows(details)
+        self.open_task_writer(task_name)
+        writer_state = self._task_parquet_writers[task_name]
+        if writer_state.writer is None:
+            table = pa.Table.from_pylist(rows)
+            writer_state.schema = table.schema
+            writer_state.writer = pq.ParquetWriter(writer_state.handle, table.schema)
+        else:
+            table = pa.Table.from_pylist(rows, schema=writer_state.schema)
+        writer_state.writer.write_table(table)
+
+    def close_task_writer(self, task_name: str) -> None:
+        """Closes and evicts the incremental parquet writer for a task, if one was opened."""
+        writer_state = self._task_parquet_writers.pop(task_name, None)
+        if writer_state is None:
+            return
+        if writer_state.writer is not None:
+            writer_state.writer.close()
+        writer_state.handle.close()
+
+    def flush_task_docs(self, task_name: str) -> None:
+        """Drains the details logger's pending batch for a task and writes it, if non-empty."""
+        details = self.details_logger.flush_pending_batch(task_name)
+        if details:
+            self.write_task_batch(task_name, details)
 
     def generate_final_dict(self) -> dict:
         """Aggregates and returns all the logger's experiment information in a dictionary.

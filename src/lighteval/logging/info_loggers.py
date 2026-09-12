@@ -258,6 +258,75 @@ class DetailsLogger:
     )
     compiled_details_over_all_tasks: CompiledDetailOverAllTasks = field(default_factory=CompiledDetailOverAllTasks)
 
+    # Streaming path (used by RWKVPipeline): running counters + a small pending-write buffer per task,
+    # so that per-doc rollouts never accumulate in `details` for the lifetime of a task.
+    _task_stats: dict[str, dict[str, int]] = field(default_factory=dict)
+    _pending_batch: dict[str, list[Detail]] = field(default_factory=dict)
+
+    def log_streaming(
+        self,
+        task_name: str,
+        doc: Doc,
+        model_response: ModelResponse,
+        metrics: dict,
+    ) -> None:
+        """Streaming equivalent of `log()`: updates running truncation counters and queues the detail
+        for a small pending-write batch instead of appending it to the unbounded `details[task_name]` list.
+
+        Args:
+            task_name (str): Name of the current task of interest.
+            doc (Doc): Current sample that we want to store.
+            model_response (ModelResponse): Model outputs for the current sample.
+            metrics (dict): Model scores for said sample on the current task's metrics.
+        """
+        detail = self.Detail(doc, model_response, metrics)
+        self._pending_batch.setdefault(task_name, []).append(detail)
+
+        stats = self._task_stats.setdefault(task_name, {"n_samples": 0, "n_completions": 0, "n_truncated": 0})
+        stats["n_samples"] += 1
+        stats["n_completions"] += len(model_response.text)
+        stats["n_truncated"] += sum(reason == "length" for reason in model_response.finish_reasons)
+
+        hash = self.Hash()
+        hash.example = xxhash.xxh64(doc.query.encode()).hexdigest()
+        hash.input_tokens = xxhash.xxh64(str(model_response.input_tokens).encode()).hexdigest()
+        hash.cont_tokens = xxhash.xxh64(str(model_response.output_tokens).encode()).hexdigest()
+        self.hashes[task_name].append(hash)
+
+    def flush_pending_batch(self, task_name: str) -> list[Detail]:
+        """Pops and returns the pending streaming-write batch for a task, leaving it empty."""
+        return self._pending_batch.pop(task_name, [])
+
+    def finalize_task(self, task_name: str) -> None:
+        """Compiles `compiled_details`/`compiled_hashes` for a task from its running counters and hash
+        list, then evicts all per-task streaming state so it stops growing for the rest of the run.
+        """
+        hashes = self.hashes[task_name]
+        compiled_hash = self.CompiledHash()
+        compiled_hash.hash_examples = xxhash.xxh64("".join(sorted(h.example for h in hashes)).encode()).hexdigest()
+        compiled_hash.hash_full_prompts = xxhash.xxh64(
+            "".join(sorted(h.full_prompt for h in hashes)).encode()
+        ).hexdigest()
+        compiled_hash.hash_input_tokens = xxhash.xxh64(
+            "".join(sorted(h.input_tokens for h in hashes)).encode()
+        ).hexdigest()
+        compiled_hash.hash_cont_tokens = xxhash.xxh64(
+            "".join(sorted(h.cont_tokens for h in hashes)).encode()
+        ).hexdigest()
+        self.compiled_hashes[task_name] = compiled_hash
+
+        stats = self._task_stats.get(task_name, {"n_samples": 0, "n_completions": 0, "n_truncated": 0})
+        compiled = self.compiled_details[task_name]
+        compiled.hashes = asdict(compiled_hash)
+        compiled.n_samples = stats["n_samples"]
+        compiled.n_completions = stats["n_completions"]
+        compiled.n_truncated = stats["n_truncated"]
+        compiled.truncation_rate = compiled.n_truncated / compiled.n_completions if compiled.n_completions else 0.0
+
+        self._task_stats.pop(task_name, None)
+        self.hashes.pop(task_name, None)
+        self._pending_batch.pop(task_name, None)
+
     def log(
         self,
         task_name: str,

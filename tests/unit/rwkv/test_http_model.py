@@ -41,6 +41,7 @@ def test_model_uses_prompt_template_stops_and_preserves_document_order(template,
 
     class Pool:
         http_worker_limit = 5
+        aggregate_capacity = 5
 
         async def start(self):
             pass
@@ -113,6 +114,8 @@ def test_model_uses_prompt_template_stops_and_preserves_document_order(template,
 
 def test_model_records_context_limited_rollout_as_truncated():
     class Pool:
+        aggregate_capacity = 5
+
         async def start(self):
             pass
 
@@ -135,6 +138,92 @@ def test_model_records_context_limited_rollout_as_truncated():
     assert response.finish_reasons == ["length"]
     assert response.stop_reasons == ["context_length"]
     assert response.truncated_tokens_count == 1
+
+
+def test_generate_caps_concurrently_scheduled_jobs_at_pool_capacity():
+    class Pool:
+        aggregate_capacity = 3
+
+        def __init__(self):
+            self.in_flight = 0
+            self.peak_in_flight = 0
+
+        async def start(self):
+            pass
+
+        async def complete(self, messages, _parameters):
+            self.in_flight += 1
+            self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
+            await asyncio.sleep(0)
+            self.in_flight -= 1
+            content = messages[-1]["content"]
+            return Completion(
+                text=content,
+                reasoning=None,
+                finish_reason="stop",
+                stop_reason=None,
+                terminal_token_id=1,
+                prompt_text=content,
+                prompt_token_ids=(1,),
+                output_token_ids=(2,),
+            )
+
+    model = RWKVHttpModel.__new__(RWKVHttpModel)
+    pool = Pool()
+    model.pool = pool
+    model.prompt_manager = PromptManager(use_chat_template=True, tokenizer=None)
+    model._prompt_template = "bot"
+    model._template_stop = "✿"
+    model._cot_mode = "open_think"
+    model._generation_parameters = {}
+    model._cache = None
+    docs = [_document(f"doc{index}") for index in range(10)]
+
+    responses = asyncio.run(model.greedy_until(docs))
+
+    assert pool.peak_in_flight == pool.aggregate_capacity
+    assert [response.text for response in responses] == [[f"doc{index}"] for index in range(10)]
+
+
+def test_generate_cancels_in_flight_jobs_instead_of_leaking_pool_capacity():
+    class Pool:
+        aggregate_capacity = 2
+
+        def __init__(self):
+            self.in_flight = 0
+
+        async def start(self):
+            pass
+
+        async def complete(self, _messages, _parameters):
+            self.in_flight += 1
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                self.in_flight -= 1
+                raise
+
+    model = RWKVHttpModel.__new__(RWKVHttpModel)
+    pool = Pool()
+    model.pool = pool
+    model.prompt_manager = PromptManager(use_chat_template=True, tokenizer=None)
+    model._prompt_template = "bot"
+    model._template_stop = "✿"
+    model._cot_mode = "open_think"
+    model._generation_parameters = {}
+    model._cache = None
+    docs = [_document(f"doc{index}") for index in range(5)]
+
+    async def scenario():
+        task = asyncio.ensure_future(model.greedy_until(docs))
+        while pool.in_flight < pool.aggregate_capacity:
+            await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return pool.in_flight
+
+    assert asyncio.run(scenario()) == 0
 
 
 def test_model_fake_think_parameters_and_provenance(tmp_path, monkeypatch):
@@ -302,6 +391,8 @@ def test_async_model_cache_preserves_document_order_and_skips_completed_requests
     calls = []
 
     class Pool:
+        aggregate_capacity = 10
+
         async def start(self):
             pass
 
@@ -363,6 +454,7 @@ def test_async_model_cache_preserves_completed_documents_when_a_rollout_fails(tm
     class Pool:
         model_id = "served"
         manifest = SimpleNamespace(max_model_len=10240)
+        aggregate_capacity = 20
 
         def __init__(self):
             self.failed = True

@@ -16,7 +16,7 @@ languages:
 english
 
 tags:
-commonsense, multiple-choice
+commonsense, multiple-choice, field:reasoning
 
 paper:
 https://arxiv.org/abs/1907.10641

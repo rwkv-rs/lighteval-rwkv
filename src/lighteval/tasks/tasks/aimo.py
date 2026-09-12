@@ -12,7 +12,7 @@ languages:
 english
 
 tags:
-math, reasoning
+math, reasoning, field:math
 
 paper:
 """
@@ -45,7 +45,7 @@ task = LightevalTaskConfig(
     sample_fields=record_to_sample,
     solver=[generate(cache=True)],
     scorer=math_scorer(),
-    hf_subset="",
+    hf_subset="default",
     hf_repo="lighteval/aimo_progress_prize_1",
     hf_avail_splits=["train"],
     evaluation_splits=["train"],

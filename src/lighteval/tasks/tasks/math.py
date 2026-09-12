@@ -11,7 +11,7 @@ languages:
 english
 
 tags:
-math, reasoning
+math, reasoning, field:math
 
 paper:
 https://arxiv.org/abs/2305.20050

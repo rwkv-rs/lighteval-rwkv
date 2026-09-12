@@ -7,6 +7,7 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Awaitable, Callable
 
 from pydantic import Field
 
@@ -22,6 +23,10 @@ from .http_pool import Completion, ContextLengthError, PoolError, PoolManifest, 
 
 logger = logging.getLogger(__name__)
 MAX_NEW_TOKENS = 8192
+# How many freshly-generated (doc, response) pairs to accumulate before calling
+# `SampleCache.cache_samples()`, which reads-back + rewrites the whole task cache file on every
+# call. Scoring itself is NOT gated by this batch size - only this cache write is.
+STREAMING_FLUSH_BATCH_SIZE = 64
 REQUEST_CONTRACT_VERSION = "rwkv-generation-v2"
 CACHE_POOL_FINGERPRINT = "transport-independent"
 PROMPT_TEMPLATES: dict[str, tuple[str, str]] = {
@@ -140,9 +145,14 @@ class RWKVHttpModel(LightevalModel):
     def max_length(self) -> int:
         return self.pool.manifest.max_model_len
 
-    async def greedy_until(self, docs: list[Doc]) -> list[ModelResponse]:
+    async def greedy_until(  # noqa: C901
+        self,
+        docs: list[Doc],
+        *,
+        on_document_ready: Callable[[Doc, ModelResponse], Awaitable[None]] | None = None,
+    ) -> list[ModelResponse]:
         if self._cache is None:
-            return await self._generate(docs)
+            return await self._generate(docs, on_document_ready=on_document_ready)
         num_samples = {doc.num_samples for doc in docs}
         if len(num_samples) > 1:
             grouped: dict[int, list[tuple[int, Doc]]] = {}
@@ -151,7 +161,8 @@ class RWKVHttpModel(LightevalModel):
             results: dict[int, ModelResponse] = {}
             for entries in grouped.values():
                 indices, group_docs = zip(*entries, strict=True)
-                for index, result in zip(indices, await self.greedy_until(list(group_docs)), strict=True):
+                sub_results = await self.greedy_until(list(group_docs), on_document_ready=on_document_ready)
+                for index, result in zip(indices, sub_results, strict=True):
                     results[index] = result
             return [results[index] for index in range(len(docs))]
         cache = self._cache_for_num_samples(next(iter(num_samples), 1))
@@ -160,16 +171,18 @@ class RWKVHttpModel(LightevalModel):
         if pending:
             if os.environ.get("RWKV_EVAL_CACHE_ONLY") == "1":
                 raise ValueError("cache-only evaluation found uncached RWKV rollouts")
-            results = await self._generate(pending, cache=cache)
-            cache.cache_samples(
-                docs=pending,
-                results=results,
-                task_ids=task_ids,
-                sampling_method=SamplingMethod.GENERATIVE,
-            )
+            # `_generate` scores/caches freshly-generated docs itself as each one completes.
+            await self._generate(pending, cache=cache, on_document_ready=on_document_ready)
         results = list(cache.get_samples_from_cache(docs, task_ids, SamplingMethod.GENERATIVE))
         if any(result is None for result in results):
             raise ValueError("Problem while loading and aggregating items from cache.")
+        if on_document_ready is not None:
+            pending_ids = {id(doc) for doc in pending}
+            for doc, result in zip(docs, results, strict=True):
+                if id(doc) not in pending_ids:
+                    # Cache hit (resume/rerun): never went through `_generate`, so it hasn't been
+                    # scored/streamed yet.
+                    await on_document_ready(doc, result)
         return results
 
     def pending_rollouts(self, docs: list[Doc]) -> int:
@@ -202,9 +215,15 @@ class RWKVHttpModel(LightevalModel):
                 caches[num_samples]._init_registry(self._cache.registry)
         return caches[num_samples]
 
-    async def _generate(self, docs: list[Doc], *, cache: SampleCache | None = None) -> list[ModelResponse]:  # noqa: C901
+    async def _generate(  # noqa: C901
+        self,
+        docs: list[Doc],
+        *,
+        cache: SampleCache | None = None,
+        on_document_ready: Callable[[Doc, ModelResponse], Awaitable[None]] | None = None,
+    ) -> list[ModelResponse]:
         jobs: list[_Job] = []
-        response_slots: list[list[Completion | None]] = []
+        response_slots: list[list[Completion | None] | None] = []
         for document_index, doc in enumerate(docs):
             if doc.use_logits:
                 raise ValueError("RWKV HTTP evaluation does not support generation logits")
@@ -234,6 +253,54 @@ class RWKVHttpModel(LightevalModel):
                         parameters=parameters,
                     )
                 )
+
+        responses: list[ModelResponse | None] = [None] * len(docs)
+        pending_cache_docs: list[Doc] = []
+        pending_cache_results: list[ModelResponse] = []
+
+        def flush_cache_buffer() -> None:
+            if cache is None or not pending_cache_docs:
+                return
+            task_ids = {cache.get_task_id(doc.task_name, SamplingMethod.GENERATIVE) for doc in pending_cache_docs}
+            cache.cache_samples(
+                docs=list(pending_cache_docs),
+                results=list(pending_cache_results),
+                task_ids=task_ids,
+                sampling_method=SamplingMethod.GENERATIVE,
+            )
+            pending_cache_docs.clear()
+            pending_cache_results.clear()
+
+        async def finalize_document(document_index: int) -> None:
+            completions = response_slots[document_index]
+            prompt_text = completions[0].prompt_text
+            prompt_tokens = completions[0].prompt_token_ids
+            if any(
+                completion.prompt_text != prompt_text or completion.prompt_token_ids != prompt_tokens
+                for completion in completions
+            ):
+                raise RuntimeError("RWKV HTTP replicas rendered different model inputs")
+            response = ModelResponse(
+                input=prompt_text,
+                input_tokens=list(prompt_tokens),
+                text=[completion.text for completion in completions],
+                reasonings=[completion.reasoning for completion in completions],
+                finish_reasons=[completion.finish_reason for completion in completions],
+                stop_reasons=[completion.stop_reason for completion in completions],
+                terminal_token_ids=[completion.terminal_token_id for completion in completions],
+                output_tokens=[list(completion.output_token_ids) for completion in completions],
+                truncated_tokens_count=sum(completion.finish_reason == "length" for completion in completions),
+            )
+            responses[document_index] = response
+            response_slots[document_index] = None  # free the raw per-rollout completions now that they're packed
+            doc = docs[document_index]
+            if cache is not None:
+                pending_cache_docs.append(doc)
+                pending_cache_results.append(response)
+                if len(pending_cache_docs) >= STREAMING_FLUSH_BATCH_SIZE:
+                    flush_cache_buffer()
+            if on_document_ready is not None:
+                await on_document_ready(doc, response)
 
         failure: BaseException | None = None
         if jobs:
@@ -267,57 +334,69 @@ class RWKVHttpModel(LightevalModel):
                         f"{task_name} document {job.document_index} rollout {job.sample_index}: {error}"
                     ) from error
 
-            requests = [asyncio.create_task(execute(job)) for job in jobs]
-            try:
-                completions = await asyncio.gather(*requests)
-            except BaseException as error:
-                failure = error
-                for request in requests:
-                    request.cancel()
-                completions = await asyncio.gather(*requests, return_exceptions=True)
-            for job, completion in zip(jobs, completions):
-                if isinstance(completion, BaseException):
-                    continue
-                response_slots[job.document_index][job.sample_index] = completion
+            # Cap concurrently-live jobs at the pool's own capacity: the HTTP layer already
+            # refuses to run more than `aggregate_capacity` requests at once, so pre-creating one
+            # asyncio.Task (and its captured prompt messages) per (doc, rollout) pair regardless of
+            # doc count only wastes memory on tasks parked on CapacityScheduler.acquire().
+            job_iter = iter(jobs)
+            max_in_flight = self.pool.aggregate_capacity
+            request_jobs: dict[asyncio.Task, _Job] = {}
+            pending_requests: set[asyncio.Task] = set()
 
-        responses: list[ModelResponse] = []
-        completed_docs: list[Doc] = []
-        for document_index, slots in enumerate(response_slots):
-            if any(completion is None for completion in slots):
+            def schedule_next() -> None:
                 if failure is not None:
-                    continue
-                raise RuntimeError("RWKV HTTP evaluation returned incomplete samples")
-            completions = [completion for completion in slots if completion is not None]
-            prompt_text = completions[0].prompt_text
-            prompt_tokens = completions[0].prompt_token_ids
-            if any(
-                completion.prompt_text != prompt_text or completion.prompt_token_ids != prompt_tokens
-                for completion in completions
-            ):
-                raise RuntimeError("RWKV HTTP replicas rendered different model inputs")
-            responses.append(
-                ModelResponse(
-                    input=prompt_text,
-                    input_tokens=list(prompt_tokens),
-                    text=[completion.text for completion in completions],
-                    reasonings=[completion.reasoning for completion in completions],
-                    finish_reasons=[completion.finish_reason for completion in completions],
-                    stop_reasons=[completion.stop_reason for completion in completions],
-                    terminal_token_ids=[completion.terminal_token_id for completion in completions],
-                    output_tokens=[list(completion.output_token_ids) for completion in completions],
-                    truncated_tokens_count=sum(completion.finish_reason == "length" for completion in completions),
-                )
-            )
-            completed_docs.append(docs[document_index])
+                    return
+                job = next(job_iter, None)
+                if job is None:
+                    return
+                task = asyncio.create_task(execute(job))
+                request_jobs[task] = job
+                pending_requests.add(task)
+
+            for _ in range(max_in_flight):
+                schedule_next()
+
+            try:
+                while pending_requests:
+                    done, pending_requests = await asyncio.wait(
+                        pending_requests, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for request in done:
+                        job = request_jobs.pop(request)
+                        try:
+                            completion = request.result()
+                        except BaseException as error:
+                            if failure is None:
+                                failure = error
+                                for other in pending_requests:
+                                    other.cancel()
+                            continue
+                        slots = response_slots[job.document_index]
+                        slots[job.sample_index] = completion
+                        if all(slot is not None for slot in slots):
+                            await finalize_document(job.document_index)
+                    for _ in range(len(done)):
+                        schedule_next()
+            finally:
+                # A cancellation (e.g. the pipeline tearing down after an unrelated task
+                # failure) interrupts the `asyncio.wait` above without touching the jobs it
+                # was waiting on: they are independent tasks, not children of this coroutine,
+                # so they would otherwise keep running detached and hold the pool's inflight
+                # count above zero, tripping RWKVHttpPool.aclose()'s active-request guard and
+                # masking whatever exception actually triggered the teardown.
+                if pending_requests:
+                    for request in pending_requests:
+                        request.cancel()
+                    await asyncio.gather(*pending_requests, return_exceptions=True)
+
         if failure is not None:
-            if cache is not None and completed_docs:
-                cache.cache_samples(
-                    docs=completed_docs,
-                    results=responses,
-                    task_ids={cache.get_task_id(doc.task_name, SamplingMethod.GENERATIVE) for doc in completed_docs},
-                    sampling_method=SamplingMethod.GENERATIVE,
-                )
+            flush_cache_buffer()
             raise failure
+
+        if any(response is None for response in responses):
+            raise RuntimeError("RWKV HTTP evaluation returned incomplete samples")
+
+        flush_cache_buffer()
         return responses
 
     @staticmethod

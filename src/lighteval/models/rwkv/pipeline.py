@@ -3,18 +3,26 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
+import hashlib
+import json
 import logging
 import queue
 import threading
+import time
 from collections import defaultdict
+from contextlib import contextmanager
 from copy import copy
+from pathlib import Path
 from typing import Mapping
 
 import typer
+from datasets import config as datasets_config
 
+from lighteval.metrics import apply_metric
 from lighteval.metrics.metrics_sample import SampleLevelComputation, SamplingMetric
 from lighteval.metrics.utils.metric_utils import SampleLevelMetric
-from lighteval.models.rwkv.http_model import MAX_NEW_TOKENS
+from lighteval.models.rwkv.http_model import MAX_NEW_TOKENS, STREAMING_FLUSH_BATCH_SIZE
 from lighteval.pipeline import Pipeline
 from lighteval.tasks.registry import Registry
 from lighteval.tasks.requests import Doc, SamplingMethod
@@ -31,6 +39,46 @@ _TARGET_COMPLETIONS = 4096
 _MIN_COMPLETIONS = 3000
 _MAX_COMPLETIONS = 6000
 logger = logging.getLogger(__name__)
+
+
+def _dataset_cache_key(task) -> str:
+    identity = json.dumps(
+        {
+            "data_files": task.data_files,
+            "dataset_config_name": task.dataset_config_name,
+            "dataset_path": task.dataset_path,
+            "dataset_revision": task.dataset_revision,
+        },
+        default=str,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(identity.encode()).hexdigest()
+
+
+@contextmanager
+def _dataset_cache_lock(task):
+    key = _dataset_cache_key(task)
+    lock_dir = Path(datasets_config.HF_DATASETS_CACHE) / ".rwkv-locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    started_at = time.monotonic()
+    with (lock_dir / key).open("a+b") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        logger.info(
+            "RWKV dataset cache lock acquired: task=%s key=%s wait_seconds=%.3f",
+            task.full_name,
+            key[:12],
+            time.monotonic() - started_at,
+        )
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file, fcntl.LOCK_UN)
+
+
+def _download_dataset(task):
+    with _dataset_cache_lock(task):
+        return task.download_dataset_worker(task)
 
 
 def _open_think_answer(text: str) -> str:
@@ -222,6 +270,9 @@ class RWKVPipeline(Pipeline):
         self.sampling_docs = defaultdict(list)
         self.task_callback = None
         self._datasets_loaded = 0
+        # Streaming scoring path: counts docs written into DetailsLogger's pending batch per task,
+        # since each doc is scored as soon as its k rollouts arrive rather than once per task.
+        self._pending_flush_counts: dict[str, int] = defaultdict(int)
         if self._metric_options:
             self._update_num_samples(list(self.tasks_dict.values()))
 
@@ -334,16 +385,7 @@ class RWKVPipeline(Pipeline):
         # while one background event loop continues dataset and HTTP work.
         def run_evaluation() -> None:
             try:
-                asyncio.run(
-                    self._evaluate_tasks(
-                        lambda task_name, sampling_docs, outputs: self._submit_score(
-                            scoring_queue,
-                            task_name,
-                            sampling_docs,
-                            outputs,
-                        )
-                    )
-                )
+                asyncio.run(self._evaluate_tasks(scoring_queue))
             except BaseException as error:
                 evaluation_errors.append(error)
             finally:
@@ -353,10 +395,13 @@ class RWKVPipeline(Pipeline):
         evaluation_thread.start()
         scoring_error = None
         while (scoring := scoring_queue.get()) is not None:
-            task_name, sampling_docs, outputs, future = scoring
+            kind, task_name, doc, response, future = scoring
             if scoring_error is None:
                 try:
-                    self._score_task(task_name, sampling_docs, outputs)
+                    if kind == "doc":
+                        self._score_doc(task_name, doc, response)
+                    else:
+                        self._finalize_task(task_name)
                 except BaseException as error:
                     scoring_error = error
             self._resolve_score_threadsafe(future, scoring_error)
@@ -373,7 +418,7 @@ class RWKVPipeline(Pipeline):
         if self.is_main_process():
             self._finalize_metrics()
 
-    async def _evaluate_tasks(self, score_task) -> None:  # noqa: C901
+    async def _evaluate_tasks(self, scoring_queue) -> None:  # noqa: C901
         load_semaphore = asyncio.Semaphore(min(self._DATASET_LOADERS, len(self._task_names)))
         scoring_tasks: set[asyncio.Task] = set()
         scoring_failures: list[BaseException] = []
@@ -381,7 +426,7 @@ class RWKVPipeline(Pipeline):
         async def prepare_task(task_name):
             async with load_semaphore:
                 task = self.tasks_dict[task_name]
-                dataset = await asyncio.to_thread(task.download_dataset_worker, task)
+                dataset = await asyncio.to_thread(_download_dataset, task)
                 self._datasets_loaded += 1
                 logger.info("RWKV dataset ready: task=%s", task_name)
                 if self._datasets_loaded == len(self._task_names):
@@ -393,18 +438,21 @@ class RWKVPipeline(Pipeline):
             return task_name, docs, self.model.pending_rollouts(docs)
 
         async def evaluate_task(task_name, docs, pending_rollouts) -> None:
-            sampling_docs = defaultdict(list)
-            for doc in docs:
-                for sampling_method in doc.sampling_methods:
-                    sampling_docs[sampling_method].append(doc)
             logger.info(
                 "RWKV task model call started: task=%s documents=%d pending_rollouts=%d",
                 task_name,
                 len(docs),
                 pending_rollouts,
             )
-            outputs = {SamplingMethod.GENERATIVE: await self.model.greedy_until(docs)}
-            scoring_task = asyncio.create_task(score_task(task_name, sampling_docs, outputs))
+
+            async def on_document_ready(doc, response) -> None:
+                await self._submit_doc(scoring_queue, task_name, doc, response)
+
+            async def run_task() -> None:
+                await self.model.greedy_until(docs, on_document_ready=on_document_ready)
+                await self._submit_task_done(scoring_queue, task_name)
+
+            scoring_task = asyncio.create_task(run_task())
             scoring_tasks.add(scoring_task)
             running.append(scoring_task)
 
@@ -523,9 +571,15 @@ class RWKVPipeline(Pipeline):
             await self.model.acleanup()
 
     @staticmethod
-    async def _submit_score(scoring_queue, task_name, sampling_docs, outputs) -> None:
+    async def _submit_doc(scoring_queue, task_name, doc, response) -> None:
         future = asyncio.get_running_loop().create_future()
-        scoring_queue.put((task_name, sampling_docs, outputs, future))
+        scoring_queue.put(("doc", task_name, doc, response, future))
+        await future
+
+    @staticmethod
+    async def _submit_task_done(scoring_queue, task_name) -> None:
+        future = asyncio.get_running_loop().create_future()
+        scoring_queue.put(("task_done", task_name, None, None, future))
         await future
 
     @staticmethod
@@ -543,9 +597,27 @@ class RWKVPipeline(Pipeline):
         if not loop.is_closed():
             loop.call_soon_threadsafe(cls._resolve_score, future, error)
 
-    def _score_task(self, task_name, sampling_docs, outputs) -> None:
-        self.sampling_docs = sampling_docs
-        self._post_process_outputs(outputs)
-        self._compute_metrics(outputs)
+    def _score_doc(self, task_name: str, doc: Doc, response) -> None:
+        sampling_method_responses = {SamplingMethod.GENERATIVE: [response]}
+        self.sampling_docs = {SamplingMethod.GENERATIVE: [doc]}
+        self._post_process_outputs(sampling_method_responses)
+        task = self.tasks_dict[task_name]
+        metric_category_metrics = [
+            metric for metric in task.metrics if metric.category == SamplingMethod.GENERATIVE
+        ]
+        outputs = apply_metric(docs=[doc], responses=[response], metrics=metric_category_metrics)
+        output = outputs[0]
+        self.evaluation_tracker.metrics_logger.log(task_name, output)
+        self.evaluation_tracker.details_logger.log_streaming(task_name, doc, response, output)
+        self._pending_flush_counts[task_name] += 1
+        if self._pending_flush_counts[task_name] >= STREAMING_FLUSH_BATCH_SIZE:
+            self.evaluation_tracker.flush_task_docs(task_name)
+            self._pending_flush_counts[task_name] = 0
+
+    def _finalize_task(self, task_name: str) -> None:
+        self.evaluation_tracker.flush_task_docs(task_name)
+        self._pending_flush_counts.pop(task_name, None)
+        self.evaluation_tracker.close_task_writer(task_name)
+        self.evaluation_tracker.details_logger.finalize_task(task_name)
         if self.task_callback is not None:
-            self.task_callback(task_name, self.evaluation_tracker.details_logger.details[task_name])
+            self.task_callback(task_name)

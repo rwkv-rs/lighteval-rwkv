@@ -1,6 +1,9 @@
 import asyncio
+import multiprocessing
+import queue
 import threading
 from collections import defaultdict
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +21,19 @@ from lighteval.tasks.tasks.ifbench.instructions import (
     NGramOverlapChecker,
     ParagraphLastFirstWordMatchChecker,
 )
+
+
+@pytest.fixture(autouse=True)
+def _bypass_dataset_cache_lock(request, monkeypatch):
+    """Streaming-scheduling tests don't exercise the cross-process dataset cache lock
+    itself (that's covered by the two `test_dataset_cache_lock_*` tests below, via real
+    `fcntl.flock` and separate processes); going through it here would make task
+    preparation order depend on real filesystem lock-acquisition timing instead of the
+    scheduling logic under test.
+    """
+    if "dataset_cache_lock" in request.node.name:
+        return
+    monkeypatch.setattr(rwkv_pipeline, "_download_dataset", lambda task: task.download_dataset_worker(task))
 
 
 def _streaming_pipeline(task_names, model, download, *, max_samples):
@@ -53,14 +69,107 @@ def _streaming_pipeline(task_names, model, download, *, max_samples):
             sampling_methods=[SamplingMethod.GENERATIVE],
         )
     ]
+    pipeline._pending_flush_counts = defaultdict(int)
+    pipeline.task_callback = None
     return pipeline
 
 
-async def _evaluate_streaming_pipeline(pipeline):
-    async def score(task_name, sampling_docs, outputs):
-        pipeline._score_task(task_name, sampling_docs, outputs)
+def _hold_dataset_cache_lock(cache_dir, data_file, acquired, release, fail=False):
+    rwkv_pipeline.datasets_config.HF_DATASETS_CACHE = Path(cache_dir)
+    task = SimpleNamespace(
+        full_name=data_file,
+        dataset_path="dataset",
+        dataset_config_name=None,
+        dataset_revision=None,
+        data_files={"validation": data_file},
+    )
+    try:
+        with rwkv_pipeline._dataset_cache_lock(task):
+            acquired.set()
+            if fail:
+                raise RuntimeError("dataset load failed")
+            release.wait(5)
+    except RuntimeError:
+        pass
 
-    await pipeline._evaluate_tasks(score)
+
+@pytest.mark.parametrize(("second_data_file", "blocked"), [("same", True), ("other", False)])
+def test_dataset_cache_lock_is_keyed_across_processes(tmp_path, second_data_file, blocked):
+    context = multiprocessing.get_context("fork")
+    first_acquired = context.Event()
+    second_acquired = context.Event()
+    release = context.Event()
+    first = context.Process(target=_hold_dataset_cache_lock, args=(tmp_path, "same", first_acquired, release))
+    second = context.Process(
+        target=_hold_dataset_cache_lock,
+        args=(tmp_path, second_data_file, second_acquired, release),
+    )
+    first.start()
+    assert first_acquired.wait(2)
+    second.start()
+
+    assert second_acquired.wait(0.2) is not blocked
+    release.set()
+    assert second_acquired.wait(2)
+    first.join(2)
+    second.join(2)
+    assert (first.exitcode, second.exitcode) == (0, 0)
+
+
+def test_dataset_cache_lock_is_released_after_failure(tmp_path):
+    context = multiprocessing.get_context("fork")
+    failed_acquired = context.Event()
+    acquired = context.Event()
+    release = context.Event()
+    failed = context.Process(
+        target=_hold_dataset_cache_lock,
+        args=(tmp_path, "same", failed_acquired, release, True),
+    )
+    retry = context.Process(target=_hold_dataset_cache_lock, args=(tmp_path, "same", acquired, release))
+
+    failed.start()
+    assert failed_acquired.wait(2)
+    failed.join(2)
+    assert failed.exitcode == 0
+    retry.start()
+    assert acquired.wait(2)
+    release.set()
+    retry.join(2)
+    assert retry.exitcode == 0
+
+
+async def _evaluate_streaming_pipeline(pipeline):
+    """Drive `_evaluate_tasks` through a real scoring queue, mirroring `evaluate()`'s drain loop."""
+    scoring_queue = queue.Queue()
+    evaluation_errors = []
+
+    async def run_evaluation():
+        try:
+            await pipeline._evaluate_tasks(scoring_queue)
+        except BaseException as error:
+            evaluation_errors.append(error)
+        finally:
+            scoring_queue.put(None)
+
+    evaluation_task = asyncio.create_task(run_evaluation())
+    loop = asyncio.get_running_loop()
+    scoring_error = None
+    while (scoring := await loop.run_in_executor(None, scoring_queue.get)) is not None:
+        kind, task_name, doc, response, future = scoring
+        if scoring_error is None:
+            try:
+                if kind == "doc":
+                    pipeline._score_doc(task_name, doc, response)
+                else:
+                    pipeline._finalize_task(task_name)
+            except BaseException as error:
+                scoring_error = error
+        pipeline._resolve_score_threadsafe(future, scoring_error)
+    await evaluation_task
+    if scoring_error is not None:
+        raise scoring_error
+    if evaluation_errors:
+        raise evaluation_errors[0]
 
 
 def test_rwkv_pipeline_starts_ready_selector_before_all_datasets_finish(monkeypatch):
@@ -80,7 +189,7 @@ def test_rwkv_pipeline_starts_ready_selector_before_all_datasets_finish(monkeypa
         def pending_rollouts(self, docs):
             return sum(doc.num_samples for doc in docs)
 
-        async def greedy_until(self, docs):
+        async def greedy_until(self, docs, on_document_ready=None):
             calls.append(docs[0].task_name)
             return []
 
@@ -97,7 +206,7 @@ def test_rwkv_pipeline_starts_ready_selector_before_all_datasets_finish(monkeypa
             sampling_methods=[SamplingMethod.GENERATIVE],
         )
     ]
-    pipeline._score_task = lambda *_args: None
+    pipeline._finalize_task = lambda *_args: None
     monkeypatch.setattr(rwkv_pipeline, "_configure_task_evaluation_plan", lambda _pipeline, _task, docs: docs)
 
     async def run():
@@ -127,7 +236,7 @@ def test_cached_selector_does_not_consume_a_rollout_slot(monkeypatch):
         def pending_rollouts(self, docs):
             return {"cached|0": 0, "small|0": 10, "spare|0": 20}[docs[0].task_name]
 
-        async def greedy_until(self, docs):
+        async def greedy_until(self, docs, on_document_ready=None):
             calls.append(docs[0].task_name)
             await release.wait()
             return []
@@ -141,7 +250,7 @@ def test_cached_selector_does_not_consume_a_rollout_slot(monkeypatch):
         lambda task_name: task_name,
         max_samples=10,
     )
-    pipeline._score_task = lambda *_args: None
+    pipeline._finalize_task = lambda *_args: None
     monkeypatch.setattr(rwkv_pipeline, "_configure_task_evaluation_plan", lambda _pipeline, _task, docs: docs)
 
     async def run():
@@ -176,7 +285,7 @@ def test_cached_selector_bypasses_full_rollout_slots(monkeypatch):
         def pending_rollouts(self, docs):
             return 0 if docs[0].task_name == "cached|0" else 10
 
-        async def greedy_until(self, docs):
+        async def greedy_until(self, docs, on_document_ready=None):
             calls.append(docs[0].task_name)
             if len(calls) == 2:
                 rollout_slots_full.set()
@@ -189,7 +298,7 @@ def test_cached_selector_bypasses_full_rollout_slots(monkeypatch):
             pass
 
     pipeline = _streaming_pipeline(("cached|0", "first|0", "second|0"), Model(), download, max_samples=10)
-    pipeline._score_task = lambda *_args: None
+    pipeline._finalize_task = lambda *_args: None
     monkeypatch.setattr(rwkv_pipeline, "_configure_task_evaluation_plan", lambda _pipeline, _task, docs: docs)
 
     async def run():
@@ -217,7 +326,7 @@ def test_pending_scoring_releases_generation_slots_without_finishing_evaluation(
     calls = []
 
     class Model:
-        async def greedy_until(self, docs):
+        async def greedy_until(self, docs, on_document_ready=None):
             calls.append(docs[0].task_name)
             return []
 
@@ -230,13 +339,21 @@ def test_pending_scoring_releases_generation_slots_without_finishing_evaluation(
     async def run():
         release = asyncio.Event()
         all_generated = asyncio.Event()
+        scoring_queue = queue.Queue()
 
-        async def score(*_args):
-            if len(calls) == 3:
-                all_generated.set()
+        async def drain():
+            loop = asyncio.get_running_loop()
+            futures = []
+            while len(futures) < 3:
+                scoring = await loop.run_in_executor(None, scoring_queue.get)
+                futures.append(scoring[-1])
+            all_generated.set()
             await release.wait()
+            for future in futures:
+                pipeline._resolve_score_threadsafe(future, None)
 
-        evaluation = asyncio.create_task(pipeline._evaluate_tasks(score))
+        evaluation = asyncio.create_task(pipeline._evaluate_tasks(scoring_queue))
+        drain_task = asyncio.create_task(drain())
         try:
             await asyncio.wait_for(all_generated.wait(), 2)
             assert set(calls) == {"first|0", "second|0", "third|0"}
@@ -244,6 +361,7 @@ def test_pending_scoring_releases_generation_slots_without_finishing_evaluation(
         finally:
             release.set()
             await evaluation
+            await drain_task
 
     asyncio.run(run())
 
@@ -294,11 +412,13 @@ def test_rwkv_pipeline_runs_scorer_on_process_main_thread():
     pipeline.is_main_process = lambda: False
     score_threads = []
 
-    async def evaluate_tasks(score):
-        await score("task|0", {}, {})
+    async def evaluate_tasks(scoring_queue):
+        future = asyncio.get_running_loop().create_future()
+        scoring_queue.put(("doc", "task|0", None, None, future))
+        await future
 
     pipeline._evaluate_tasks = evaluate_tasks
-    pipeline._score_task = lambda *_args: score_threads.append(threading.current_thread())
+    pipeline._score_doc = lambda *_args: score_threads.append(threading.current_thread())
 
     pipeline.evaluate()
 
@@ -313,7 +433,7 @@ def test_rwkv_pipeline_scores_only_after_every_rollout_finishes(monkeypatch):
     class Model:
         pool = SimpleNamespace(http_worker_limit=4)
 
-        async def greedy_until(self, _docs):
+        async def greedy_until(self, _docs, on_document_ready=None):
             first_rollouts_done.set()
             await pending_rollout.wait()
             return []
@@ -329,7 +449,7 @@ def test_rwkv_pipeline_scores_only_after_every_rollout_finishes(monkeypatch):
             sampling_methods=[SamplingMethod.GENERATIVE],
         )
     ]
-    pipeline._score_task = lambda *_args: scored.append("task|0")
+    pipeline._finalize_task = lambda task_name: scored.append(task_name)
     monkeypatch.setattr(rwkv_pipeline, "_configure_task_evaluation_plan", lambda _pipeline, _task, docs: docs)
 
     async def run():
@@ -349,7 +469,7 @@ def test_rwkv_pipeline_scoring_failure_cancels_other_tasks(monkeypatch):
     class Model:
         pool = SimpleNamespace(http_worker_limit=2)
 
-        async def greedy_until(self, docs):
+        async def greedy_until(self, docs, on_document_ready=None):
             if docs[0].task_name == "failed|0":
                 await second_started.wait()
                 return []
@@ -369,7 +489,7 @@ def test_rwkv_pipeline_scoring_failure_cancels_other_tasks(monkeypatch):
         lambda task_name: task_name,
         max_samples=1,
     )
-    pipeline._score_task = lambda task_name, *_args: (_ for _ in ()).throw(ValueError(task_name))
+    pipeline._finalize_task = lambda task_name: (_ for _ in ()).throw(ValueError(task_name))
     monkeypatch.setattr(rwkv_pipeline, "_configure_task_evaluation_plan", lambda _pipeline, _task, docs: docs)
 
     with pytest.raises(ValueError, match=r"failed\|0"):

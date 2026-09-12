@@ -12,7 +12,7 @@ languages:
 english
 
 tags:
-factuality, qa
+factuality, qa, field:knowledge
 
 paper:
 https://arxiv.org/abs/2109.07958
