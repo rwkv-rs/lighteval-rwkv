@@ -632,6 +632,7 @@ def test_scoreboard_publication_keeps_only_evaluation_facts(tmp_path, monkeypatc
     tracker.metrics_logger.log("gsm8k|0", detail.metric)
 
     callback("gsm8k|0")
+    callback.wait()
 
     publication_request = next(request for request in requests if request.method == "PUT")
     publication = json.loads(gzip.decompress(publication_request.data))

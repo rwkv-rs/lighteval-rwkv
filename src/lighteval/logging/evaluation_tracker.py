@@ -100,6 +100,8 @@ class _TaskParquetWriter:
     """Incremental per-task parquet writer state used by the streaming details path."""
 
     handle: IO[bytes]
+    temporary_path: Path
+    final_path: Path
     writer: pq.ParquetWriter | None = None
     schema: pa.Schema | None = None
 
@@ -407,9 +409,14 @@ class EvaluationTracker:
             return
         output_dir_details_sub_folder = self._get_details_sub_folder(self.run_date_id)
         self.fs.mkdirs(output_dir_details_sub_folder, exist_ok=True)
-        output_file_details = output_dir_details_sub_folder / f"details_{task_name}_{self.run_date_id}.parquet"
-        handle = self.fs.open(str(output_file_details), "wb")
-        self._task_parquet_writers[task_name] = _TaskParquetWriter(handle=handle)
+        final_path = output_dir_details_sub_folder / f"details_{task_name}_{self.run_date_id}.parquet"
+        temporary_path = final_path.with_name(final_path.name + ".partial")
+        handle = self.fs.open(str(temporary_path), "wb")
+        self._task_parquet_writers[task_name] = _TaskParquetWriter(
+            handle=handle,
+            temporary_path=temporary_path,
+            final_path=final_path,
+        )
 
     def write_task_batch(self, task_name: str, details: list["DetailsLogger.Detail"]) -> None:
         """Appends one batch of doc-level details to the task's incremental parquet file."""
@@ -434,6 +441,17 @@ class EvaluationTracker:
         if writer_state.writer is not None:
             writer_state.writer.close()
         writer_state.handle.close()
+        self.fs.mv(str(writer_state.temporary_path), str(writer_state.final_path))
+
+    def abort_task_writers(self) -> None:
+        """Close and remove details files for tasks that did not reach their completion boundary."""
+        for task_name in tuple(self._task_parquet_writers):
+            writer_state = self._task_parquet_writers.pop(task_name)
+            if writer_state.writer is not None:
+                writer_state.writer.close()
+            writer_state.handle.close()
+            if self.fs.exists(str(writer_state.temporary_path)):
+                self.fs.rm(str(writer_state.temporary_path))
 
     def flush_task_docs(self, task_name: str) -> None:
         """Drains the details logger's pending batch for a task and writes it, if non-empty."""

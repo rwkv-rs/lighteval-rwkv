@@ -9,8 +9,10 @@ import json
 import logging
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Lock
 from urllib.parse import quote, urlsplit
 
 import httpx
@@ -125,6 +127,9 @@ class ScoreboardCallback:
         self._rerun_reason = rerun_reason
         self._selector_completed: dict[str, set[str]] = {}
         self.publication_errors: list[tuple[str, str]] = []
+        self._publication_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="rwkv-scoreboard")
+        self._publication_futures = []
+        self._publication_errors_lock = Lock()
         preflight = self._request("GET", "/api/v1/evaluation-publication-preflight")
         expected_schema = "scoreboard-v1"
         if preflight.get("schema_version") != expected_schema:
@@ -197,12 +202,45 @@ class ScoreboardCallback:
         if any(expected_task not in completed for expected_task in expected):
             return
         try:
-            self._publish_selector(selector, expected)
+            executor = getattr(self, "_publication_executor", None)
+            if executor is None:
+                self._publish_selector(selector, expected)
+            else:
+                future = executor.submit(self._publish_selector, selector, expected)
+                self._publication_futures.append((selector, future))
         except ValueError as error:
-            self.publication_errors.append((selector, str(error)))
-            logger.error("Scoreboard publication deferred: selector=%s error=%s", selector, error)
+            self._record_publication_error(selector, error)
         finally:
             del self._selector_completed[selector]
+
+    def _record_publication_error(self, selector: str, error: ValueError) -> None:
+        lock = getattr(self, "_publication_errors_lock", None)
+        if lock is None:
+            lock = Lock()
+        with lock:
+            self.publication_errors.append((selector, str(error)))
+        logger.error("Scoreboard publication deferred: selector=%s error=%s", selector, error)
+
+    def wait(self) -> None:
+        """Wait for all queued publications without blocking generation or scoring."""
+        executor = getattr(self, "_publication_executor", None)
+        if executor is None:
+            return
+        self._publication_executor = None
+        executor.shutdown(wait=True)
+        unexpected_error = None
+        for selector, future in self._publication_futures:
+            try:
+                future.result()
+            except ValueError as error:
+                self._record_publication_error(selector, error)
+            except BaseException as error:  # pragma: no cover - preserves unexpected worker failures
+                unexpected_error = unexpected_error or error
+        self._publication_futures.clear()
+        if unexpected_error is not None:
+            raise unexpected_error
+
+    close = wait
 
     def _publish_selector(self, selector, task_names) -> None:
         tasks = [self._pipeline.tasks_dict[task_name] for task_name in task_names]

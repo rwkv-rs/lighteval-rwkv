@@ -61,6 +61,7 @@ def _streaming_pipeline(task_names, model, download, *, max_samples):
     pipeline.model = model
     pipeline.evaluation_tracker = SimpleNamespace(
         task_config_logger=SimpleNamespace(log=lambda _tasks: None),
+        abort_task_writers=lambda: None,
     )
     pipeline._prepare_task_documents = lambda task: [
         SimpleNamespace(
@@ -175,12 +176,16 @@ async def _evaluate_streaming_pipeline(pipeline):
 def test_rwkv_pipeline_starts_ready_selector_before_all_datasets_finish(monkeypatch):
     slow_release = threading.Event()
     slow_finished = threading.Event()
+    blocked_finished = threading.Event()
     calls = []
 
     def download(task_name):
-        if task_name == "slow|0":
+        if task_name in {"slow|0", "blocked|0"}:
             slow_release.wait(2)
-            slow_finished.set()
+            if task_name == "slow|0":
+                slow_finished.set()
+            else:
+                blocked_finished.set()
         return task_name
 
     class Model:
@@ -196,9 +201,9 @@ def test_rwkv_pipeline_starts_ready_selector_before_all_datasets_finish(monkeypa
         async def acleanup(self):
             pass
 
-    pipeline = _streaming_pipeline(("fast|0", "slow|0"), Model(), download, max_samples=10)
-    pipeline._selector_tasks = {"small": ("slow|0",), "large": ("fast|0",)}
-    pipeline._task_selectors = {"slow|0": "small", "fast|0": "large"}
+    pipeline = _streaming_pipeline(("fast|0", "slow|0", "blocked|0"), Model(), download, max_samples=10)
+    pipeline._selector_tasks = {"small": ("slow|0",), "large": ("fast|0",), "blocked": ("blocked|0",)}
+    pipeline._task_selectors = {"slow|0": "small", "fast|0": "large", "blocked|0": "blocked"}
     pipeline._prepare_task_documents = lambda task: [
         SimpleNamespace(
             task_name=task.full_name,
@@ -218,10 +223,11 @@ def test_rwkv_pipeline_starts_ready_selector_before_all_datasets_finish(monkeypa
                 await asyncio.sleep(0.01)
             assert calls == ["fast|0"]
             assert not slow_finished.is_set()
+            assert not blocked_finished.is_set()
         finally:
             slow_release.set()
         await evaluation
-        assert calls == ["fast|0", "slow|0"]
+        assert set(calls) == {"fast|0", "slow|0", "blocked|0"}
 
     asyncio.run(run())
 

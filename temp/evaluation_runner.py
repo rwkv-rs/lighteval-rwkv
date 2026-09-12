@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import signal
 import subprocess
 import sys
 import threading
-import time
-import hashlib
-import json
-from collections import deque
 from dataclasses import dataclass
 from io import BufferedReader
 from pathlib import Path
@@ -36,8 +34,8 @@ G1J_MANIFESTS = {
 }
 DEFAULT_CAPACITIES = {"1.5b": 1024, "2.9b": 1024, "7.2b": 960, "13.3b": 320}
 G1J_CAPACITIES = {"1.5b": 1024, "2.9b": 512, "7.2b": 256, "13.3b": 248}
-DATASET_RATE_WINDOW_SECONDS = 300
-DATASET_STARTS_PER_WINDOW = 2
+DEFAULT_MAX_RESTARTS = 5
+DEFAULT_RESTART_DELAY_SECONDS = 15
 
 
 @dataclass(frozen=True)
@@ -77,6 +75,18 @@ def _parse_args(
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--run-id", default=os.environ.get("RWKV_EVAL_RUN_ID", "default"))
     parser.add_argument("--output-root", type=Path, default=Path(os.environ.get("RWKV_EVAL_OUTPUT_ROOT", "results")))
+    parser.add_argument(
+        "--max-restarts",
+        type=int,
+        default=int(os.environ.get("RWKV_EVAL_MAX_RESTARTS", DEFAULT_MAX_RESTARTS)),
+        help="Maximum retries for one model process after an unsuccessful exit.",
+    )
+    parser.add_argument(
+        "--restart-delay",
+        type=float,
+        default=float(os.environ.get("RWKV_EVAL_RESTART_DELAY", DEFAULT_RESTART_DELAY_SECONDS)),
+        help="Seconds to wait before retrying one model process.",
+    )
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args(argv)
 
@@ -130,13 +140,85 @@ def _command(args: argparse.Namespace, config: Path) -> list[str]:
     return command
 
 
-def _forward_output(stream: BufferedReader, *, stop_at_evaluation_started: bool = False) -> bool:
+def _forward_output(stream: BufferedReader, *, label: str | None = None) -> None:
     for line in stream:
+        if label is not None:
+            line = f"[{label}] ".encode() + line
         sys.stdout.buffer.write(line)
         sys.stdout.buffer.flush()
-        if stop_at_evaluation_started and b"RWKV evaluation started:" in line:
-            return True
-    return False
+
+
+def _start_process(
+    args: argparse.Namespace,
+    evaluation: ModelEvaluation,
+    config: Path,
+) -> subprocess.Popen[bytes]:
+    environment = os.environ.copy()
+    environment["RWKV_EVAL_POOL_MANIFEST"] = str(evaluation.manifest.resolve())
+    print(f"Starting {evaluation.size}: {evaluation.manifest}", flush=True)
+    return subprocess.Popen(
+        _command(args, config),
+        cwd=PROJECT_ROOT,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+
+def _run_model(
+    args: argparse.Namespace,
+    evaluation: ModelEvaluation,
+    config: Path,
+    processes: dict[str, subprocess.Popen[bytes]],
+    process_lock: threading.Lock,
+    interrupted: threading.Event,
+    received_signal: list[int | None],
+) -> int:
+    restarts = 0
+    while not interrupted.is_set():
+        process = _start_process(args, evaluation, config)
+        with process_lock:
+            processes[evaluation.size] = process
+        assert process.stdout is not None
+        output_thread = threading.Thread(
+            target=_forward_output,
+            args=(process.stdout,),
+            kwargs={"label": evaluation.size},
+            daemon=True,
+        )
+        output_thread.start()
+        return_code = process.wait()
+        output_thread.join()
+        with process_lock:
+            if processes.get(evaluation.size) is process:
+                del processes[evaluation.size]
+
+        if interrupted.is_set():
+            return 128 + (received_signal[0] or signal.SIGTERM)
+        if return_code == 0:
+            print(f"Completed {evaluation.size} successfully.", flush=True)
+            return 0
+
+        restarts += 1
+        max_restarts = getattr(args, "max_restarts", DEFAULT_MAX_RESTARTS)
+        restart_delay = getattr(args, "restart_delay", DEFAULT_RESTART_DELAY_SECONDS)
+        if restarts > max_restarts:
+            print(
+                f"{evaluation.size} failed with exit code {return_code} after {restarts - 1} retries.",
+                file=sys.stderr,
+                flush=True,
+            )
+            return return_code
+        print(
+            f"{evaluation.size} exited with code {return_code}; retry {restarts}/{max_restarts} "
+            f"in {restart_delay:g}s.",
+            file=sys.stderr,
+            flush=True,
+        )
+        if interrupted.wait(restart_delay):
+            return 128 + (received_signal[0] or signal.SIGTERM)
+
+    return 128 + (received_signal[0] or signal.SIGTERM)
 
 
 def main(  # noqa: C901
@@ -174,68 +256,55 @@ def main(  # noqa: C901
                 return 2
         else:
             metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
-    processes: list[tuple[ModelEvaluation, subprocess.Popen[bytes]]] = []
-    output_threads: list[threading.Thread] = []
-    received_signal: int | None = None
+    process_configs = {
+        evaluation.size: args.config if args.dry_run else _model_config(args, evaluation)
+        for evaluation in evaluations
+    }
+    processes: dict[str, subprocess.Popen[bytes]] = {}
+    process_lock = threading.Lock()
+    received_signal: list[int | None] = [None]
     interrupted = threading.Event()
-    dataset_start_times: deque[float] = deque()
 
     def forward_signal(signum, _frame) -> None:
-        nonlocal received_signal
-        received_signal = signum
+        received_signal[0] = signum
         interrupted.set()
-        for _, process in processes:
+        with process_lock:
+            active_processes = tuple(processes.values())
+        for process in active_processes:
             if process.poll() is None:
                 process.send_signal(signum)
 
     signal.signal(signal.SIGINT, forward_signal)
     signal.signal(signal.SIGTERM, forward_signal)
 
-    for evaluation in evaluations:
-        if not args.dry_run:
-            now = time.monotonic()
-            while dataset_start_times and now - dataset_start_times[0] >= DATASET_RATE_WINDOW_SECONDS:
-                dataset_start_times.popleft()
-            if len(dataset_start_times) == DATASET_STARTS_PER_WINDOW:
-                remaining = DATASET_RATE_WINDOW_SECONDS - (now - dataset_start_times[0])
-                print(f"Waiting {remaining:.0f}s for the Hugging Face metadata rate window", flush=True)
-                interrupted.wait(remaining)
-                if received_signal is not None:
-                    break
-                now = time.monotonic()
-                while dataset_start_times and now - dataset_start_times[0] >= DATASET_RATE_WINDOW_SECONDS:
-                    dataset_start_times.popleft()
-            dataset_start_times.append(time.monotonic())
-        environment = os.environ.copy()
-        environment["RWKV_EVAL_POOL_MANIFEST"] = str(evaluation.manifest.resolve())
-        print(f"Starting {evaluation.size}: {evaluation.manifest}", flush=True)
-        config = args.config if args.dry_run else _model_config(args, evaluation)
-        process = subprocess.Popen(
-            _command(args, config),
-            cwd=PROJECT_ROOT,
-            env=environment,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
-        processes.append((evaluation, process))
-        assert process.stdout is not None
-        evaluation_started = _forward_output(process.stdout, stop_at_evaluation_started=True)
-        if evaluation_started:
-            output_thread = threading.Thread(target=_forward_output, args=(process.stdout,), daemon=True)
-            output_thread.start()
-            output_threads.append(output_thread)
-        elif (return_code := process.poll()) is not None and return_code < 0:
-            received_signal = -return_code
-            interrupted.set()
-            break
+    workers = []
+    worker_results: dict[str, int] = {}
+    result_lock = threading.Lock()
 
-    failed = [
-        (evaluation.size, return_code) for evaluation, process in processes if (return_code := process.wait()) != 0
-    ]
-    for output_thread in output_threads:
-        output_thread.join()
-    if received_signal is not None:
-        return 128 + received_signal
+    def run_and_record(evaluation: ModelEvaluation) -> None:
+        result = _run_model(
+            args,
+            evaluation,
+            process_configs[evaluation.size],
+            processes,
+            process_lock,
+            interrupted,
+            received_signal,
+        )
+        with result_lock:
+            worker_results[evaluation.size] = result
+
+    if received_signal[0] is None:
+        for evaluation in evaluations:
+            worker = threading.Thread(target=run_and_record, args=(evaluation,), name=f"rwkv-{evaluation.size}")
+            worker.start()
+            workers.append(worker)
+        for worker in workers:
+            worker.join()
+
+    if received_signal[0] is not None:
+        return 128 + (received_signal[0] or signal.SIGTERM)
+    failed = [(evaluation.size, worker_results[evaluation.size]) for evaluation in evaluations if worker_results[evaluation.size]]
     if failed:
         summary = ", ".join(f"{size}={return_code}" for size, return_code in failed)
         print(f"RWKV evaluations failed: {summary}", flush=True)

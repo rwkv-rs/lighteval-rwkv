@@ -488,7 +488,6 @@ class RWKVPipeline(Pipeline):
             ready_selectors = {}
             active_selectors: dict[asyncio.Task, str] = {}
             evaluation_started = False
-            initial_ready_target = min(self._DATASET_LOADERS, max(1, len(self._selector_tasks) - 1))
 
             async def evaluate_selector(selector, queued: asyncio.Event) -> None:
                 task_calls = []
@@ -519,9 +518,7 @@ class RWKVPipeline(Pipeline):
                 await queued.wait()
 
             while preparation_tasks or ready_selectors or active_selectors:
-                while ready_selectors and (
-                    evaluation_started or len(ready_selectors) >= initial_ready_target or not preparation_tasks
-                ):
+                while ready_selectors:
                     selector = _selector_priority(
                         {value: selector_rollouts[value] for value in ready_selectors}, tuple(selector_order)
                     )[0]
@@ -568,6 +565,7 @@ class RWKVPipeline(Pipeline):
                 raise scoring_failures[0]
             raise
         finally:
+            self.evaluation_tracker.abort_task_writers()
             await self.model.acleanup()
 
     @staticmethod

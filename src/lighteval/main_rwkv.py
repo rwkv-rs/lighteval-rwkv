@@ -265,6 +265,7 @@ def rwkv(
     """Evaluate the configured native LightEval benchmarks on an existing RWKV endpoint pool."""
     pool: RWKVHttpPool | None = None
     model: RWKVHttpModel | None = None
+    scoreboard = None
     try:
         eval_config = RWKVEvaluationConfig.read(config)
         manifest, pool, resolved = _preflight(eval_config)
@@ -315,6 +316,8 @@ def rwkv(
         pipeline.evaluate()
         pipeline.show_results()
         pipeline.save_and_push_results()
+        if scoreboard is not None:
+            scoreboard.wait()
         if scoreboard is not None and scoreboard.publication_errors:
             failures = "; ".join(f"{selector}: {error}" for selector, error in scoreboard.publication_errors)
             raise ValueError(f"Scoreboard publications remain pending: {failures}")
@@ -322,6 +325,8 @@ def rwkv(
         typer.echo(f"RWKV evaluation failed: {error}", err=True)
         raise typer.Exit(code=2) from error
     finally:
+        if scoreboard is not None:
+            scoreboard.wait()
         if model is not None:
             model.cleanup()
         elif pool is not None:

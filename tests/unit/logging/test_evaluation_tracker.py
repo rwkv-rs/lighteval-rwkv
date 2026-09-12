@@ -27,6 +27,7 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+import pyarrow.parquet as pq
 from datasets import Dataset
 from huggingface_hub import HfApi
 
@@ -120,6 +121,48 @@ def test_details_logger_aggregates_completion_truncation_separately_from_prompt_
     assert logger.compiled_details_over_all_tasks.n_completions == 3
     assert logger.compiled_details_over_all_tasks.n_truncated == 1
     assert logger.compiled_details_over_all_tasks.truncation_rate == pytest.approx(1 / 3)
+
+
+def test_streaming_details_publish_only_after_atomic_task_close(mock_evaluation_tracker, mock_datetime):
+    tracker = mock_evaluation_tracker
+    tracker.should_save_details = True
+    detail = DetailsLogger.Detail(
+        doc=Doc(query="question", choices=["answer"], gold_index=0),
+        model_response=ModelResponse(text=["answer"], finish_reasons=["stop"]),
+        metric={"accuracy": 1.0},
+    )
+
+    tracker.write_task_batch("task|0", [detail])
+
+    final_path = tracker.task_details_path("task|0")
+    partial_path = final_path.with_name(final_path.name + ".partial")
+    assert not final_path.exists()
+    assert partial_path.exists()
+
+    tracker.close_task_writer("task|0")
+
+    assert final_path.exists()
+    assert not partial_path.exists()
+    assert pq.ParquetFile(final_path).metadata.num_rows == 1
+
+
+def test_aborting_streaming_details_removes_unfinished_task_file(mock_evaluation_tracker, mock_datetime):
+    tracker = mock_evaluation_tracker
+    tracker.should_save_details = True
+    detail = DetailsLogger.Detail(
+        doc=Doc(query="question", choices=["answer"], gold_index=0),
+        model_response=ModelResponse(text=["answer"], finish_reasons=["stop"]),
+        metric={"accuracy": 1.0},
+    )
+
+    tracker.write_task_batch("task|0", [detail])
+    final_path = tracker.task_details_path("task|0")
+    partial_path = final_path.with_name(final_path.name + ".partial")
+
+    tracker.abort_task_writers()
+
+    assert not final_path.exists()
+    assert not partial_path.exists()
 
 
 class TestLogging:
