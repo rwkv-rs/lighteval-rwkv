@@ -401,7 +401,14 @@ def test_scoreboard_rejects_task_field_before_network_preflight(tmp_path, monkey
 
 def test_scoreboard_finds_completed_selectors_for_current_campaign():
     callback = ScoreboardCallback.__new__(ScoreboardCallback)
-    callback._pipeline = SimpleNamespace(_selector_tasks={"gsm8k": ("gsm8k|0",), "ifeval": ("ifeval|0",)})
+    metric = SimpleNamespace(metric_name="avg@1")
+    callback._pipeline = SimpleNamespace(
+        _selector_tasks={"gsm8k": ("gsm8k|0",), "ifeval": ("ifeval|0",)},
+        tasks_dict={
+            "gsm8k|0": SimpleNamespace(metrics=[metric]),
+            "ifeval|0": SimpleNamespace(metrics=[metric]),
+        },
+    )
     callback._model = SimpleNamespace(
         config=SimpleNamespace(model_revision="a" * 64, wkv_mode="fp32io16")
     )
@@ -412,11 +419,13 @@ def test_scoreboard_finds_completed_selectors_for_current_campaign():
                 {
                     "completed_at": "2026-09-12T00:00:00Z",
                     "campaign_id": "gsm8k-campaign",
+                    "primary_metric": "avg@1",
                     "task": {"identity": gsm8k_identity},
                 },
                 {
                     "completed_at": "2026-09-12T00:00:00Z",
                     "campaign_id": "ifeval-campaign",
+                    "primary_metric": "avg@1",
                     "task": {"identity": f"{'a' * 64}:fp32io16:ifeval"},
                 },
             ]
@@ -429,6 +438,40 @@ def test_scoreboard_finds_completed_selectors_for_current_campaign():
     )
 
     assert callback._load_completed_selectors() == {"gsm8k"}
+
+
+def test_scoreboard_rechecks_selector_when_published_metric_is_stale():
+    callback = ScoreboardCallback.__new__(ScoreboardCallback)
+    callback._pipeline = SimpleNamespace(
+        _selector_tasks={"gsm8k": ("gsm8k|0",)},
+        tasks_dict={"gsm8k|0": SimpleNamespace(metrics=[SimpleNamespace(metric_name="avg@4")])},
+    )
+    callback._model = SimpleNamespace(
+        config=SimpleNamespace(model_revision="a" * 64, wkv_mode="fp32io16")
+    )
+    identity = f"{'a' * 64}:fp32io16:gsm8k"
+    callback._request = lambda _method, path: (
+        {
+            "evaluations": [
+                {
+                    "completed_at": "2026-09-12T00:00:00Z",
+                    "campaign_id": "stale-campaign",
+                    "primary_metric": "avg@8",
+                    "task": {"identity": identity},
+                },
+                {
+                    "completed_at": "2026-09-12T00:00:00Z",
+                    "campaign_id": "canonical-campaign",
+                    "primary_metric": "avg@4",
+                    "task": {"identity": f"{'b' * 64}:fp32io16:gsm8k", "benchmark": "gsm8k"},
+                },
+            ]
+        }
+        if path.startswith("/api/evaluations")
+        else pytest.fail("a stale metric must not be accepted as a completed selector")
+    )
+
+    assert callback._load_completed_selectors() == frozenset()
 
 
 def test_scoreboard_field_changes_all_canonical_hashes():

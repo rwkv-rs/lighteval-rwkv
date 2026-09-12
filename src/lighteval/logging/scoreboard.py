@@ -138,8 +138,14 @@ class ScoreboardCallback:
             )
         self.completed_selectors = self._load_completed_selectors()
 
-    def _completed_campaign_ids(self) -> dict[str, str]:
-        """Return finalized campaign candidates for this model and configured selectors."""
+    def _completed_campaign_ids(self) -> dict[str, list[tuple[str, str | None]]]:
+        """Return completed campaign candidates grouped by task identity.
+
+        A task identity alone is insufficient for idempotency while historical
+        Scoreboard records may use different rollout counts. Keep every
+        candidate so the caller can select the one whose primary metric matches
+        the plan for this run.
+        """
         try:
             evaluations = self._request("GET", "/api/evaluations?limit=5000").get("evaluations", [])
         except ValueError as error:
@@ -151,7 +157,18 @@ class ScoreboardCallback:
 
         revision = self._model.config.model_revision
         prefix = f"{revision}:{self._model.config.wkv_mode}:"
-        campaign_by_identity: dict[str, str] = {}
+        benchmark_metrics: dict[str, list[int]] = {}
+        for evaluation in evaluations:
+            task = evaluation.get("task")
+            primary_metric = evaluation.get("primary_metric")
+            benchmark = task.get("benchmark") if isinstance(task, dict) else None
+            match = re.fullmatch(r"avg@([1-9][0-9]*)", primary_metric or "")
+            if benchmark is not None and match is not None:
+                benchmark_metrics.setdefault(benchmark, []).append(int(match.group(1)))
+        self._canonical_metrics = {
+            benchmark: f"avg@{min(values)}" for benchmark, values in benchmark_metrics.items()
+        }
+        campaign_by_identity: dict[str, list[tuple[str, str | None]]] = {}
         for evaluation in evaluations:
             if not isinstance(evaluation, dict) or evaluation.get("completed_at") is None:
                 continue
@@ -162,7 +179,9 @@ class ScoreboardCallback:
                 continue
             selector = identity.removeprefix(prefix)
             if selector in self._pipeline._selector_tasks:
-                campaign_by_identity[identity] = campaign_id
+                campaign_by_identity.setdefault(identity, []).append(
+                    (campaign_id, evaluation.get("primary_metric"))
+                )
         return campaign_by_identity
 
     def _load_completed_selectors(self) -> frozenset[str]:
@@ -172,17 +191,31 @@ class ScoreboardCallback:
         prefix = f"{revision}:{self._model.config.wkv_mode}:"
 
         completed = set()
-        for identity, campaign_id in campaign_by_identity.items():
-            try:
-                campaign = self._request(
-                    "GET", f"/api/v1/evaluation-campaigns/{quote(campaign_id, safe='')}"
-                )
-            except ValueError as error:
-                logger.warning("Scoreboard campaign lookup unavailable: campaign=%s error=%s", campaign_id, error)
-                continue
-            task_hashes = campaign.get("task_hashes", {})
-            if campaign.get("status") == "complete" and isinstance(task_hashes, dict) and identity in task_hashes:
-                completed.add(identity.removeprefix(prefix))
+        for identity, candidates in campaign_by_identity.items():
+            selector = identity.removeprefix(prefix)
+            expected_metric = self._canonical_metrics.get(selector)
+            for campaign_id, published_metric in candidates:
+                if expected_metric is None:
+                    expected_metric = published_metric
+                if published_metric != expected_metric:
+                    logger.info(
+                        "Republishing selector with the current metric: selector=%s published=%s expected=%s",
+                        selector,
+                        published_metric,
+                        expected_metric,
+                    )
+                    continue
+                try:
+                    campaign = self._request(
+                        "GET", f"/api/v1/evaluation-campaigns/{quote(campaign_id, safe='')}"
+                    )
+                except ValueError as error:
+                    logger.warning("Scoreboard campaign lookup unavailable: campaign=%s error=%s", campaign_id, error)
+                    continue
+                task_hashes = campaign.get("task_hashes", {})
+                if campaign.get("status") == "complete" and isinstance(task_hashes, dict) and identity in task_hashes:
+                    completed.add(selector)
+                    break
         if completed:
             logger.info("Skipping already published selectors: %s", ", ".join(sorted(completed)))
         return frozenset(completed)
