@@ -177,28 +177,38 @@ def test_streaming_details_keep_ifbench_kwargs_type_stable(mock_evaluation_track
     tracker = mock_evaluation_tracker
     tracker.should_save_details = True
 
-    def detail(keyword, m, n):
+    def detail(keyword, m, n, max_words, min_words, n_end, n_start, prompt_to_repeat):
         return DetailsLogger.Detail(
             doc=Doc(
                 query="question",
                 choices=["answer"],
                 gold_index=0,
-                specific={
-                    "kwargs": [{"keyword": keyword, "m": m, "n": n}],
-                },
+                specific={"kwargs": [{
+                    "keyword": keyword,
+                    "m": m,
+                    "n": n,
+                    "max_words": max_words,
+                    "min_words": min_words,
+                    "n_end": n_end,
+                    "n_start": n_start,
+                    "prompt_to_repeat": prompt_to_repeat,
+                }]},
             ),
             model_response=ModelResponse(text=["answer"], finish_reasons=["stop"]),
             metric={"accuracy": 1.0},
         )
 
-    tracker.write_task_batch("task|0", [detail(None, None, None)])
-    tracker.write_task_batch("task|0", [detail("keyword", 3, 4)])
+    tracker.write_task_batch("task|0", [detail(None, None, None, None, None, None, None, None)])
+    tracker.write_task_batch("task|0", [detail("keyword", 3, 4, 5.0, 6.0, 7, 8, "repeat")])
     tracker.close_task_writer("task|0")
 
     rows = pq.read_table(tracker.task_details_path("task|0")).to_pylist()
     assert rows[0]["doc"]["specific"]["kwargs"][0]["keyword"] is None
     assert rows[1]["doc"]["specific"]["kwargs"][0]["m"] == 3
     assert rows[1]["doc"]["specific"]["kwargs"][0]["n"] == 4
+    assert rows[1]["doc"]["specific"]["kwargs"][0]["max_words"] == 5.0
+    assert rows[1]["doc"]["specific"]["kwargs"][0]["n_end"] == 7
+    assert rows[1]["doc"]["specific"]["kwargs"][0]["prompt_to_repeat"] == "repeat"
 
 
 def test_aborting_streaming_details_removes_unfinished_task_file(mock_evaluation_tracker, mock_datetime):

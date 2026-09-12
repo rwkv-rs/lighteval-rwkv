@@ -480,13 +480,25 @@ class EvaluationTracker:
         if specific and specific.get("kwargs"):
             # IFBench's heterogeneous kwargs can leave these fields null in the first
             # streamed batch even though later documents use them.
+            defaults = {
+                "keyword": "",
+                "keyword1": "",
+                "keyword2": "",
+                "keyword3": "",
+                "keyword4": "",
+                "keyword5": "",
+                "max_words": 0.0,
+                "min_words": 0.0,
+                "m": 0,
+                "n": 0,
+                "n_end": 0,
+                "n_start": 0,
+                "prompt_to_repeat": "",
+            }
             for kwargs in specific["kwargs"]:
-                if kwargs.get("keyword") is None:
-                    kwargs["keyword"] = ""
-                if kwargs.get("m") is None:
-                    kwargs["m"] = 0
-                if kwargs.get("n") is None:
-                    kwargs["n"] = 0
+                for field_name, default in defaults.items():
+                    if kwargs.get(field_name) is None:
+                        kwargs[field_name] = default
 
     def close_task_writer(self, task_name: str) -> None:
         """Closes and evicts the incremental parquet writer for a task, if one was opened."""
