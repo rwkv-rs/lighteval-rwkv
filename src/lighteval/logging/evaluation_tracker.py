@@ -25,6 +25,7 @@ import logging
 import os
 import re
 import time
+from copy import deepcopy
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime
 from enum import Enum
@@ -426,12 +427,48 @@ class EvaluationTracker:
         self.open_task_writer(task_name)
         writer_state = self._task_parquet_writers[task_name]
         if writer_state.writer is None:
-            table = pa.Table.from_pylist(rows)
+            # A first batch can contain only null values for optional response lists such as
+            # `stop_reasons`.  Arrow would infer `list<null>` and reject a later batch containing
+            # strings.  Seed the inference row with the stable response element types without
+            # writing that synthetic row to the task details.
+            table = pa.Table.from_pylist([*rows, self._typed_schema_seed(rows[0])])
+            table = table.slice(0, len(rows))
             writer_state.schema = table.schema
             writer_state.writer = pq.ParquetWriter(writer_state.handle, table.schema)
         else:
             table = pa.Table.from_pylist(rows, schema=writer_state.schema)
         writer_state.writer.write_table(table)
+
+    @staticmethod
+    def _typed_schema_seed(row: dict) -> dict:
+        """Return a non-persisted row that keeps nullable response lists type-stable."""
+        seed = deepcopy(row)
+        response = seed["model_response"]
+        completion_count = len(response["text"])
+
+        list_defaults = {
+            "finish_reasons": "",
+            "reasonings": "",
+            "stop_reasons": "",
+            "terminal_token_ids": 0,
+        }
+        for field_name, default in list_defaults.items():
+            values = response[field_name]
+            if not values or all(value is None for value in values):
+                response[field_name] = [default] * completion_count
+
+        if response["text_post_processed"] is None:
+            response["text_post_processed"] = [""] * completion_count
+
+        if not response["input_tokens"]:
+            response["input_tokens"] = [0]
+        if not response["output_tokens"] or all(not tokens for tokens in response["output_tokens"]):
+            response["output_tokens"] = [[0] for _ in range(completion_count)]
+        if not response["logprobs"]:
+            response["logprobs"] = [0.0]
+        if not response["argmax_logits_eq_gold"]:
+            response["argmax_logits_eq_gold"] = [False]
+        return seed
 
     def close_task_writer(self, task_name: str) -> None:
         """Closes and evicts the incremental parquet writer for a task, if one was opened."""

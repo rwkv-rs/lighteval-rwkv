@@ -626,6 +626,21 @@ def test_open_think_postprocessing_ignores_duplicate_closing_tag():
     assert response.final_text == ["final"]
 
 
+def test_ifbench_stopwords_are_loaded_once(monkeypatch):
+    from lighteval.tasks.tasks.ifeval import instructions_utils
+
+    downloads = []
+    monkeypatch.setattr(instructions_utils.nltk, "download", lambda name: downloads.append(name))
+    monkeypatch.setattr(instructions_utils.nltk.corpus.stopwords, "words", lambda _language: ["the"])
+    instructions_utils._get_stopwords.cache_clear()
+
+    assert instructions_utils.count_stopwords("the answer") == 1
+    assert instructions_utils.count_stopwords("the result") == 1
+    assert downloads == ["stopwords"]
+
+    instructions_utils._get_stopwords.cache_clear()
+
+
 def test_rwkv_pipeline_always_converts_choices():
     doc = Doc(
         query="Question?",

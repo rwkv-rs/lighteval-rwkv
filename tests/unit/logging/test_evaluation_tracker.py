@@ -146,6 +146,33 @@ def test_streaming_details_publish_only_after_atomic_task_close(mock_evaluation_
     assert pq.ParquetFile(final_path).metadata.num_rows == 1
 
 
+def test_streaming_details_keep_nullable_response_lists_type_stable(mock_evaluation_tracker, mock_datetime):
+    tracker = mock_evaluation_tracker
+    tracker.should_save_details = True
+
+    def detail(stop_reasons, reasonings):
+        return DetailsLogger.Detail(
+            doc=Doc(query="question", choices=["answer"], gold_index=0),
+            model_response=ModelResponse(
+                text=["answer"],
+                reasonings=[reasonings],
+                finish_reasons=["stop"],
+                stop_reasons=[stop_reasons],
+                terminal_token_ids=[None],
+            ),
+            metric={"accuracy": 1.0},
+        )
+
+    tracker.write_task_batch("task|0", [detail(None, None)])
+    tracker.write_task_batch("task|0", [detail("✿", "reasoning")])
+    tracker.close_task_writer("task|0")
+
+    rows = pq.read_table(tracker.task_details_path("task|0")).to_pylist()
+    assert rows[0]["model_response"]["stop_reasons"] == [None]
+    assert rows[1]["model_response"]["stop_reasons"] == ["✿"]
+    assert rows[1]["model_response"]["reasonings"] == ["reasoning"]
+
+
 def test_aborting_streaming_details_removes_unfinished_task_file(mock_evaluation_tracker, mock_datetime):
     tracker = mock_evaluation_tracker
     tracker.should_save_details = True

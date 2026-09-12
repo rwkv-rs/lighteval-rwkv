@@ -1678,10 +1678,16 @@ def _get_sentence_tokenizer():
     return nltk.data.load("nltk:tokenizers/punkt/english.pickle")
 
 
+@functools.lru_cache(maxsize=1)
+def _get_stopwords():
+    """Load the English stopword list once per evaluator process."""
+    nltk.download("stopwords")
+    return frozenset(nltk.corpus.stopwords.words("english"))
+
+
 def count_stopwords(text):
     """Counts the number of stopwords."""
-    nltk.download("stopwords")
-    stopwords = nltk.corpus.stopwords.words("english")
+    stopwords = _get_stopwords()
     tokenizer = nltk.tokenize.RegexpTokenizer(r"\w+")
     tokens = tokenizer.tokenize(text)
     num_stopwords = len([t for t in tokens if t.lower() in stopwords])
