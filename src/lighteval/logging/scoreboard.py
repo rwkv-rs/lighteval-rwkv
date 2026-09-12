@@ -262,11 +262,12 @@ class ScoreboardCallback:
             "expected_tasks": [task_metadata],
             "rerun_reason": self._rerun_reason,
         }
-        campaign["run_key"] = _campaign_run_key(campaign)
         if primary_metric is not None:
-            campaign["run_key"] = _sha256(
-                {"campaign": campaign["run_key"], "primary_metric": primary_metric}
+            reason = campaign["rerun_reason"]
+            campaign["rerun_reason"] = (
+                f"{reason}; primary_metric={primary_metric}" if reason else f"primary_metric={primary_metric}"
             )
+        campaign["run_key"] = _campaign_run_key(campaign)
         return campaign
 
     @classmethod

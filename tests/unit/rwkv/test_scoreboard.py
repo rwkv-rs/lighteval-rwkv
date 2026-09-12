@@ -502,6 +502,8 @@ def test_scoreboard_field_changes_all_canonical_hashes():
     assert campaign["registry_sha256"] != other_campaign["registry_sha256"]
     assert campaign["run_key"] != other_campaign["run_key"]
     assert _sha256({"task": task}) != _sha256({"task": other})
+    assert campaign["rerun_reason"] is None
+    assert callback._campaign(task, "avg@1")["rerun_reason"] == "primary_metric=avg@1"
     assert callback._campaign(task, "avg@1")["run_key"] != callback._campaign(task, "avg@4")["run_key"]
 
 
