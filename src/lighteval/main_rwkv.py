@@ -313,6 +313,7 @@ def rwkv(
         )
         if scoreboard is not None:
             pipeline.task_callback = scoreboard
+            pipeline.set_skip_selectors(scoreboard.completed_selectors)
         pipeline.evaluate()
         pipeline.show_results()
         pipeline.save_and_push_results()

@@ -399,6 +399,38 @@ def test_scoreboard_rejects_task_field_before_network_preflight(tmp_path, monkey
     assert requests == []
 
 
+def test_scoreboard_finds_completed_selectors_for_current_campaign():
+    callback = ScoreboardCallback.__new__(ScoreboardCallback)
+    callback._pipeline = SimpleNamespace(_selector_tasks={"gsm8k": ("gsm8k|0",), "ifeval": ("ifeval|0",)})
+    callback._model = SimpleNamespace(
+        config=SimpleNamespace(model_revision="a" * 64, wkv_mode="fp32io16")
+    )
+    gsm8k_identity = f"{'a' * 64}:fp32io16:gsm8k"
+    callback._request = lambda _method, path: (
+        {
+            "evaluations": [
+                {
+                    "completed_at": "2026-09-12T00:00:00Z",
+                    "campaign_id": "gsm8k-campaign",
+                    "task": {"identity": gsm8k_identity},
+                },
+                {
+                    "completed_at": "2026-09-12T00:00:00Z",
+                    "campaign_id": "ifeval-campaign",
+                    "task": {"identity": f"{'a' * 64}:fp32io16:ifeval"},
+                },
+            ]
+        }
+        if path.startswith("/api/evaluations")
+        else {
+            "status": "complete" if path.endswith("gsm8k-campaign") else "running",
+            "task_hashes": {gsm8k_identity: "publication-sha"},
+        }
+    )
+
+    assert callback._load_completed_selectors() == {"gsm8k"}
+
+
 def test_scoreboard_field_changes_all_canonical_hashes():
     callback = ScoreboardCallback.__new__(ScoreboardCallback)
     callback._run_mode = "test"

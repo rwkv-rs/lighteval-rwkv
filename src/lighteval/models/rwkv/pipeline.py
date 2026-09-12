@@ -226,7 +226,12 @@ class RWKVPipeline(Pipeline):
     def __init__(self, *args, selector_tasks: Mapping[str, tuple[str, ...]], task_max_samples=None, **kwargs) -> None:
         self._configured_selector_tasks = selector_tasks
         self._configured_task_max_samples = task_max_samples
+        self._skip_selectors: frozenset[str] = frozenset()
         super().__init__(*args, **kwargs)
+
+    def set_skip_selectors(self, selectors) -> None:
+        """Exclude selectors already finalized by an external result publisher."""
+        self._skip_selectors = frozenset(selectors)
 
     def _init_tasks_and_requests(self, tasks: str) -> None:
         logger.info("--- LOADING TASKS ---")
@@ -419,7 +424,21 @@ class RWKVPipeline(Pipeline):
             self._finalize_metrics()
 
     async def _evaluate_tasks(self, scoring_queue) -> None:  # noqa: C901
-        load_semaphore = asyncio.Semaphore(min(self._DATASET_LOADERS, len(self._task_names)))
+        selector_tasks = {
+            selector: task_names
+            for selector, task_names in self._selector_tasks.items()
+            if selector not in getattr(self, "_skip_selectors", frozenset())
+        }
+        task_names = tuple(task_name for names in selector_tasks.values() for task_name in names)
+        skip_selectors = getattr(self, "_skip_selectors", frozenset())
+        if skip_selectors:
+            logger.info("RWKV selectors skipped before dataset preparation: %s", ", ".join(sorted(skip_selectors)))
+        if not task_names:
+            self.evaluation_tracker.task_config_logger.log(self.tasks_dict)
+            await self.model.acleanup()
+            return
+
+        load_semaphore = asyncio.Semaphore(min(self._DATASET_LOADERS, len(task_names)))
         scoring_tasks: set[asyncio.Task] = set()
         scoring_failures: list[BaseException] = []
 
@@ -429,8 +448,8 @@ class RWKVPipeline(Pipeline):
                 dataset = await asyncio.to_thread(_download_dataset, task)
                 self._datasets_loaded += 1
                 logger.info("RWKV dataset ready: task=%s", task_name)
-                if self._datasets_loaded == len(self._task_names):
-                    typer.echo(f"RWKV datasets ready: {self._datasets_loaded}/{len(self._task_names)}")
+                if self._datasets_loaded == len(task_names):
+                    typer.echo(f"RWKV datasets ready: {self._datasets_loaded}/{len(task_names)}")
             task.dataset = dataset
             docs = self._prepare_task_documents(task)
             docs = _configure_task_evaluation_plan(self, task, docs)
@@ -470,18 +489,24 @@ class RWKVPipeline(Pipeline):
 
             scoring_task.add_done_callback(on_scoring_done)
 
-        selector_order = sorted(self._selector_tasks, key=lambda selector: len(self._selector_tasks[selector]))
-        ordered_task_names = [
-            task_names[index]
-            for index in range(max(map(len, self._selector_tasks.values())))
-            for selector in selector_order
-            if index < len(task_names := self._selector_tasks[selector])
-        ]
-        preparation_tasks = {
-            asyncio.create_task(prepare_task(task_name)): self._task_selectors[task_name]
-            for task_name in ordered_task_names
-        }
-        running = list(preparation_tasks)
+        selector_order = sorted(selector_tasks, key=lambda selector: len(selector_tasks[selector]))
+        preparation_tasks = {}
+        running = []
+        next_selector_index = 0
+
+        def enqueue_next_selector() -> None:
+            nonlocal next_selector_index
+            if next_selector_index >= len(selector_order):
+                return
+            selector = selector_order[next_selector_index]
+            next_selector_index += 1
+            for task_name in selector_tasks[selector]:
+                task = asyncio.create_task(prepare_task(task_name))
+                preparation_tasks[task] = selector
+                running.append(task)
+
+        for _ in range(min(self._DATASET_LOADERS, len(selector_order))):
+            enqueue_next_selector()
         try:
             prepared_by_selector = defaultdict(list)
             selector_rollouts = {}
@@ -544,9 +569,10 @@ class RWKVPipeline(Pipeline):
                         continue
                     selector = preparation_tasks.pop(task)
                     prepared_by_selector[selector].append(await task)
-                    if len(prepared_by_selector[selector]) == len(self._selector_tasks[selector]):
+                    if len(prepared_by_selector[selector]) == len(selector_tasks[selector]):
                         selector_rollouts[selector] = sum(item[2] for item in prepared_by_selector[selector])
                         ready_selectors[selector] = None
+                        enqueue_next_selector()
                         logger.info(
                             "RWKV selector ready: selector=%s pending_rollouts=%d",
                             selector,

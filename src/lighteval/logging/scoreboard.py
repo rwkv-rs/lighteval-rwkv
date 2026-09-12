@@ -136,6 +136,56 @@ class ScoreboardCallback:
             raise ValueError(
                 f"Scoreboard {run_mode} endpoint requires {preflight.get('schema_version')}, expected {expected_schema}"
             )
+        self.completed_selectors = self._load_completed_selectors()
+
+    def _completed_campaign_ids(self) -> dict[str, str]:
+        """Return finalized campaign candidates for this model and configured selectors."""
+        try:
+            evaluations = self._request("GET", "/api/evaluations?limit=5000").get("evaluations", [])
+        except ValueError as error:
+            logger.warning("Scoreboard completed-task lookup unavailable: %s", error)
+            return {}
+        if not isinstance(evaluations, list):
+            logger.warning("Scoreboard completed-task lookup returned an invalid evaluations list")
+            return {}
+
+        revision = self._model.config.model_revision
+        prefix = f"{revision}:{self._model.config.wkv_mode}:"
+        campaign_by_identity: dict[str, str] = {}
+        for evaluation in evaluations:
+            if not isinstance(evaluation, dict) or evaluation.get("completed_at") is None:
+                continue
+            task = evaluation.get("task")
+            campaign_id = evaluation.get("campaign_id")
+            identity = task.get("identity") if isinstance(task, dict) else None
+            if not isinstance(campaign_id, str) or not isinstance(identity, str) or not identity.startswith(prefix):
+                continue
+            selector = identity.removeprefix(prefix)
+            if selector in self._pipeline._selector_tasks:
+                campaign_by_identity[identity] = campaign_id
+        return campaign_by_identity
+
+    def _load_completed_selectors(self) -> frozenset[str]:
+        """Find selectors already finalized for this exact model and evaluation config."""
+        campaign_by_identity = self._completed_campaign_ids()
+        revision = self._model.config.model_revision
+        prefix = f"{revision}:{self._model.config.wkv_mode}:"
+
+        completed = set()
+        for identity, campaign_id in campaign_by_identity.items():
+            try:
+                campaign = self._request(
+                    "GET", f"/api/v1/evaluation-campaigns/{quote(campaign_id, safe='')}"
+                )
+            except ValueError as error:
+                logger.warning("Scoreboard campaign lookup unavailable: campaign=%s error=%s", campaign_id, error)
+                continue
+            task_hashes = campaign.get("task_hashes", {})
+            if campaign.get("status") == "complete" and isinstance(task_hashes, dict) and identity in task_hashes:
+                completed.add(identity.removeprefix(prefix))
+        if completed:
+            logger.info("Skipping already published selectors: %s", ", ".join(sorted(completed)))
+        return frozenset(completed)
 
     @staticmethod
     def _extract_task_field(task_name: str, tags: list[str]) -> str:
