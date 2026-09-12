@@ -173,6 +173,34 @@ def test_streaming_details_keep_nullable_response_lists_type_stable(mock_evaluat
     assert rows[1]["model_response"]["reasonings"] == ["reasoning"]
 
 
+def test_streaming_details_keep_ifbench_kwargs_type_stable(mock_evaluation_tracker, mock_datetime):
+    tracker = mock_evaluation_tracker
+    tracker.should_save_details = True
+
+    def detail(keyword, m, n):
+        return DetailsLogger.Detail(
+            doc=Doc(
+                query="question",
+                choices=["answer"],
+                gold_index=0,
+                specific={
+                    "kwargs": [{"keyword": keyword, "m": m, "n": n}],
+                },
+            ),
+            model_response=ModelResponse(text=["answer"], finish_reasons=["stop"]),
+            metric={"accuracy": 1.0},
+        )
+
+    tracker.write_task_batch("task|0", [detail(None, None, None)])
+    tracker.write_task_batch("task|0", [detail("keyword", 3, 4)])
+    tracker.close_task_writer("task|0")
+
+    rows = pq.read_table(tracker.task_details_path("task|0")).to_pylist()
+    assert rows[0]["doc"]["specific"]["kwargs"][0]["keyword"] is None
+    assert rows[1]["doc"]["specific"]["kwargs"][0]["m"] == 3
+    assert rows[1]["doc"]["specific"]["kwargs"][0]["n"] == 4
+
+
 def test_aborting_streaming_details_removes_unfinished_task_file(mock_evaluation_tracker, mock_datetime):
     tracker = mock_evaluation_tracker
     tracker.should_save_details = True

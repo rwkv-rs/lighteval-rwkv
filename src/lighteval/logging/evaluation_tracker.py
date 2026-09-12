@@ -445,7 +445,12 @@ class EvaluationTracker:
         seed = deepcopy(row)
         response = seed["model_response"]
         completion_count = len(response["text"])
+        EvaluationTracker._fill_response_schema_defaults(response, completion_count)
+        EvaluationTracker._fill_ifbench_schema_defaults(seed["doc"])
+        return seed
 
+    @staticmethod
+    def _fill_response_schema_defaults(response: dict, completion_count: int) -> None:
         list_defaults = {
             "finish_reasons": "",
             "reasonings": "",
@@ -468,7 +473,20 @@ class EvaluationTracker:
             response["logprobs"] = [0.0]
         if not response["argmax_logits_eq_gold"]:
             response["argmax_logits_eq_gold"] = [False]
-        return seed
+
+    @staticmethod
+    def _fill_ifbench_schema_defaults(doc: dict) -> None:
+        specific = doc.get("specific")
+        if specific and specific.get("kwargs"):
+            # IFBench's heterogeneous kwargs can leave these fields null in the first
+            # streamed batch even though later documents use them.
+            for kwargs in specific["kwargs"]:
+                if kwargs.get("keyword") is None:
+                    kwargs["keyword"] = ""
+                if kwargs.get("m") is None:
+                    kwargs["m"] = 0
+                if kwargs.get("n") is None:
+                    kwargs["n"] = 0
 
     def close_task_writer(self, task_name: str) -> None:
         """Closes and evicts the incremental parquet writer for a task, if one was opened."""
