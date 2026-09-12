@@ -266,6 +266,8 @@ def rwkv(
     pool: RWKVHttpPool | None = None
     model: RWKVHttpModel | None = None
     scoreboard = None
+    evaluation_started = False
+    evaluation_completed = False
     try:
         eval_config = RWKVEvaluationConfig.read(config)
         manifest, pool, resolved = _preflight(eval_config)
@@ -314,7 +316,9 @@ def rwkv(
         if scoreboard is not None:
             pipeline.task_callback = scoreboard
             pipeline.set_skip_selectors(scoreboard.completed_selectors)
+        evaluation_started = True
         pipeline.evaluate()
+        evaluation_completed = True
         pipeline.show_results()
         pipeline.save_and_push_results()
         if scoreboard is not None:
@@ -329,6 +333,7 @@ def rwkv(
         if scoreboard is not None:
             scoreboard.wait()
         if model is not None:
-            model.cleanup()
+            if not evaluation_started or evaluation_completed:
+                model.cleanup()
         elif pool is not None:
             pool.close()
