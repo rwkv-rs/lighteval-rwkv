@@ -488,6 +488,8 @@ class RWKVPipeline(Pipeline):
                         running_task.cancel()
 
             scoring_task.add_done_callback(on_scoring_done)
+            # Keep the selector active until its generation and scoring task finishes.
+            await scoring_task
 
         selector_order = sorted(selector_tasks, key=lambda selector: len(selector_tasks[selector]))
         preparation_tasks = {}
@@ -550,7 +552,7 @@ class RWKVPipeline(Pipeline):
                     positive_active = sum(
                         selector_rollouts[active_selector] > 0 for active_selector in active_selectors.values()
                     )
-                    if selector_rollouts[selector] > 0 and positive_active >= 2:
+                    if selector_rollouts[selector] > 0 and positive_active >= 1:
                         break
                     del ready_selectors[selector]
                     await admit_selector(selector)

@@ -232,6 +232,48 @@ def test_rwkv_pipeline_starts_ready_selector_before_all_datasets_finish(monkeypa
     asyncio.run(run())
 
 
+def test_rwkv_pipeline_runs_one_positive_selector_at_a_time(monkeypatch):
+    release = asyncio.Event()
+    calls = []
+
+    class Model:
+        pool = SimpleNamespace(http_worker_limit=20)
+
+        def pending_rollouts(self, docs):
+            return sum(doc.num_samples for doc in docs)
+
+        async def greedy_until(self, docs, on_document_ready=None):
+            calls.append(docs[0].task_name)
+            await release.wait()
+            return []
+
+        async def acleanup(self):
+            pass
+
+    pipeline = _streaming_pipeline(("first|0", "second|0"), Model(), lambda task_name: task_name, max_samples=10)
+    pipeline._selector_tasks = {"first": ("first|0",), "second": ("second|0",)}
+    pipeline._task_selectors = {"first|0": "first", "second|0": "second"}
+    pipeline._finalize_task = lambda *_args: None
+    monkeypatch.setattr(rwkv_pipeline, "_configure_task_evaluation_plan", lambda _pipeline, _task, docs: docs)
+
+    async def run():
+        evaluation = asyncio.create_task(_evaluate_streaming_pipeline(pipeline))
+        try:
+            for _ in range(20):
+                if calls:
+                    break
+                await asyncio.sleep(0.01)
+            assert calls == ["first|0"]
+            await asyncio.sleep(0.05)
+            assert calls == ["first|0"]
+        finally:
+            release.set()
+        await evaluation
+        assert calls == ["first|0", "second|0"]
+
+    asyncio.run(run())
+
+
 def test_cached_selector_does_not_consume_a_rollout_slot(monkeypatch):
     release = asyncio.Event()
     calls = []
@@ -262,13 +304,16 @@ def test_cached_selector_does_not_consume_a_rollout_slot(monkeypatch):
     async def run():
         evaluation = asyncio.create_task(_evaluate_streaming_pipeline(pipeline))
         for _ in range(20):
-            if len(calls) == 3:
+            if len(calls) == 2:
                 break
             await asyncio.sleep(0.01)
         assert calls[0] == "cached|0"
-        assert set(calls) == {"cached|0", "small|0", "spare|0"}
+        assert set(calls) == {"cached|0", "small|0"}
+        await asyncio.sleep(0.05)
+        assert set(calls) == {"cached|0", "small|0"}
         release.set()
         await evaluation
+        assert set(calls) == {"cached|0", "small|0", "spare|0"}
 
     asyncio.run(run())
 
@@ -276,7 +321,6 @@ def test_cached_selector_does_not_consume_a_rollout_slot(monkeypatch):
 def test_cached_selector_bypasses_full_rollout_slots(monkeypatch):
     cached_dataset_ready = threading.Event()
     release = asyncio.Event()
-    rollout_slots_full = asyncio.Event()
     cached_started = asyncio.Event()
     calls = []
 
@@ -293,8 +337,6 @@ def test_cached_selector_bypasses_full_rollout_slots(monkeypatch):
 
         async def greedy_until(self, docs, on_document_ready=None):
             calls.append(docs[0].task_name)
-            if len(calls) == 2:
-                rollout_slots_full.set()
             if docs[0].task_name == "cached|0":
                 cached_started.set()
             await release.wait()
@@ -309,11 +351,14 @@ def test_cached_selector_bypasses_full_rollout_slots(monkeypatch):
 
     async def run():
         evaluation = asyncio.create_task(_evaluate_streaming_pipeline(pipeline))
-        await asyncio.wait_for(rollout_slots_full.wait(), 1)
-        assert calls == ["first|0", "second|0"]
+        for _ in range(20):
+            if calls:
+                break
+            await asyncio.sleep(0.01)
+        assert calls == ["first|0"]
         cached_dataset_ready.set()
         await asyncio.wait_for(cached_started.wait(), 1)
-        assert calls == ["first|0", "second|0", "cached|0"]
+        assert calls == ["first|0", "cached|0"]
         release.set()
         await evaluation
 
@@ -340,6 +385,8 @@ def test_pending_scoring_releases_generation_slots_without_finishing_evaluation(
             pass
 
     pipeline = _streaming_pipeline(("first|0", "second|0", "third|0"), Model(), lambda name: name, max_samples=10)
+    pipeline._selector_tasks = {"benchmark": ("first|0", "second|0", "third|0")}
+    pipeline._task_selectors = dict.fromkeys(pipeline._task_names, "benchmark")
     monkeypatch.setattr(rwkv_pipeline, "_configure_task_evaluation_plan", lambda _pipeline, _task, docs: docs)
 
     async def run():
@@ -495,6 +542,8 @@ def test_rwkv_pipeline_scoring_failure_cancels_other_tasks(monkeypatch):
         lambda task_name: task_name,
         max_samples=1,
     )
+    pipeline._selector_tasks = {"benchmark": ("failed|0", "pending|0")}
+    pipeline._task_selectors = dict.fromkeys(pipeline._task_names, "benchmark")
     pipeline._finalize_task = lambda task_name: (_ for _ in ()).throw(ValueError(task_name))
     monkeypatch.setattr(rwkv_pipeline, "_configure_task_evaluation_plan", lambda _pipeline, _task, docs: docs)
 
