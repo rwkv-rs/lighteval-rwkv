@@ -10,6 +10,7 @@ from lighteval.tasks.rwkv_free_response import RWKVFreeResponseMatch, is_rwkv_fr
     [
         ("arithmetic:add_or_sub|0", True),
         ("math:algebra|0", True),
+        ("olympiad_bench:OE_TO_maths_en_COMP|0", True),
         ("asdiv|0", True),
         ("gsm_plus|0", True),
         ("aimo_progress_prize_1|0", True),

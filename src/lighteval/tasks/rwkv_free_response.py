@@ -10,7 +10,7 @@ from lighteval.tasks.requests import Doc, SamplingMethod
 from lighteval.utils.timeout import timeout
 
 
-_FREE_RESPONSE_TASK_PREFIXES = ("arithmetic:", "math:")
+_FREE_RESPONSE_TASK_PREFIXES = ("arithmetic:", "math:", "olympiad_bench:")
 _FREE_RESPONSE_TASK_NAMES = ("asdiv", "gsm_plus", "aimo_progress_prize_1")
 
 
