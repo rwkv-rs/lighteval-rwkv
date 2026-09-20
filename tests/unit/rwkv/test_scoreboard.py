@@ -11,7 +11,8 @@ import lighteval.logging.scoreboard as scoreboard_module
 from lighteval.logging.evaluation_tracker import EvaluationTracker
 from lighteval.logging.info_loggers import DetailsLogger, MetricsLogger
 from lighteval.logging.scoreboard import ScoreboardCallback, _finalized_task_matches, _sha256
-from lighteval.metrics.metrics_sample import ExactMatches
+from lighteval.metrics.metrics_sample import ExactMatches, LoglikelihoodAcc
+from lighteval.metrics.normalizations import LogProbPMINorm
 from lighteval.metrics.utils.metric_utils import SampleLevelMetric
 from lighteval.models.model_output import ModelResponse
 from lighteval.models.rwkv.pipeline import RWKVAvgAtK
@@ -74,7 +75,7 @@ def test_scoreboard_callback_selects_twenty_samples_per_outcome(tmp_path):
                         query="question",
                         choices=["answer"],
                         gold_index=0,
-                        id=str(index),
+                        id=f"{outcome}-{index}",
                         specific={
                             "rwkv_rollout_scores": [float(outcome == "correct")],
                             "rwkv_rollout_extracted_answers": [text],
@@ -103,9 +104,7 @@ def test_scoreboard_callback_selects_twenty_samples_per_outcome(tmp_path):
 
     assert next_offset == len(details)
     assert accumulator.outcome_totals == {"correct": 25, "incorrect": 25, "unanswered": 25}
-    assert Counter(
-        rollout.outcome for bucket in accumulator.selected.values() for rollout in bucket
-    ) == {
+    assert Counter(rollout.outcome for bucket in accumulator.selected.values() for rollout in bucket) == {
         "correct": 20,
         "incorrect": 20,
         "unanswered": 20,
@@ -186,6 +185,155 @@ def test_scoreboard_splits_rollouts_and_scores_each_one(tmp_path):
     assert [sample["answer"]["extracted_answer"] for sample in samples] == ["one", ""]
     assert [sample["answer"]["repeat_id"] for sample in samples] == [0, 1]
     assert samples[0]["metrics"] == {"scoreboard_outcome": "correct", "avg@2": 1.0}
+
+
+def test_scoreboard_accumulates_logprob_details_with_predicted_answer(tmp_path):
+    response = ModelResponse(
+        input="Question?",
+        input_tokens=[1],
+        output_tokens=[[2], [3]],
+        logprobs=[-0.1, -0.2],
+        argmax_logits_eq_gold=[True, False],
+    )
+    detail = DetailsLogger.Detail(
+        doc=Doc(query="Question?", choices=[" A", " B"], gold_index=0, id="1"),
+        model_response=response,
+        metric={"accuracy": 1.0},
+    )
+    task = SimpleNamespace(
+        full_name="mmlu|0",
+        metrics=(SimpleNamespace(category=SamplingMethod.LOGPROBS, metric_name="accuracy"),),
+    )
+    path = tmp_path / "details_mmlu_2026.parquet"
+    _write_details_parquet(path, [detail])
+
+    accumulator, next_offset = ScoreboardCallback._accumulate_task(task, path, 0)
+
+    assert next_offset == 1
+    assert accumulator.score_sum == 1.0
+    assert accumulator.count == 1
+    assert accumulator.outcome_totals == {"correct": 1, "incorrect": 0, "unanswered": 0}
+    rollout = accumulator.selected["correct"][0]
+    sample = ScoreboardCallback._sample(0, rollout, "avg@1")
+    assert sample["answer"] == {
+        "outcome": "correct",
+        "problem_id": "mmlu|0:1",
+        "repeat_id": 0,
+        "ground_truth": " A",
+        "extracted_answer": " A",
+        "assembled_prompt": "Question?",
+        "raw_completion": "",
+        "fail_reason": None,
+        "generated_tokens": 0,
+        "latency_ms": None,
+    }
+    assert sample["model_response"]["logprobs"] == [-0.1, -0.2]
+
+
+def test_scoreboard_logprob_answer_uses_metric_normalization(tmp_path):
+    response = ModelResponse(
+        input="Question?",
+        output_tokens=[[2], [3], [4], [5]],
+        logprobs=[-1.1, -1.0, -2.0, -0.5],
+        unconditioned_logprobs=[-2.0, -0.5],
+    )
+    detail = DetailsLogger.Detail(
+        doc=Doc(query="Question?", choices=[" A", " B"], gold_index=0, id="1"),
+        model_response=response,
+        metric={"accuracy": 1.0},
+    )
+    task = SimpleNamespace(
+        full_name="mmlu|0",
+        metrics=(
+            SimpleNamespace(
+                category=SamplingMethod.LOGPROBS,
+                metric_name="accuracy",
+                sample_level_fn=LoglikelihoodAcc(logprob_normalization=LogProbPMINorm()),
+            ),
+        ),
+    )
+    path = tmp_path / "details_mmlu_2026.parquet"
+    _write_details_parquet(path, [detail])
+
+    accumulator, _ = ScoreboardCallback._accumulate_task(task, path, 0)
+    rollout = accumulator.selected["correct"][0]
+    sample = ScoreboardCallback._sample(0, rollout, "avg@1")
+
+    assert rollout.extracted_answer == " A"
+    assert rollout.outcome == "correct"
+    assert sample["answer"]["extracted_answer"] == " A"
+
+
+def test_scoreboard_logprob_outcome_comes_from_predicted_choice(tmp_path):
+    response = ModelResponse(
+        input="Question?",
+        output_tokens=[[2], [3]],
+        logprobs=[-0.2, -0.1],
+    )
+    detail = DetailsLogger.Detail(
+        doc=Doc(query="Question?", choices=[" A", " B"], gold_index=0, id="1"),
+        model_response=response,
+        metric={"accuracy": 1.0},
+    )
+    task = SimpleNamespace(
+        full_name="mmlu|0",
+        metrics=(SimpleNamespace(category=SamplingMethod.LOGPROBS, metric_name="accuracy"),),
+    )
+    path = tmp_path / "details_mmlu_2026.parquet"
+    _write_details_parquet(path, [detail])
+
+    accumulator, _ = ScoreboardCallback._accumulate_task(task, path, 0)
+
+    assert accumulator.score_sum == 1.0
+    assert accumulator.outcome_totals == {"correct": 0, "incorrect": 1, "unanswered": 0}
+    assert accumulator.selected["incorrect"][0].extracted_answer == " B"
+
+
+def test_scoreboard_mixed_task_publishes_generative_metric_only(tmp_path):
+    logprob_detail = DetailsLogger.Detail(
+        doc=Doc(
+            query="Question?",
+            choices=[" A", " B"],
+            gold_index=0,
+            id="1",
+            specific={
+                "rwkv_rollout_scores": [1.0],
+                "rwkv_rollout_extracted_answers": ["A"],
+            },
+        ),
+        model_response=ModelResponse(input="Question?", output_tokens=[[2]], logprobs=[-0.1]),
+        metric={"acc": 1.0},
+    )
+    generative_detail = DetailsLogger.Detail(
+        doc=Doc(
+            query="Question?",
+            choices=[" A", " B"],
+            gold_index=0,
+            id="1",
+            specific={
+                "rwkv_rollout_scores": [0.0, 1.0],
+                "rwkv_rollout_extracted_answers": ["B", "A"],
+            },
+        ),
+        model_response=ModelResponse(text=["B", "A"], finish_reasons=["stop", "stop"]),
+        metric={"pass@k:k=1": 0.5},
+    )
+    task = SimpleNamespace(
+        full_name="mmlu_redux_2:biology|0",
+        metrics=(
+            SimpleNamespace(category=SamplingMethod.LOGPROBS, metric_name="acc"),
+            SimpleNamespace(category=SamplingMethod.GENERATIVE, metric_name="pass@k:k=1"),
+        ),
+    )
+    path = tmp_path / "details_mixed_2026.parquet"
+    _write_details_parquet(path, [logprob_detail, generative_detail])
+
+    accumulator, next_offset = ScoreboardCallback._accumulate_task(task, path, 0)
+
+    assert next_offset == 1
+    assert accumulator.count == 2
+    assert accumulator.score_sum == 1.0
+    assert accumulator.outcome_totals == {"correct": 1, "incorrect": 1, "unanswered": 0}
 
 
 def test_rwkv_avg_at_k_persists_rollout_facts_on_document():
@@ -273,6 +421,7 @@ def test_scoreboard_finalized_task_requires_matching_content_hash():
 def test_scoreboard_aggregates_lighteval_metadata_for_selector():
     callback = ScoreboardCallback.__new__(ScoreboardCallback)
     callback._run_mode = "test"
+    callback._cot_mode = "CoT"
     callback._model = SimpleNamespace(
         config=SimpleNamespace(
             model_name="RWKV7-g1h-7.2B-20260710-ctx10240", model_revision="a" * 64, wkv_mode="fp32io16"
@@ -380,6 +529,7 @@ def test_scoreboard_rejects_task_field_before_network_preflight(tmp_path, monkey
             model_name="RWKV7-g1j-1.5B-20260831-ctx16384",
             model_revision="a" * 64,
             max_samples=None,
+            cot_mode="open_think",
         )
     )
     requests = []
@@ -409,9 +559,8 @@ def test_scoreboard_finds_completed_selectors_for_current_campaign():
             "ifeval|0": SimpleNamespace(metrics=[metric]),
         },
     )
-    callback._model = SimpleNamespace(
-        config=SimpleNamespace(model_revision="a" * 64, wkv_mode="fp32io16")
-    )
+    callback._cot_mode = "CoT"
+    callback._model = SimpleNamespace(config=SimpleNamespace(model_revision="a" * 64, wkv_mode="fp32io16"))
     gsm8k_identity = f"{'a' * 64}:fp32io16:gsm8k"
     callback._request = lambda _method, path: (
         {
@@ -419,14 +568,14 @@ def test_scoreboard_finds_completed_selectors_for_current_campaign():
                 {
                     "completed_at": "2026-09-12T00:00:00Z",
                     "campaign_id": "gsm8k-campaign",
-                    "primary_metric": "avg@1",
-                    "task": {"identity": gsm8k_identity},
+                    "k_metric": {"avg@k": 1},
+                    "task": {"identity": gsm8k_identity, "cot_mode": "CoT"},
                 },
                 {
                     "completed_at": "2026-09-12T00:00:00Z",
                     "campaign_id": "ifeval-campaign",
-                    "primary_metric": "avg@1",
-                    "task": {"identity": f"{'a' * 64}:fp32io16:ifeval"},
+                    "k_metric": {"avg@k": 1},
+                    "task": {"identity": f"{'a' * 64}:fp32io16:ifeval", "cot_mode": "CoT"},
                 },
             ]
         }
@@ -446,9 +595,8 @@ def test_scoreboard_rechecks_selector_when_published_metric_is_stale():
         _selector_tasks={"gsm8k": ("gsm8k|0",)},
         tasks_dict={"gsm8k|0": SimpleNamespace(metrics=[SimpleNamespace(metric_name="avg@4")])},
     )
-    callback._model = SimpleNamespace(
-        config=SimpleNamespace(model_revision="a" * 64, wkv_mode="fp32io16")
-    )
+    callback._cot_mode = "CoT"
+    callback._model = SimpleNamespace(config=SimpleNamespace(model_revision="a" * 64, wkv_mode="fp32io16"))
     identity = f"{'a' * 64}:fp32io16:gsm8k"
     callback._request = lambda _method, path: (
         {
@@ -456,14 +604,14 @@ def test_scoreboard_rechecks_selector_when_published_metric_is_stale():
                 {
                     "completed_at": "2026-09-12T00:00:00Z",
                     "campaign_id": "stale-campaign",
-                    "primary_metric": "avg@8",
-                    "task": {"identity": identity},
+                    "k_metric": {"avg@k": 8},
+                    "task": {"identity": identity, "cot_mode": "CoT"},
                 },
                 {
                     "completed_at": "2026-09-12T00:00:00Z",
                     "campaign_id": "canonical-campaign",
-                    "primary_metric": "avg@4",
-                    "task": {"identity": f"{'b' * 64}:fp32io16:gsm8k", "benchmark": "gsm8k"},
+                    "k_metric": {"avg@k": 4},
+                    "task": {"identity": f"{'b' * 64}:fp32io16:gsm8k", "benchmark": "gsm8k", "cot_mode": "CoT"},
                 },
             ]
         }
@@ -484,6 +632,7 @@ def test_scoreboard_field_changes_all_canonical_hashes():
         "weight_sha256": "b" * 64,
         "weight_display_name": "model",
         "wkv_mode": "fp32io16",
+        "cot_mode": "CoT",
         "benchmark": "benchmark",
         "task_name": "benchmark",
         "field": "knowledge",
@@ -503,11 +652,10 @@ def test_scoreboard_field_changes_all_canonical_hashes():
     assert campaign["run_key"] != other_campaign["run_key"]
     assert _sha256({"task": task}) != _sha256({"task": other})
     assert campaign["rerun_reason"] is None
-    assert callback._campaign(task, "avg@1")["rerun_reason"] == "primary_metric=avg@1"
-    assert callback._campaign(task, "avg@1")["run_key"] != callback._campaign(task, "avg@4")["run_key"]
+    assert callback._campaign(task)["rerun_reason"] is None
 
 
-def test_full_scoreboard_uses_scoreboard_v1_campaign_contract():
+def test_full_scoreboard_uses_scoreboard_v2_campaign_contract():
     callback = ScoreboardCallback.__new__(ScoreboardCallback)
     callback._run_mode = "full"
     callback._config_digest = "a" * 64
@@ -517,6 +665,7 @@ def test_full_scoreboard_uses_scoreboard_v1_campaign_contract():
         "weight_sha256": "b" * 64,
         "weight_display_name": "RWKV7-g1i-1.5B-20260805-ctx16384",
         "wkv_mode": "fp32io16",
+        "cot_mode": "CoT",
         "benchmark": "winogrande",
         "field": "reasoning",
         "task_name": "winogrande",
@@ -543,7 +692,7 @@ def test_full_scoreboard_uses_scoreboard_v1_campaign_contract():
         "expected_tasks",
         "rerun_reason",
     }
-    assert campaign["schema_version"] == "scoreboard-v1"
+    assert campaign["schema_version"] == "scoreboard-v2"
     assert campaign["configured_benchmarks"] == ["winogrande"]
     assert campaign["expected_tasks"] == [task]
 
@@ -571,7 +720,7 @@ def test_scoreboard_selector_keeps_unconfigured_generation_size():
         for _ in range(2)
     ]
 
-    task_config = callback._task_config([SimpleNamespace(config=config) for config in configs], "avg@1")
+    task_config = callback._task_config([SimpleNamespace(config=config) for config in configs])
 
     assert task_config["generation_size"] is None
     assert task_config["original_num_docs"] == 200
@@ -599,7 +748,7 @@ def test_scoreboard_publication_keeps_only_evaluation_facts(tmp_path, monkeypatc
         requests.append(SimpleNamespace(method=method, url=url, data=content, headers=headers))
         assert timeout == 60
         if method == "GET":
-            return Response({"status": "ready", "schema_version": "scoreboard-v1"})
+            return Response({"status": "ready", "schema_version": "scoreboard-v2"})
         if url.endswith("/api/v1/evaluation-campaigns"):
             return Response({"campaign_id": campaign_id})
         return Response({"action": "created"})
@@ -723,25 +872,29 @@ def test_scoreboard_publication_keeps_only_evaluation_facts(tmp_path, monkeypatc
         "task_config",
         "environment",
         "sampling_config",
-        "primary_metric",
-        "metrics",
+        "k_metric",
+        "score",
         "diagnostics",
         "samples",
     }
     assert "comparison" not in publication
     assert publication["sampling_config"]["temperature"] == 0.96
-    assert publication["sampling_config"]["num_samples"] == 1
+    assert "num_samples" not in publication["sampling_config"]
+    assert publication["sampling_config"]["cot_mode"] == "open_think"
     assert publication["sampling_config"]["chat_template_kwargs"] == {
         "rwkv_prompt_template": "bot",
         "rwkv_generation_prompt": "open_think",
     }
-    assert publication["task_config"]["k_metrics"] == "avg@1"
+    assert "k_metrics" not in publication["task_config"]
     assert publication["task"]["benchmark"] == "gsm8k"
     assert publication["task"]["task_name"] == "gsm8k"
     assert publication["task"]["field"] == "math"
     assert publication["task"]["weight_display_name"] == "RWKV7-g1h-7.2B-20260710-ctx10240"
     assert publication["task"]["weight_sha256"] == "a" * 64
     assert publication["task"]["wkv_mode"] == "fp32io16"
+    assert publication["task"]["cot_mode"] == "CoT"
+    assert publication["k_metric"] == {"avg@k": 1}
+    assert publication["score"] == 1.0
     assert publication["task"]["languages"] == ["english"]
     assert publication["task"]["tags"] == ["math", "reasoning"]
     assert sample["document_index"] == 0

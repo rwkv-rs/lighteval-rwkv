@@ -268,6 +268,21 @@ class Completion:
     output_token_ids: tuple[int, ...]
 
 
+@dataclass(frozen=True)
+class LogprobScore:
+    """Scores for one candidate continuation returned by the RWKV service."""
+
+    logprobs: tuple[float, ...]
+    token_ids: tuple[int, ...]
+    greedy_token_ids: tuple[int, ...]
+    prompt_text: str
+    prompt_token_ids: tuple[int, ...]
+
+    @property
+    def sequence_logprob(self) -> float:
+        return sum(self.logprobs)
+
+
 class RWKVHttpPool:
     """Capacity-aware client for one already-deployed RWKV endpoint pool."""
 
@@ -317,6 +332,13 @@ class RWKVHttpPool:
         model_ids = [entry.get("id") for entry in data if isinstance(entry, dict)]
         if len(model_ids) != len(data) or not all(isinstance(model_id, str) and model_id for model_id in model_ids):
             raise PoolError(f"RWKV replica {replica.base_url} returned an invalid model list")
+        for entry in data:
+            capabilities = entry.get("capabilities")
+            if isinstance(capabilities, dict) and capabilities.get("logprobs") is False:
+                raise PoolError(
+                    f"RWKV replica {replica.base_url} explicitly reports that native log-probability "
+                    "scoring is unsupported"
+                )
         if self.manifest.served_model_name not in model_ids:
             raise PoolError(
                 f"RWKV replica {replica.base_url} does not serve manifest model {self.manifest.served_model_name}"
@@ -390,6 +412,128 @@ class RWKVHttpPool:
         if context_failure is not None and not failures:
             raise ContextLengthError(context_failure)
         raise PoolError("RWKV completion failed: " + "; ".join(failures))
+
+    async def score(  # noqa: C901
+        self,
+        messages: list[dict[str, str]],
+        continuation: str,
+        parameters: Mapping[str, object] | None = None,
+    ) -> LogprobScore:
+        """Score a candidate without sampling it.
+
+        RWKV's HTTP deployment exposes this as an OpenAI-compatible completion
+        request with the small scoring extension ``continuation``.  The service
+        returns token-level scores for that continuation and the prompt token
+        metadata needed by LightEval.  A server that does not implement this
+        contract fails explicitly instead of being silently evaluated as text
+        generation.
+        """
+        if self._model_id is None:
+            raise PoolError("RWKV pool must pass preflight before evaluation")
+        if not isinstance(messages, list) or not isinstance(continuation, str):
+            raise PoolError("RWKV logprob scoring requires messages and a string continuation")
+        if self._first_request_at is None:
+            self._first_request_at = time.monotonic()
+        await self.start()
+        assert self._clients is not None
+        payload = dict(parameters or {})
+        payload.update(
+            model=self.model_id,
+            messages=messages,
+            continuation=continuation,
+            max_tokens=0,
+            logprobs=1,
+            echo=True,
+            return_token_ids=True,
+            return_prompt_text=True,
+            n=1,
+            stream=False,
+        )
+        attempted: set[int] = set()
+        failures: list[str] = []
+        for attempt in range(API_MAX_RETRY):
+            if len(attempted) == len(self._clients):
+                attempted.clear()
+            async with self._scheduler.lease(frozenset(attempted)) as index:
+                attempted.add(index)
+                try:
+                    response = await self._clients[index].post("/v1/completions", json=payload)
+                    response.raise_for_status()
+                    return self._parse_score(response.json())
+                except httpx.HTTPStatusError as error:
+                    status = error.response.status_code
+                    if status not in RETRYABLE_STATUS_CODES:
+                        detail = error.response.text[:500]
+                        if status in {404, 405, 422}:
+                            raise PoolError(
+                                "RWKV endpoint does not support native log-probability scoring "
+                                f"(/v1/completions, HTTP {status}): {detail}"
+                            ) from error
+                        raise PoolError(
+                            f"RWKV endpoint rejected logprob scoring with HTTP {status}: {detail}"
+                        ) from error
+                    failures.append(f"{self.manifest.replicas[index].base_url}: HTTP {status}")
+                except (httpx.RequestError, ValueError, KeyError, TypeError) as error:
+                    if isinstance(error, (ValueError, KeyError, TypeError)):
+                        raise PoolError(f"RWKV endpoint returned invalid logprob scores: {error}") from error
+                    failures.append(f"{self.manifest.replicas[index].base_url}: {type(error).__name__}: {error}")
+            if attempt < API_MAX_RETRY - 1:
+                await asyncio.sleep(min(64, API_RETRY_SLEEP * (API_RETRY_MULTIPLIER**attempt)))
+        raise PoolError("RWKV logprob scoring failed: " + "; ".join(failures))
+
+    @classmethod
+    def _parse_score(cls, raw: object) -> LogprobScore:  # noqa: C901
+        if not isinstance(raw, dict):
+            raise ValueError("response must be an object")
+        choices = raw.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+            raise ValueError("scoring response must contain exactly one choice")
+        choice = choices[0]
+        logprobs = choice.get("continuation_logprobs", raw.get("continuation_logprobs"))
+        token_ids = choice.get(
+            "continuation_token_ids", choice.get("token_ids", raw.get("continuation_token_ids", raw.get("token_ids")))
+        )
+        greedy_ids = choice.get(
+            "greedy_token_ids",
+            choice.get("argmax_token_ids", raw.get("greedy_token_ids", raw.get("argmax_token_ids"))),
+        )
+        details = choice.get("logprobs")
+        if isinstance(details, dict):
+            logprobs = details.get("token_logprobs", logprobs)
+            token_ids = details.get("token_ids", details.get("continuation_token_ids", token_ids))
+            greedy_ids = details.get("greedy_token_ids", details.get("argmax_token_ids", greedy_ids))
+        # Rolling-likelihood responses score the prompt rather than a supplied
+        # continuation.  Accept the explicit prompt form used by RWKV servers.
+        if not logprobs and raw.get("prompt_logprobs") is not None:
+            logprobs = raw.get("prompt_logprobs")
+            token_ids = raw.get("prompt_token_ids")
+            greedy_ids = raw.get("prompt_greedy_token_ids", raw.get("argmax_prompt_token_ids"))
+        if not isinstance(logprobs, list) or any(not isinstance(value, (int, float)) for value in logprobs):
+            raise ValueError("continuation token logprobs are missing or invalid")
+        if not isinstance(token_ids, list) or any(
+            not isinstance(value, int) or isinstance(value, bool) for value in token_ids
+        ):
+            raise ValueError("continuation token ids are missing or invalid")
+        if len(logprobs) != len(token_ids):
+            raise ValueError("continuation token ids and logprobs have different lengths")
+        if greedy_ids is None:
+            greedy_ids = token_ids
+        if not isinstance(greedy_ids, list) or any(
+            not isinstance(value, int) or isinstance(value, bool) for value in greedy_ids
+        ):
+            raise ValueError("greedy token ids are missing or invalid")
+        prompt_text = raw.get("prompt_text")
+        prompt_token_ids = raw.get("prompt_token_ids")
+        if not isinstance(prompt_text, str):
+            raise ValueError("scoring prompt_text is missing or invalid")
+        prompt_token_ids = cls._token_ids(prompt_token_ids, "prompt")
+        return LogprobScore(
+            logprobs=tuple(float(value) for value in logprobs),
+            token_ids=tuple(token_ids),
+            greedy_token_ids=tuple(greedy_ids),
+            prompt_text=prompt_text,
+            prompt_token_ids=prompt_token_ids,
+        )
 
     @staticmethod
     def _context_error_message(error: httpx.HTTPStatusError) -> str | None:

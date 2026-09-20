@@ -1,4 +1,4 @@
-schema_version = 1
+schema_version = 2
 run_mode = "full"
 pool_manifest = "${RWKV_EVAL_POOL_MANIFEST}"
 output_dir = "results"

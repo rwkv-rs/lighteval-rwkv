@@ -450,7 +450,21 @@ class EvaluationTracker:
         return seed
 
     @staticmethod
+    def _schema_list_or_default(values, default, count):
+        if not values or all(value is None for value in values):
+            return [default] * count
+        return values
+
+    @staticmethod
     def _fill_response_schema_defaults(response: dict, completion_count: int) -> None:
+        # Use one synthetic completion when the first streamed response is a logprob
+        # response with no generated text.  The synthetic row is removed immediately
+        # after schema inference, but its values prevent Arrow from inferring
+        # list<null> for fields populated by a later generated response.
+        schema_completion_count = max(completion_count, 1)
+        if not response["text"]:
+            response["text"] = [""]
+
         list_defaults = {
             "finish_reasons": "",
             "reasonings": "",
@@ -458,21 +472,25 @@ class EvaluationTracker:
             "terminal_token_ids": 0,
         }
         for field_name, default in list_defaults.items():
-            values = response[field_name]
-            if not values or all(value is None for value in values):
-                response[field_name] = [default] * completion_count
+            response[field_name] = EvaluationTracker._schema_list_or_default(
+                response[field_name], default, schema_completion_count
+            )
 
-        if response["text_post_processed"] is None:
-            response["text_post_processed"] = [""] * completion_count
+        if not response["text_post_processed"]:
+            response["text_post_processed"] = [""] * schema_completion_count
 
         if not response["input_tokens"]:
             response["input_tokens"] = [0]
         if not response["output_tokens"] or all(not tokens for tokens in response["output_tokens"]):
-            response["output_tokens"] = [[0] for _ in range(completion_count)]
+            response["output_tokens"] = [[0] for _ in range(schema_completion_count)]
         if not response["logprobs"]:
             response["logprobs"] = [0.0]
         if not response["argmax_logits_eq_gold"]:
             response["argmax_logits_eq_gold"] = [False]
+        if response["logits"] is None:
+            response["logits"] = [[0.0]]
+        if response["unconditioned_logprobs"] is None:
+            response["unconditioned_logprobs"] = [0.0]
 
     @staticmethod
     def _fill_ifbench_schema_defaults(doc: dict) -> None:

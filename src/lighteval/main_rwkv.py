@@ -16,7 +16,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised on Python 3.10
 
 import typer
 
-from lighteval.models.rwkv.http_model import PROMPT_TEMPLATES, SAMPLING_PARAMETERS, RWKVHttpModel
+from lighteval.models.rwkv.http_model import PROMPT_TEMPLATES, SAMPLING_PARAMETERS, RWKVHTTPModel
 from lighteval.models.rwkv.http_pool import PoolError, PoolManifest, RWKVHttpPool
 from lighteval.models.rwkv.pipeline import RWKVPipeline
 
@@ -70,8 +70,8 @@ class RWKVEvaluationConfig:
         missing = sorted(_REQUIRED_CONFIG_FIELDS - set(raw))
         if missing:
             raise ConfigError("missing RWKV eval config fields: " + ", ".join(missing))
-        if raw["schema_version"] != 1 or isinstance(raw["schema_version"], bool):
-            raise ConfigError("RWKV eval schema_version must be 1")
+        if raw["schema_version"] != 2 or isinstance(raw["schema_version"], bool):
+            raise ConfigError("RWKV eval schema_version must be 2")
 
         run_mode = raw["run_mode"]
         if run_mode not in {"full", "test"}:
@@ -202,7 +202,7 @@ def resolve_benchmarks(selectors: tuple[str, ...]) -> ResolvedBenchmarks:
         )
     if incompatible:
         raise ConfigError(
-            "benchmark leaf tasks are incompatible with the generative RWKV adapter: "
+            "benchmark leaf tasks use unsupported RWKV request categories (PERPLEXITY is not implemented): "
             + ", ".join(sorted(incompatible))
         )
     if not owners:
@@ -264,7 +264,7 @@ def rwkv(
 ) -> None:
     """Evaluate the configured native LightEval benchmarks on an existing RWKV endpoint pool."""
     pool: RWKVHttpPool | None = None
-    model: RWKVHttpModel | None = None
+    model: RWKVHTTPModel | None = None
     scoreboard = None
     evaluation_started = False
     evaluation_completed = False
@@ -279,7 +279,7 @@ def rwkv(
         from lighteval.logging.evaluation_tracker import EvaluationTracker
         from lighteval.pipeline import ParallelismManager, PipelineParameters
 
-        model = RWKVHttpModel(
+        model = RWKVHTTPModel(
             manifest=manifest,
             prompt_template=eval_config.prompt_template,
             cot_mode=eval_config.cot_mode,

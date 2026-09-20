@@ -183,16 +183,20 @@ def test_streaming_details_keep_ifbench_kwargs_type_stable(mock_evaluation_track
                 query="question",
                 choices=["answer"],
                 gold_index=0,
-                specific={"kwargs": [{
-                    "keyword": keyword,
-                    "m": m,
-                    "n": n,
-                    "max_words": max_words,
-                    "min_words": min_words,
-                    "n_end": n_end,
-                    "n_start": n_start,
-                    "prompt_to_repeat": prompt_to_repeat,
-                }]},
+                specific={
+                    "kwargs": [
+                        {
+                            "keyword": keyword,
+                            "m": m,
+                            "n": n,
+                            "max_words": max_words,
+                            "min_words": min_words,
+                            "n_end": n_end,
+                            "n_start": n_start,
+                            "prompt_to_repeat": prompt_to_repeat,
+                        }
+                    ]
+                },
             ),
             model_response=ModelResponse(text=["answer"], finish_reasons=["stop"]),
             metric={"accuracy": 1.0},

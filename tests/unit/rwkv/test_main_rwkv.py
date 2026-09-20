@@ -48,7 +48,7 @@ def test_dry_run_preflights_without_creating_results_or_model(tmp_path, monkeypa
     monkeypatch.setattr(main_rwkv, "_preflight", lambda _config: (_manifest(), pool, resolved))
     monkeypatch.setattr(
         main_rwkv,
-        "RWKVHttpModel",
+        "RWKVHTTPModel",
         lambda **_kwargs: (_ for _ in ()).throw(AssertionError("model must not be created")),
     )
 
@@ -117,7 +117,7 @@ def test_test_run_uses_configured_limit_and_standard_saving(tmp_path, monkeypatc
 
     monkeypatch.setattr(main_rwkv.RWKVEvaluationConfig, "read", lambda _path: config)
     monkeypatch.setattr(main_rwkv, "_preflight", lambda _config: (_manifest(), pool, resolved))
-    monkeypatch.setattr(main_rwkv, "RWKVHttpModel", Model)
+    monkeypatch.setattr(main_rwkv, "RWKVHTTPModel", Model)
     monkeypatch.setattr("lighteval.logging.evaluation_tracker.EvaluationTracker", Tracker)
     monkeypatch.setattr(main_rwkv, "RWKVPipeline", Pipeline)
 

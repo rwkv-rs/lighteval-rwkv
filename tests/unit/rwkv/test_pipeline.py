@@ -1,6 +1,7 @@
 import asyncio
 import multiprocessing
 import queue
+import re
 import threading
 from collections import defaultdict
 from pathlib import Path
@@ -15,7 +16,6 @@ from lighteval.metrics.metrics_sample import AvgAtN, ExactMatches, MajAtN, Sampl
 from lighteval.metrics.utils.metric_utils import SampleLevelMetric
 from lighteval.models.model_output import ModelResponse
 from lighteval.tasks.requests import Doc, SamplingMethod
-from lighteval.tasks.rwkv_free_response import RWKVFreeResponseMatch
 from lighteval.tasks.tasks.ifbench.instructions import (
     EmojiSentenceChecker,
     NGramOverlapChecker,
@@ -554,7 +554,7 @@ def test_rwkv_pipeline_scoring_failure_cancels_other_tasks(monkeypatch):
 
 
 @pytest.mark.parametrize("generation_size", [1, 5, 256, 1280, 2048])
-def test_open_think_uses_full_generation_contract(generation_size):
+def test_prepare_documents_preserves_native_generation_contract(generation_size):
     doc = Doc(
         query="question",
         choices=["answer"],
@@ -563,67 +563,56 @@ def test_open_think_uses_full_generation_contract(generation_size):
         stop_sequences=["\n"],
     )
     task = SimpleNamespace(
-        config=SimpleNamespace(generation_size=generation_size, stop_sequence=["\n"]),
+        full_name="task|0",
+        get_docs=lambda _max_samples: [doc],
     )
+    pipeline = rwkv_pipeline.RWKVPipeline.__new__(rwkv_pipeline.RWKVPipeline)
+    pipeline._task_max_samples = {}
+    pipeline.pipeline_parameters = SimpleNamespace(max_samples=None)
 
-    rwkv_pipeline.RWKVPipeline._prepare_open_think_task(task, [doc])
-
-    assert doc.generation_size == 8192
-    assert doc.stop_sequences == []
-    assert task.config.generation_size == 8192
-    assert task.config.stop_sequence == []
+    assert pipeline._prepare_task_documents(task) == [doc]
+    assert doc.generation_size == generation_size
+    assert doc.stop_sequences == ["\n"]
 
 
-def test_truthfulqa_conversion_keeps_only_mc1():
+def test_prepare_documents_preserves_logprob_choices():
     doc = Doc(
-        query="question",
-        choices=["true", "false", "true", "also true", "false", "also false"],
-        gold_index=[0, 2, 3],
-        specific={"len_mc1": 2},
+        query="Question?",
+        choices=["one", "two"],
+        gold_index=1,
         sampling_methods=[SamplingMethod.LOGPROBS],
     )
-    metric = SimpleNamespace(
-        metric_name=["truthfulqa_mc1", "truthfulqa_mc2"],
-        category=SamplingMethod.LOGPROBS,
-        corpus_level_fn={"truthfulqa_mc1": sum, "truthfulqa_mc2": sum},
-        higher_is_better={"truthfulqa_mc1": True, "truthfulqa_mc2": True},
-    )
-    task = SimpleNamespace(
-        full_name="truthfulqa:mc|0",
-        metrics=(metric,),
-        config=SimpleNamespace(metrics=(metric,), original_num_docs=-1, effective_num_docs=-1),
-    )
-
-    rwkv_pipeline.RWKVPipeline._prepare_truthfulqa_mc1(task, [doc])
-    rwkv_pipeline.RWKVPipeline._prepare_choice_task(task, [doc])
-
-    assert doc.choices == ["true", "false"]
-    assert doc.gold_index == 0
-    assert doc.specific["rwkv_truthfulqa_metric"] == "mc1"
-    assert doc.specific["rwkv_choice"] is True
-    assert [converted.metric_name for converted in task.metrics] == ["truthfulqa_mc1"]
-
-
-def test_open_think_postprocessing_keeps_only_final_answer():
+    task = SimpleNamespace(full_name="task|0", get_docs=lambda _max_samples: [doc])
     pipeline = rwkv_pipeline.RWKVPipeline.__new__(rwkv_pipeline.RWKVPipeline)
-    pipeline.model = SimpleNamespace(config=SimpleNamespace(cot_mode="open_think"))
-    pipeline.sampling_docs = defaultdict(list)
-    response = ModelResponse(text=[">reasoning</think>final", "answer without tags"])
+    pipeline._task_max_samples = {}
+    pipeline.pipeline_parameters = SimpleNamespace(max_samples=None)
+
+    pipeline._prepare_task_documents(task)
+
+    assert doc.query == "Question?"
+    assert doc.choices == ["one", "two"]
+    assert doc.sampling_methods == [SamplingMethod.LOGPROBS]
+
+
+def test_generation_postprocessing_uses_native_reasoning_tag_removal():
+    pipeline = rwkv_pipeline.RWKVPipeline.__new__(rwkv_pipeline.RWKVPipeline)
+    pipeline.pipeline_parameters = SimpleNamespace(
+        remove_reasoning_tags=True,
+        reasoning_tags=[("<think>", "</think>")],
+    )
+    response = ModelResponse(text=["<think>reasoning</think>final", "answer without tags"])
 
     pipeline._post_process_outputs({SamplingMethod.GENERATIVE: [response]})
 
     assert response.final_text == ["final", "answer without tags"]
 
 
-def test_open_think_postprocessing_ignores_duplicate_closing_tag():
+def test_logprob_postprocessing_is_not_invoked():
     pipeline = rwkv_pipeline.RWKVPipeline.__new__(rwkv_pipeline.RWKVPipeline)
-    pipeline.model = SimpleNamespace(config=SimpleNamespace(cot_mode="open_think"))
-    pipeline.sampling_docs = defaultdict(list)
-    response = ModelResponse(text=[">reasoning</think>final</think>"])
+    response = ModelResponse(logprobs=[-1.0])
+    pipeline._post_process_outputs({SamplingMethod.LOGPROBS: [response]})
 
-    pipeline._post_process_outputs({SamplingMethod.GENERATIVE: [response]})
-
-    assert response.final_text == ["final"]
+    assert response.text_post_processed is None
 
 
 def test_ifbench_stopwords_are_loaded_once(monkeypatch):
@@ -641,7 +630,7 @@ def test_ifbench_stopwords_are_loaded_once(monkeypatch):
     instructions_utils._get_stopwords.cache_clear()
 
 
-def test_rwkv_pipeline_always_converts_choices():
+def test_rwkv_pipeline_does_not_convert_logprob_choices():
     doc = Doc(
         query="Question?",
         instruction="Upstream instruction: ",
@@ -659,53 +648,11 @@ def test_rwkv_pipeline_always_converts_choices():
     pipeline = rwkv_pipeline.RWKVPipeline.__new__(rwkv_pipeline.RWKVPipeline)
     pipeline._task_max_samples = {}
     pipeline.pipeline_parameters = SimpleNamespace(max_samples=None)
-    pipeline.model = SimpleNamespace(config=SimpleNamespace(cot_mode="fake_think"))
 
     assert pipeline._prepare_task_documents(task) == [doc]
-    assert doc.query.startswith("Question?")
-    assert "A. one" in doc.query
-    assert doc.sampling_methods == [SamplingMethod.GENERATIVE]
-    assert doc.specific["rwkv_choice"] is True
-
-
-def test_fake_think_postprocessing_extracts_converted_choice_answer():
-    doc = Doc(
-        query="Question?\nA. one\nB. two",
-        choices=["one", "two"],
-        gold_index=1,
-        sampling_methods=[SamplingMethod.GENERATIVE],
-        specific={"rwkv_choice": True},
-    )
-    pipeline = rwkv_pipeline.RWKVPipeline.__new__(rwkv_pipeline.RWKVPipeline)
-    pipeline.model = SimpleNamespace(config=SimpleNamespace(cot_mode="fake_think"))
-    pipeline.pipeline_parameters = SimpleNamespace(
-        remove_reasoning_tags=True,
-        reasoning_tags=[("<think>", "</think>")],
-    )
-    pipeline.sampling_docs = {SamplingMethod.GENERATIVE: [doc]}
-    response = ModelResponse(text=["<think>x</think>Answer: B"], finish_reasons=["stop"])
-
-    pipeline._post_process_outputs({SamplingMethod.GENERATIVE: [response]})
-
-    assert response.final_text == ["two"]
-
-
-def test_rwkv_pipeline_discards_truncated_choice_answer():
-    doc = Doc(
-        query="Question?\nA. one\nB. two",
-        choices=["one", "two"],
-        gold_index=1,
-        sampling_methods=[SamplingMethod.GENERATIVE],
-        specific={"rwkv_choice": True},
-    )
-    pipeline = rwkv_pipeline.RWKVPipeline.__new__(rwkv_pipeline.RWKVPipeline)
-    pipeline.model = SimpleNamespace(config=SimpleNamespace(cot_mode="open_think"))
-    pipeline.sampling_docs = {SamplingMethod.GENERATIVE: [doc]}
-    response = ModelResponse(text=["<think>Answer: B"], finish_reasons=["length"])
-
-    pipeline._post_process_outputs({SamplingMethod.GENERATIVE: [response]})
-
-    assert response.final_text == [""]
+    assert doc.query == "Question?"
+    assert doc.choices == ["one", "two"]
+    assert doc.sampling_methods == [SamplingMethod.LOGPROBS]
 
 
 @pytest.mark.parametrize(
@@ -791,10 +738,27 @@ def test_rwkv_avg_at_k_averages_the_native_task_scorer():
     assert str(scorer) == "RWKVAvgAtK(k=4)"
 
 
+class _StubSamplingScorer(SampleLevelComputation):
+    """Test-local stand-in for a native sampling scorer that exposes extract_answer.
+
+    Keeps these tests covering RWKVAvgAtK's live delegation plumbing without the
+    removed RWKVFreeResponseMatch module.
+    """
+
+    def compute(self, doc, model_response, **kwargs):
+        return 1.0 if self.extract_answer(doc, model_response) in doc.choices else 0.0
+
+    @staticmethod
+    def extract_answer(_doc, model_response) -> str:
+        text = model_response.final_text[0] if model_response.final_text else ""
+        numbers = re.findall(r"-?\d+", text.replace("−", "-"))
+        return numbers[-1] if numbers else ""
+
+
 def test_rwkv_avg_at_k_delegates_answer_extraction_to_sampling_scorer():
     metric = SampleLevelMetric(
         metric_name="maj@n",
-        sample_level_fn=MajAtN(n=1, sample_scoring_function=RWKVFreeResponseMatch()),
+        sample_level_fn=MajAtN(n=1, sample_scoring_function=_StubSamplingScorer()),
         category=SamplingMethod.GENERATIVE,
         corpus_level_fn=lambda values: sum(values) / len(values),
         higher_is_better=True,
@@ -810,7 +774,7 @@ def test_rwkv_avg_at_k_delegates_answer_extraction_to_sampling_scorer():
 def test_rwkv_math_rollouts_keep_the_prediction_used_for_each_score():
     metric = SampleLevelMetric(
         metric_name="accuracy",
-        sample_level_fn=RWKVFreeResponseMatch(),
+        sample_level_fn=_StubSamplingScorer(),
         category=SamplingMethod.GENERATIVE,
         corpus_level_fn=lambda values: sum(values) / len(values),
         higher_is_better=True,
@@ -920,7 +884,8 @@ def test_rwkv_pipeline_exposes_only_avg_at_k_and_updates_document_counts():
         pipeline.documents_dict[task.full_name],
     )
 
-    assert [metric.metric_name for metric in task.metrics] == ["avg@8"]
+    assert [metric.metric_name for metric in task.metrics] == ["accuracy"]
+    assert isinstance(task.metrics[0].sample_level_fn, rwkv_pipeline.RWKVAvgAtK)
     assert doc.num_samples == 8
     assert task.num_samples == [1, 8]
     assert task.config.original_num_docs == 500
@@ -963,10 +928,11 @@ def test_rwkv_partial_run_uses_avg_at_one():
         pipeline.documents_dict[task.full_name],
     )
 
-    assert [configured.metric_name for configured in task.metrics] == ["avg@1"]
+    assert [configured.metric_name for configured in task.metrics] == ["accuracy"]
+    assert isinstance(task.metrics[0].sample_level_fn, rwkv_pipeline.RWKVAvgAtK)
     assert len(pipeline.documents_dict[task.full_name]) == 10
     assert all(doc.num_samples == 1 for doc in docs)
-    assert task.num_samples == [1, 1]
+    assert task.num_samples == [1]
     assert task.config.original_num_docs == 30
     assert task.config.effective_num_docs == 10
 
@@ -1035,6 +1001,43 @@ def test_lcb_worker_pool_failure_is_not_scored_as_a_wrong_answer(monkeypatch):
             )
     finally:
         codegen_metrics._evaluation_executor.cache_clear()
+
+
+def test_mixed_task_dispatches_native_request_categories(monkeypatch):
+    calls = []
+
+    class Model:
+        pool = SimpleNamespace(http_worker_limit=4)
+
+        def pending_rollouts(self, docs):
+            return 2
+
+        async def greedy_until(self, docs, on_document_ready=None):
+            calls.append("greedy_until")
+            await on_document_ready(docs[0], ModelResponse(text=["generated"]))
+
+        async def loglikelihood(self, docs, on_document_ready=None):
+            calls.append("loglikelihood")
+            await on_document_ready(docs[0], ModelResponse(logprobs=[-1.0]))
+
+        async def acleanup(self):
+            pass
+
+    pipeline = _streaming_pipeline(("mixed|0",), Model(), lambda name: name, max_samples=1)
+    doc = SimpleNamespace(
+        task_name="mixed|0",
+        id="1",
+        num_samples=1,
+        sampling_methods=[SamplingMethod.GENERATIVE, SamplingMethod.LOGPROBS],
+    )
+    pipeline._prepare_task_documents = lambda _task: [doc]
+    monkeypatch.setattr(rwkv_pipeline, "_configure_task_evaluation_plan", lambda _pipeline, _task, docs: docs)
+    pipeline._score_doc = lambda _task, _doc, response: calls.append(getattr(response, "_rwkv_sampling_method").name)
+    pipeline._finalize_task = lambda _task: None
+
+    asyncio.run(_evaluate_streaming_pipeline(pipeline))
+
+    assert calls == ["greedy_until", "GENERATIVE", "loglikelihood", "LOGPROBS"]
 
 
 def test_rwkv_avg_at_k_persists_producer_rollout_facts():

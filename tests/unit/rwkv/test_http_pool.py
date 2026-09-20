@@ -282,9 +282,7 @@ def test_pool_retries_context_limited_completion_with_effective_output_limit(tmp
     pool.preflight()
 
     async def run():
-        completion = await pool.complete(
-            [{"role": "user", "content": "q"}], {"max_completion_tokens": 2000}
-        )
+        completion = await pool.complete([{"role": "user", "content": "q"}], {"max_completion_tokens": 2000})
         await pool.aclose()
         return completion
 

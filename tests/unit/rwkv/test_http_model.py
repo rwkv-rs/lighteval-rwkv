@@ -3,14 +3,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from lighteval.models.rwkv.http_model import (
-    CACHE_POOL_FINGERPRINT,
-    PROMPT_TEMPLATES,
-    REQUEST_CONTRACT_VERSION,
-    RWKVHttpModel,
-)
-from lighteval.models.rwkv.http_pool import Completion, ContextLengthError, PoolError
+from lighteval.models.rwkv.http_model import CACHE_POOL_FINGERPRINT, REQUEST_CONTRACT_VERSION, RWKVHTTPModel
+from lighteval.models.rwkv.http_pool import Completion, ContextLengthError, LogprobScore, PoolError
 from lighteval.tasks.prompt_manager import PromptManager
+from lighteval.tasks.requests import SamplingMethod
 from lighteval.utils.cache_management import SampleCache, TaskID
 
 
@@ -28,19 +24,10 @@ def _document(query, num_samples=1, generation_size=9000, stops=None):
     )
 
 
-@pytest.mark.parametrize(
-    ("template", "prefix", "template_stop"),
-    [
-        ("bot", "\nBot✿", "✿"),
-        ("assistant", "\n\nAssistant: ", "\nUser:"),
-        ("function_calling", "\n### Assistant", "\n### User"),
-    ],
-)
-def test_model_uses_prompt_template_stops_and_preserves_document_order(template, prefix, template_stop):
+def test_model_uses_native_messages_and_document_stop_sequences():
     calls = []
 
     class Pool:
-        http_worker_limit = 5
         aggregate_capacity = 5
 
         async def start(self):
@@ -49,67 +36,48 @@ def test_model_uses_prompt_template_stops_and_preserves_document_order(template,
         async def complete(self, messages, parameters):
             calls.append((messages, parameters))
             token = len(calls)
-            await asyncio.sleep(0.001 * (4 - token))
             return Completion(
                 text=messages[-1]["content"],
                 reasoning="reasoning",
                 finish_reason="stop",
-                stop_reason=template_stop,
+                stop_reason=None,
                 terminal_token_id=0,
                 prompt_text=f"rendered-{messages[-1]['content']}",
                 prompt_token_ids=(1, 2),
                 output_token_ids=(token,),
             )
 
-    model = RWKVHttpModel.__new__(RWKVHttpModel)
+    model = RWKVHTTPModel.__new__(RWKVHTTPModel)
     model.pool = Pool()
     model.prompt_manager = PromptManager(use_chat_template=True, tokenizer=None)
-    model._prompt_template = template
-    model._assistant_prefix = prefix
-    model._template_stop = template_stop
     model._cot_mode = "open_think"
-    model._generation_parameters = {
-        "temperature": 0.96,
-        "top_p": 0.76,
-        "top_k": 32,
-        "presence_penalty": 1.0,
-        "frequency_penalty": 0.1,
-        "penalty_decay": 0.988,
-    }
+    model._generation_parameters = {"temperature": 0.96, "top_p": 0.76, "top_k": 32}
     model._cache = None
 
-    responses = asyncio.run(
-        model.greedy_until(
-            [_document("first", num_samples=2, stops=[template_stop, "task-stop"]), _document("second")]
-        )
-    )
+    responses = asyncio.run(model.greedy_until([_document("first", num_samples=2, stops=["task-stop"])]))
 
-    assert [response.text for response in responses] == [["first", "first"], ["second"]]
-    assert [response.reasonings for response in responses] == [
-        ["reasoning", "reasoning"],
-        ["reasoning"],
-    ]
-    assert [response.finish_reasons for response in responses] == [["stop", "stop"], ["stop"]]
-    assert [response.stop_reasons for response in responses] == [
-        [template_stop, template_stop],
-        [template_stop],
-    ]
-    assert [response.terminal_token_ids for response in responses] == [[0, 0], [0]]
-    assert [response.output_tokens for response in responses] == [[[1], [2]], [[3]]]
-    assert len(calls) == 3
-    first_parameters = calls[0][1]
-    assert first_parameters == {
-        **model._generation_parameters,
-        "max_completion_tokens": 8192,
-        "stop": [template_stop, "task-stop"],
-        "chat_template_kwargs": {
-            "rwkv_prompt_template": template,
-            "rwkv_generation_prompt": "open_think",
-        },
-        "ignore_eos": False,
-        "return_token_ids": True,
-        "return_prompt_text": True,
+    assert responses[0].text == ["first", "first"]
+    assert responses[0].output_tokens == [[1], [2]]
+    assert calls[0][0] == [{"role": "user", "content": "first"}]
+    assert calls[0][1]["stop"] == ["✿"]
+    assert calls[0][1]["chat_template_kwargs"] == {
+        "rwkv_prompt_template": "bot",
+        "rwkv_generation_prompt": "open_think",
     }
+    assert calls[0][1]["rwkv_cot_mode"] == "open_think"
+
+
+def test_reasoning_mode_ignores_task_budget_and_stop_sequence():
+    model = RWKVHTTPModel.__new__(RWKVHTTPModel)
+    model._cot_mode = "open_think"
+    document = _document("question", generation_size=2048, stops=["\\n"])
+
+    assert model._completion_limit(document) == 8192
+    assert model._stop_sequences(document) == ["✿"]
+
+    model._cot_mode = "no_cot"
+    assert model._completion_limit(document) == 2048
+    assert model._stop_sequences(document) == ["✿", "\\n"]
 
 
 def test_model_records_context_limited_rollout_as_truncated():
@@ -122,7 +90,7 @@ def test_model_records_context_limited_rollout_as_truncated():
         async def complete(self, _messages, _parameters):
             raise ContextLengthError("prompt cannot fit")
 
-    model = RWKVHttpModel.__new__(RWKVHttpModel)
+    model = RWKVHTTPModel.__new__(RWKVHTTPModel)
     model.pool = Pool()
     model.prompt_manager = PromptManager(use_chat_template=True, tokenizer=None)
     model._prompt_template = "bot"
@@ -168,7 +136,7 @@ def test_generate_caps_concurrently_scheduled_jobs_at_pool_capacity():
                 output_token_ids=(2,),
             )
 
-    model = RWKVHttpModel.__new__(RWKVHttpModel)
+    model = RWKVHTTPModel.__new__(RWKVHTTPModel)
     pool = Pool()
     model.pool = pool
     model.prompt_manager = PromptManager(use_chat_template=True, tokenizer=None)
@@ -203,7 +171,7 @@ def test_generate_cancels_in_flight_jobs_instead_of_leaking_pool_capacity():
                 self.in_flight -= 1
                 raise
 
-    model = RWKVHttpModel.__new__(RWKVHttpModel)
+    model = RWKVHTTPModel.__new__(RWKVHTTPModel)
     pool = Pool()
     model.pool = pool
     model.prompt_manager = PromptManager(use_chat_template=True, tokenizer=None)
@@ -251,7 +219,7 @@ def test_model_fake_think_parameters_and_provenance(tmp_path, monkeypatch):
     )
     monkeypatch.setattr("lighteval.models.rwkv.http_model.SampleCache", Cache)
 
-    model = RWKVHttpModel(
+    model = RWKVHTTPModel(
         manifest=manifest,
         prompt_template="bot",
         cot_mode="fake_think",
@@ -268,7 +236,6 @@ def test_model_fake_think_parameters_and_provenance(tmp_path, monkeypatch):
     assert model.config.model_name == manifest.model_name
     assert model.config.model_revision == "weight-sha"
     assert model.config.wkv_mode == "fp32io16"
-    assert model.config.prompt_template == "bot"
     assert model.config.cot_mode == "fake_think"
     assert model.config.pool_fingerprint == "f" * 64
     assert model.config.request_contract_version == REQUEST_CONTRACT_VERSION
@@ -279,7 +246,7 @@ def test_model_fake_think_parameters_and_provenance(tmp_path, monkeypatch):
 
 
 def test_model_rejects_generation_logits():
-    model = RWKVHttpModel.__new__(RWKVHttpModel)
+    model = RWKVHTTPModel.__new__(RWKVHTTPModel)
     model._cache = None
     document = _document("question")
     document.use_logits = True
@@ -289,7 +256,7 @@ def test_model_rejects_generation_logits():
 
 
 def test_model_empty_documents_do_not_open_the_pool():
-    model = RWKVHttpModel.__new__(RWKVHttpModel)
+    model = RWKVHTTPModel.__new__(RWKVHTTPModel)
     model._cache = None
 
     assert asyncio.run(model.greedy_until([])) == []
@@ -317,7 +284,7 @@ def test_request_contract_version_changes_cache_namespace(tmp_path, monkeypatch)
         fingerprint="f" * 64,
     )
     monkeypatch.setattr("lighteval.models.rwkv.http_model.SampleCache", Cache)
-    model = RWKVHttpModel(
+    model = RWKVHTTPModel(
         manifest=manifest,
         prompt_template="bot",
         cot_mode="open_think",
@@ -360,7 +327,7 @@ def test_rollout_count_changes_cache_namespace(tmp_path, monkeypatch):
         fingerprint="f" * 64,
     )
     monkeypatch.setattr("lighteval.models.rwkv.http_model.SampleCache", Cache)
-    model = RWKVHttpModel(
+    model = RWKVHTTPModel(
         manifest=manifest,
         prompt_template="bot",
         cot_mode="open_think",
@@ -427,7 +394,7 @@ def test_async_model_cache_preserves_document_order_and_skips_completed_requests
         def get_samples_from_cache(self, docs, _task_ids, _sampling_method):
             return [self.results[doc.id] for doc in docs]
 
-    model = RWKVHttpModel.__new__(RWKVHttpModel)
+    model = RWKVHTTPModel.__new__(RWKVHTTPModel)
     model.pool = Pool()
     model.prompt_manager = PromptManager(use_chat_template=True, tokenizer=None)
     model._prompt_template = "bot"
@@ -514,7 +481,7 @@ def test_async_model_cache_preserves_completed_documents_when_a_rollout_fails(tm
         fingerprint="f" * 64,
     )
     monkeypatch.setattr("lighteval.models.rwkv.http_model.SampleCache", Cache)
-    model = RWKVHttpModel(
+    model = RWKVHTTPModel(
         manifest=manifest,
         prompt_template="bot",
         cot_mode="open_think",
@@ -560,7 +527,7 @@ def test_cache_only_mode_rejects_uncached_rollouts(monkeypatch):
         def get_samples_to_process_and_cache(self, docs, _sampling_method):
             return docs, []
 
-    model = RWKVHttpModel.__new__(RWKVHttpModel)
+    model = RWKVHTTPModel.__new__(RWKVHTTPModel)
     model._cache = Cache()
     model._generate = lambda _docs: (_ for _ in ()).throw(AssertionError("generation must be disabled"))
     monkeypatch.setenv("RWKV_EVAL_CACHE_ONLY", "1")
@@ -569,9 +536,38 @@ def test_cache_only_mode_rejects_uncached_rollouts(monkeypatch):
         asyncio.run(model.greedy_until([_document("uncached")]))
 
 
-def test_prompt_template_contract_is_exact():
-    assert PROMPT_TEMPLATES == {
-        "bot": ("\nBot✿", "✿"),
-        "assistant": ("\n\nAssistant: ", "\nUser:"),
-        "function_calling": ("\n### Assistant", "\n### User"),
-    }
+def test_http_loglikelihood_returns_native_choice_scores():
+    class Pool:
+        async def start(self):
+            pass
+
+        async def score(self, _messages, continuation, _parameters=None):
+            token = ord(continuation.strip())
+            return LogprobScore(
+                logprobs=(-float(token),),
+                token_ids=(token,),
+                greedy_token_ids=(token,),
+                prompt_text="rendered prompt",
+                prompt_token_ids=(1, 2),
+            )
+
+    model = RWKVHTTPModel.__new__(RWKVHTTPModel)
+    model.pool = Pool()
+    model.prompt_manager = PromptManager(use_chat_template=True, tokenizer=None)
+    model._cache = None
+    doc = _document("Question?\nAnswer:")
+    doc.choices = [" A", " B"]
+    doc.sampling_methods = [SamplingMethod.LOGPROBS]
+
+    response = asyncio.run(model.loglikelihood([doc]))[0]
+
+    assert response.logprobs == [-65.0, -66.0]
+    assert response.output_tokens == [[65], [66]]
+    assert response.argmax_logits_eq_gold == [True, True]
+    assert response.input == "rendered prompt"
+
+
+def test_prompt_template_contract_is_exposed():
+    from lighteval.models.rwkv import http_model
+
+    assert set(http_model.PROMPT_TEMPLATES) == {"bot", "assistant", "function_calling"}

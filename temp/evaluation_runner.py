@@ -127,7 +127,10 @@ def _model_config(args: argparse.Namespace, evaluation: ModelEvaluation) -> Path
     root = getattr(args, "output_root", Path("results")) / getattr(args, "run_id", "default") / evaluation.size.lower()
     root.mkdir(parents=True, exist_ok=True)
     text = args.config.read_text()
-    lines = [f'output_dir = "{root.resolve()}"' if line.strip().startswith("output_dir") else line for line in text.splitlines()]
+    lines = [
+        f'output_dir = "{root.resolve()}"' if line.strip().startswith("output_dir") else line
+        for line in text.splitlines()
+    ]
     path = root / ".runner-config.toml"
     path.write_text("\n".join(lines) + "\n")
     return path
@@ -257,8 +260,7 @@ def main(  # noqa: C901
         else:
             metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
     process_configs = {
-        evaluation.size: args.config if args.dry_run else _model_config(args, evaluation)
-        for evaluation in evaluations
+        evaluation.size: args.config if args.dry_run else _model_config(args, evaluation) for evaluation in evaluations
     }
     processes: dict[str, subprocess.Popen[bytes]] = {}
     process_lock = threading.Lock()
@@ -304,7 +306,11 @@ def main(  # noqa: C901
 
     if received_signal[0] is not None:
         return 128 + (received_signal[0] or signal.SIGTERM)
-    failed = [(evaluation.size, worker_results[evaluation.size]) for evaluation in evaluations if worker_results[evaluation.size]]
+    failed = [
+        (evaluation.size, worker_results[evaluation.size])
+        for evaluation in evaluations
+        if worker_results[evaluation.size]
+    ]
     if failed:
         summary = ", ".join(f"{size}={return_code}" for size, return_code in failed)
         print(f"RWKV evaluations failed: {summary}", flush=True)

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
@@ -18,7 +19,7 @@ from lighteval.tasks.prompt_manager import PromptManager
 from lighteval.tasks.requests import Doc, SamplingMethod
 from lighteval.utils.cache_management import SampleCache
 
-from .http_pool import Completion, ContextLengthError, PoolError, PoolManifest, RWKVHttpPool
+from .http_pool import Completion, ContextLengthError, LogprobScore, PoolError, PoolManifest, RWKVHttpPool
 
 
 logger = logging.getLogger(__name__)
@@ -27,7 +28,7 @@ MAX_NEW_TOKENS = 8192
 # `SampleCache.cache_samples()`, which reads-back + rewrites the whole task cache file on every
 # call. Scoring itself is NOT gated by this batch size - only this cache write is.
 STREAMING_FLUSH_BATCH_SIZE = 64
-REQUEST_CONTRACT_VERSION = "rwkv-generation-v2"
+REQUEST_CONTRACT_VERSION = "rwkv-native-request-v4"
 CACHE_POOL_FINGERPRINT = "transport-independent"
 PROMPT_TEMPLATES: dict[str, tuple[str, str]] = {
     "bot": ("\nBot✿", "✿"),
@@ -35,6 +36,11 @@ PROMPT_TEMPLATES: dict[str, tuple[str, str]] = {
     "function_calling": ("\n### Assistant", "\n### User"),
 }
 SAMPLING_PARAMETERS: dict[str, dict[str, object]] = {
+    "no_cot": {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 0,
+    },
     "open_think": {
         "temperature": 0.96,
         "top_p": 0.76,
@@ -75,8 +81,8 @@ class _Job:
     parameters: dict[str, object]
 
 
-class RWKVHttpModel(LightevalModel):
-    """Generative LightEval adapter for an existing RWKV vLLM endpoint pool."""
+class RWKVHTTPModel(LightevalModel):
+    """Native generative and log-probability adapter for an RWKV HTTP pool."""
 
     is_async = True
 
@@ -185,20 +191,6 @@ class RWKVHttpModel(LightevalModel):
                     await on_document_ready(doc, result)
         return results
 
-    def pending_rollouts(self, docs: list[Doc]) -> int:
-        """Return the uncached rollout count used by the benchmark scheduler."""
-        if self._cache is None:
-            return sum(doc.num_samples for doc in docs)
-        num_samples = {doc.num_samples for doc in docs}
-        pending_rollouts = 0
-        for num_samples_for_group in num_samples:
-            group_docs = [doc for doc in docs if doc.num_samples == num_samples_for_group]
-            pending, _ = self._cache_for_num_samples(num_samples_for_group).get_samples_to_process_and_cache(
-                group_docs, SamplingMethod.GENERATIVE
-            )
-            pending_rollouts += len(pending) * num_samples_for_group
-        return pending_rollouts
-
     def _cache_for_num_samples(self, num_samples: int) -> SampleCache:
         if num_samples == 1:
             return self._cache
@@ -236,10 +228,7 @@ class RWKVHttpModel(LightevalModel):
             parameters.update(
                 max_completion_tokens=self._completion_limit(doc),
                 stop=self._stop_sequences(doc),
-                chat_template_kwargs={
-                    "rwkv_prompt_template": self._prompt_template,
-                    "rwkv_generation_prompt": self._cot_mode,
-                },
+                **self._prompt_parameters(),
                 ignore_eos=False,
                 return_token_ids=True,
                 return_prompt_text=True,
@@ -358,9 +347,7 @@ class RWKVHttpModel(LightevalModel):
 
             try:
                 while pending_requests:
-                    done, pending_requests = await asyncio.wait(
-                        pending_requests, return_when=asyncio.FIRST_COMPLETED
-                    )
+                    done, pending_requests = await asyncio.wait(pending_requests, return_when=asyncio.FIRST_COMPLETED)
                     for request in done:
                         job = request_jobs.pop(request)
                         try:
@@ -399,8 +386,12 @@ class RWKVHttpModel(LightevalModel):
         flush_cache_buffer()
         return responses
 
-    @staticmethod
-    def _completion_limit(doc: Doc) -> int:
+    def _completion_limit(self, doc: Doc) -> int:
+        # Reasoning modes need room for the hidden chain of thought. A native
+        # task budget such as math's 2048-token limit is intended for a short
+        # final answer and can truncate CoT before it reaches that answer.
+        if getattr(self, "_cot_mode", "open_think") in {"open_think", "fake_think"}:
+            return MAX_NEW_TOKENS
         if (
             isinstance(doc.generation_size, int)
             and not isinstance(doc.generation_size, bool)
@@ -409,15 +400,177 @@ class RWKVHttpModel(LightevalModel):
             return min(doc.generation_size, MAX_NEW_TOKENS)
         return MAX_NEW_TOKENS
 
+    def _prompt_parameters(self) -> dict[str, object]:
+        return {
+            "chat_template_kwargs": {
+                "rwkv_prompt_template": getattr(self, "_prompt_template", "bot"),
+                "rwkv_generation_prompt": getattr(self, "_cot_mode", "open_think"),
+            },
+            "rwkv_cot_mode": getattr(self, "_cot_mode", "open_think"),
+        }
+
     def _stop_sequences(self, doc: Doc) -> list[str]:
-        configured = [self._template_stop, *(doc.stop_sequences or [])]
+        template_stop = getattr(self, "_template_stop", PROMPT_TEMPLATES["bot"][1])
+        configured = [template_stop]
+        if getattr(self, "_cot_mode", "open_think") not in {"open_think", "fake_think"}:
+            configured.extend(doc.stop_sequences or [])
         return list(dict.fromkeys(stop for stop in configured if isinstance(stop, str) and stop))
 
-    def loglikelihood(self, docs: list[Doc]) -> list[ModelResponse]:
-        raise NotImplementedError("RWKV HTTP evaluation is generative only")
+    def pending_rollouts(self, docs: list[Doc]) -> int:
+        """Count uncached requests in all native request categories."""
+        total = 0
+        for method in (SamplingMethod.GENERATIVE, SamplingMethod.LOGPROBS, SamplingMethod.PERPLEXITY):
+            method_docs = [
+                doc for doc in docs if method in getattr(doc, "sampling_methods", [SamplingMethod.GENERATIVE])
+            ]
+            if not method_docs:
+                continue
+            if self._cache is None:
+                total += sum(doc.num_samples if method == SamplingMethod.GENERATIVE else 1 for doc in method_docs)
+                continue
+            if method == SamplingMethod.GENERATIVE:
+                for count in {doc.num_samples for doc in method_docs}:
+                    group = [doc for doc in method_docs if doc.num_samples == count]
+                    pending, _ = self._cache_for_num_samples(count).get_samples_to_process_and_cache(group, method)
+                    total += len(pending) * count
+            else:
+                pending, _ = self._cache.get_samples_to_process_and_cache(method_docs, method)
+                total += len(pending)
+        return total
 
-    def loglikelihood_rolling(self, docs: list[Doc]) -> list[ModelResponse]:
-        raise NotImplementedError("RWKV HTTP evaluation is generative only")
+    async def loglikelihood(
+        self,
+        docs: list[Doc],
+        *,
+        on_document_ready: Callable[[Doc, ModelResponse], Awaitable[None]] | None = None,
+    ) -> list[ModelResponse]:
+        return await self._logprob_requests(docs, SamplingMethod.LOGPROBS, on_document_ready=on_document_ready)
+
+    async def loglikelihood_rolling(
+        self,
+        docs: list[Doc],
+        *,
+        on_document_ready: Callable[[Doc, ModelResponse], Awaitable[None]] | None = None,
+    ) -> list[ModelResponse]:
+        return await self._logprob_requests(docs, SamplingMethod.PERPLEXITY, on_document_ready=on_document_ready)
+
+    async def _logprob_requests(
+        self,
+        docs: list[Doc],
+        sampling_method: SamplingMethod,
+        *,
+        on_document_ready: Callable[[Doc, ModelResponse], Awaitable[None]] | None = None,
+    ) -> list[ModelResponse]:
+        if not docs:
+            return []
+        if self._cache is None:
+            return await self._score_docs(docs, sampling_method, on_document_ready=on_document_ready)
+        cache = self._cache
+        pending, _ = cache.get_samples_to_process_and_cache(docs, sampling_method)
+        if pending:
+            if os.environ.get("RWKV_EVAL_CACHE_ONLY") == "1":
+                raise ValueError(f"cache-only evaluation found uncached {sampling_method.name} requests")
+            await self._score_docs(pending, sampling_method, cache=cache, on_document_ready=on_document_ready)
+        task_ids = {cache.get_task_id(doc.task_name, sampling_method) for doc in docs}
+        results = list(cache.get_samples_from_cache(docs, task_ids, sampling_method))
+        if on_document_ready is not None:
+            pending_ids = {id(doc) for doc in pending}
+            for doc, response in zip(docs, results, strict=True):
+                if id(doc) not in pending_ids:
+                    await on_document_ready(doc, response)
+        return results
+
+    async def _score_docs(  # noqa: C901
+        self,
+        docs: list[Doc],
+        sampling_method: SamplingMethod,
+        *,
+        cache: SampleCache | None = None,
+        on_document_ready: Callable[[Doc, ModelResponse], Awaitable[None]] | None = None,
+    ) -> list[ModelResponse]:
+        await self.pool.start()
+        results: list[ModelResponse | None] = [None] * len(docs)
+        cache_docs: list[Doc] = []
+        cache_results: list[ModelResponse] = []
+
+        async def score_one(index: int, doc: Doc) -> None:
+            messages = self.prompt_manager.prepare_prompt_api(doc)
+            candidates = doc.choices if sampling_method == SamplingMethod.LOGPROBS else [""]
+            if not candidates:
+                candidates = [""]
+            scores: list[LogprobScore] = []
+            for candidate in candidates:
+                parameters = {
+                    "rolling": sampling_method == SamplingMethod.PERPLEXITY,
+                    **self._prompt_parameters(),
+                }
+                scores.append(await self.pool.score(messages, candidate, parameters))
+            unconditioned_scores = None
+            if sampling_method == SamplingMethod.LOGPROBS and getattr(doc, "unconditioned_query", None) is not None:
+                unconditioned_doc = copy(doc)
+                unconditioned_doc.query = doc.unconditioned_query
+                unconditioned_messages = self.prompt_manager.prepare_prompt_api(unconditioned_doc)
+                unconditioned_scores = []
+                for candidate in candidates:
+                    unconditioned_scores.append(
+                        await self.pool.score(unconditioned_messages, candidate, self._prompt_parameters())
+                    )
+            response = self._model_response_from_scores(
+                scores, sampling_method, unconditioned_scores=unconditioned_scores
+            )
+            results[index] = response
+            if cache is not None:
+                cache_docs.append(doc)
+                cache_results.append(response)
+            if on_document_ready is not None:
+                await on_document_ready(doc, response)
+
+        jobs = [asyncio.create_task(score_one(index, doc)) for index, doc in enumerate(docs)]
+        try:
+            await asyncio.gather(*jobs)
+        finally:
+            for job in jobs:
+                if not job.done():
+                    job.cancel()
+            if jobs:
+                await asyncio.gather(*jobs, return_exceptions=True)
+        if cache is not None and cache_docs:
+            cache.cache_samples(
+                docs=cache_docs,
+                results=cache_results,
+                task_ids={cache.get_task_id(doc.task_name, sampling_method) for doc in cache_docs},
+                sampling_method=sampling_method,
+            )
+        return [response for response in results if response is not None]
+
+    @staticmethod
+    def _model_response_from_scores(
+        scores: list[LogprobScore], sampling_method: SamplingMethod, unconditioned_scores=None
+    ) -> ModelResponse:
+        if sampling_method == SamplingMethod.PERPLEXITY:
+            score = scores[0]
+            return ModelResponse(
+                input=score.prompt_text,
+                input_tokens=list(score.prompt_token_ids),
+                output_tokens=[list(score.token_ids)],
+                logprobs=list(score.logprobs),
+                argmax_logits_eq_gold=[
+                    all(a == b for a, b in zip(score.token_ids, score.greedy_token_ids, strict=False))
+                ],
+            )
+        conditioned_logprobs = [score.sequence_logprob for score in scores]
+        unconditioned_logprobs = (
+            [score.sequence_logprob for score in unconditioned_scores] if unconditioned_scores is not None else None
+        )
+        return ModelResponse(
+            input=scores[0].prompt_text,
+            input_tokens=list(scores[0].prompt_token_ids),
+            output_tokens=[list(score.token_ids) for score in scores]
+            + ([list(score.token_ids) for score in unconditioned_scores] if unconditioned_scores else []),
+            logprobs=conditioned_logprobs + (unconditioned_logprobs or []),
+            argmax_logits_eq_gold=[score.token_ids == score.greedy_token_ids for score in scores],
+            unconditioned_logprobs=unconditioned_logprobs,
+        )
 
     def cleanup(self) -> None:
         self.pool.close()

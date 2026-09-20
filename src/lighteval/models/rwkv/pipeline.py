@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import fcntl
 import hashlib
+import inspect
 import json
 import logging
 import queue
@@ -21,18 +22,10 @@ from datasets import config as datasets_config
 
 from lighteval.metrics import apply_metric
 from lighteval.metrics.metrics_sample import SampleLevelComputation, SamplingMetric
-from lighteval.metrics.utils.metric_utils import SampleLevelMetric
-from lighteval.models.rwkv.http_model import MAX_NEW_TOKENS, STREAMING_FLUSH_BATCH_SIZE
+from lighteval.models.rwkv.http_model import STREAMING_FLUSH_BATCH_SIZE
 from lighteval.pipeline import Pipeline
 from lighteval.tasks.registry import Registry
 from lighteval.tasks.requests import Doc, SamplingMethod
-from lighteval.tasks.rwkv_free_response import is_rwkv_free_response, rwkv_free_response_metrics
-from lighteval.tasks.rwkv_single_choice import (
-    convert_rwkv_choice,
-    extract_rwkv_choice_answer,
-    is_rwkv_choice,
-    rwkv_choice_metrics,
-)
 
 
 _TARGET_COMPLETIONS = 4096
@@ -81,11 +74,6 @@ def _download_dataset(task):
         return task.download_dataset_worker(task)
 
 
-def _open_think_answer(text: str) -> str:
-    _, closed, answer = text.partition("</think>")
-    return answer.replace("</think>", "") if closed else text
-
-
 class RWKVAvgAtK(SampleLevelComputation):
     """Average one native task scorer over exactly k independent completions."""
 
@@ -96,24 +84,60 @@ class RWKVAvgAtK(SampleLevelComputation):
     def __str__(self) -> str:
         return f"RWKVAvgAtK(k={self.k})"
 
-    def compute(self, doc: Doc, model_response, **kwargs) -> float:
-        scores = []
-        extracted_answers = []
-        for index in range(self.k):
-            response = model_response[index]
-            scores.append(self.score_rollout(doc, response))
-            extracted_answers.append(self.extract_rollout_answer(doc, response))
+    def compute(self, doc: Doc, model_response, **kwargs):
+        grouped_values = None
+        if isinstance(self.metric.metric_name, (list, tuple)):
+            names = tuple(self.metric.metric_name)
+            grouped_values = {name: [] for name in names}
+            scores = []
+            extracted_answers = []
+            for index in range(self.k):
+                response = model_response[index]
+                if response.finish_reasons == ["length"]:
+                    native = dict.fromkeys(names, 0.0)
+                else:
+                    native = self.metric.compute_sample(doc=doc, model_response=response)
+                for name in names:
+                    grouped_values[name].append(float(native[name]))
+                scores.append(float(native[names[0]]))
+                extracted_answers.append(self.extract_rollout_answer(doc, response))
+        else:
+            scores = []
+            extracted_answers = []
+            for index in range(self.k):
+                response = model_response[index]
+                scores.append(self.score_rollout(doc, response))
+                extracted_answers.append(self.extract_rollout_answer(doc, response))
 
         # DetailsLogger serializes Doc.specific with the native details artifact.
         # Keep the producer's per-rollout facts next to the document so downstream
         # publishers can report them without invoking a benchmark scorer again.
         specific = dict(doc.specific or {})
-        specific["rwkv_rollout_scores"] = scores
+        # Keep the historical primary-metric fields while retaining all native
+        # generative metrics when a task registers more than one scorer.
+        specific.setdefault("rwkv_rollout_scores", scores)
         specific["rwkv_rollout_extracted_answers"] = extracted_answers
         specific["rwkv_model_answers"] = extracted_answers
+        metric_names = (
+            tuple(self.metric.metric_name)
+            if isinstance(self.metric.metric_name, (list, tuple))
+            else (self.metric.metric_name,)
+        )
+        if len(metric_names) > 1:
+            score_by_metric = dict(specific.get("rwkv_rollout_scores_by_metric", {}))
+            for metric_name in metric_names:
+                score_by_metric[metric_name] = (
+                    [grouped_values[metric_name][index] for index in range(self.k)]
+                    if grouped_values is not None
+                    else scores
+                )
+            specific["rwkv_rollout_scores_by_metric"] = score_by_metric
         if self.k == 1:
             specific["rwkv_model_answer"] = extracted_answers[0] if extracted_answers else ""
         doc.specific = specific
+
+        if grouped_values is not None:
+            return {name: sum(items) / self.k for name, items in grouped_values.items()}
         return sum(scores) / self.k
 
     def score_rollout(self, doc: Doc, model_response) -> float:
@@ -185,36 +209,43 @@ def _make_document_ids_unique(docs: list[Doc]) -> None:
 
 
 def _configure_task_evaluation_plan(pipeline, task, docs) -> list[Doc]:
+    """Apply RWKV rollouts without changing the task's native request types."""
     original_num_docs = len(task.eval_docs())
     max_samples = pipeline.pipeline_parameters.max_samples
-    if max_samples is None:
-        effective_num_docs, k, metric_name = _evaluation_plan(original_num_docs)
+    has_generative = any(metric.category == SamplingMethod.GENERATIVE for metric in task.metrics)
+    if has_generative:
+        if max_samples is None:
+            effective_num_docs, k, _ = _evaluation_plan(original_num_docs)
+        else:
+            task_max_samples = getattr(pipeline, "_task_max_samples", {}).get(task.full_name, max_samples)
+            effective_num_docs, k = min(original_num_docs, task_max_samples), 1
     else:
-        task_max_samples = getattr(pipeline, "_task_max_samples", {}).get(task.full_name, max_samples)
-        effective_num_docs, k, metric_name = min(original_num_docs, task_max_samples), 1, "avg@1"
+        effective_num_docs, k = (
+            min(original_num_docs, max_samples) if max_samples is not None else original_num_docs,
+            1,
+        )
+
     docs = docs[:effective_num_docs]
     _make_document_ids_unique(docs)
-    source_metric = task.metrics[0]
-    source_name = source_metric.metric_name[0] if isinstance(source_metric.metric_name, (list, tuple)) else None
-    corpus_level_fn = source_metric.corpus_level_fn[source_name] if source_name else source_metric.corpus_level_fn
-    higher_is_better = source_metric.higher_is_better[source_name] if source_name else source_metric.higher_is_better
-    task.metrics = (
-        SampleLevelMetric(
-            metric_name=metric_name,
-            sample_level_fn=RWKVAvgAtK(k, source_metric),
-            category=SamplingMethod.GENERATIVE,
-            corpus_level_fn=corpus_level_fn,
-            higher_is_better=higher_is_better,
-        ),
-    )
-    task.num_samples = [1, k]
+    wrapped_metrics = []
+    for metric in task.metrics:
+        if metric.category != SamplingMethod.GENERATIVE:
+            wrapped_metrics.append(metric)
+            continue
+        wrapped = copy(metric)
+        wrapped.sample_level_fn = RWKVAvgAtK(k, metric)
+        wrapped_metrics.append(wrapped)
+    task.metrics = tuple(wrapped_metrics)
+    task.num_samples = list(dict.fromkeys([*getattr(task, "num_samples", [1]), *([k] if has_generative else [])]))
     for doc in docs:
-        doc.num_samples = k
+        # LOGPROBS/PERPLEXITY requests are single requests.  Only documents
+        # participating in a generative metric receive independent rollouts.
+        doc.num_samples = k if SamplingMethod.GENERATIVE in doc.sampling_methods else 1
     task.config = copy(task.config)
     task.config.metrics = task.metrics
     task.config.original_num_docs = original_num_docs
     task.config.effective_num_docs = len(docs)
-    task.sampling_methods = [SamplingMethod.GENERATIVE]
+    task.sampling_methods = list(dict.fromkeys(metric.category for metric in task.metrics))
     return docs
 
 
@@ -282,97 +313,19 @@ class RWKVPipeline(Pipeline):
             self._update_num_samples(list(self.tasks_dict.values()))
 
     def _prepare_task_documents(self, task):
+        # Task formatters and request categories belong to LightEval.  In
+        # particular, choices must remain available to LOGPROBS requests.
         max_samples = self._task_max_samples.get(task.full_name, self.pipeline_parameters.max_samples)
-        docs = task.get_docs(max_samples)
-        self._prepare_truthfulqa_mc1(task, docs)
-        self._prepare_choice_task(task, docs)
-        self._prepare_free_response_task(task)
-        if self.model.config.cot_mode == "open_think":
-            self._prepare_open_think_task(task, docs)
-        return docs
-
-    @staticmethod
-    def _prepare_truthfulqa_mc1(task, docs) -> None:
-        if task.full_name.rsplit("|", 1)[0] != "truthfulqa:mc":
-            return
-        for doc in docs:
-            len_mc1 = doc.specific["len_mc1"]
-            gold_indices = doc.gold_index if isinstance(doc.gold_index, list) else [doc.gold_index]
-            doc.choices = doc.choices[:len_mc1]
-            doc.gold_index = next(index for index in gold_indices if index < len_mc1)
-            doc.specific = dict(doc.specific, rwkv_truthfulqa_metric="mc1")
-
-    @staticmethod
-    def _prepare_open_think_task(task, docs) -> None:
-        for doc in docs:
-            doc.generation_size = MAX_NEW_TOKENS
-            doc.stop_sequences = []
-        task.config = copy(task.config)
-        task.config.generation_size = MAX_NEW_TOKENS
-        task.config.stop_sequence = []
-
-    @staticmethod
-    def _prepare_free_response_task(task) -> None:
-        if not is_rwkv_free_response(task.full_name):
-            return
-        task.config = copy(task.config)
-        task.metrics = tuple(
-            converted
-            for metric in task.metrics
-            for converted in (
-                rwkv_free_response_metrics(metric) if metric.category == SamplingMethod.GENERATIVE else (metric,)
-            )
-        )
-        task.config.metrics = task.metrics
-
-    @staticmethod
-    def _prepare_choice_task(task, docs) -> None:
-        unsupported = [
-            doc for doc in docs if SamplingMethod.LOGPROBS in doc.sampling_methods and not is_rwkv_choice(doc)
-        ]
-        if unsupported:
-            raise ValueError(
-                f"task {task.full_name} contains {len(unsupported)} "
-                "logprob documents which cannot be converted to generation"
-            )
-        choice_docs = [doc for doc in docs if is_rwkv_choice(doc)]
-        if not choice_docs:
-            return
-        for doc in choice_docs:
-            convert_rwkv_choice(doc)
-        task.config = copy(task.config)
-        task.config.original_num_docs = len(docs)
-        task.config.effective_num_docs = len(docs)
-        converted_metrics = tuple(
-            converted
-            for metric in task.metrics
-            for converted in (rwkv_choice_metrics(metric) if metric.category == SamplingMethod.LOGPROBS else (metric,))
-        )
-        task.metrics = (
-            converted_metrics[:1] if task.full_name.rsplit("|", 1)[0] == "truthfulqa:mc" else converted_metrics
-        )
-        task.config.metrics = task.metrics
-        task.sampling_methods = list(dict.fromkeys(metric.category for metric in task.metrics))
+        return task.get_docs(max_samples)
 
     def _post_process_outputs(self, sampling_method_responses) -> None:
-        if self.model.config.cot_mode != "open_think":
-            super()._post_process_outputs(sampling_method_responses)
-        else:
-            logger.info("--- POST-PROCESSING MODEL RESPONSES ---")
-            for responses in sampling_method_responses.values():
-                for response in responses:
-                    response.text_post_processed = [_open_think_answer(text) for text in response.text]
-
-        responses = sampling_method_responses.get(SamplingMethod.GENERATIVE, [])
-        for doc, response in zip(self.sampling_docs.get(SamplingMethod.GENERATIVE, []), responses):
-            if not isinstance(doc.specific, dict) or doc.specific.get("rwkv_choice") is not True:
-                continue
-            response.text_post_processed = [
-                ""
-                if index < len(response.finish_reasons) and response.finish_reasons[index] == "length"
-                else extract_rwkv_choice_answer(text, doc.choices, doc.query)
-                for index, text in enumerate(response.text)
-            ]
+        # Use LightEval's normal response processing.  RWKV-specific answer
+        # extraction is performed only by the native generative scorer wrapped
+        # by RWKVAvgAtK; log-probability responses never pass through it.
+        if SamplingMethod.GENERATIVE in sampling_method_responses:
+            super()._post_process_outputs(
+                {SamplingMethod.GENERATIVE: sampling_method_responses[SamplingMethod.GENERATIVE]}
+            )
 
     def _index_task_documents(self, task, docs) -> None:
         self.documents_dict[task.full_name] = docs
@@ -456,7 +409,7 @@ class RWKVPipeline(Pipeline):
             self._index_task_documents(task, docs)
             return task_name, docs, self.model.pending_rollouts(docs)
 
-        async def evaluate_task(task_name, docs, pending_rollouts) -> None:
+        async def evaluate_task(task_name, docs, pending_rollouts) -> None:  # noqa: C901
             logger.info(
                 "RWKV task model call started: task=%s documents=%d pending_rollouts=%d",
                 task_name,
@@ -464,11 +417,39 @@ class RWKVPipeline(Pipeline):
                 pending_rollouts,
             )
 
-            async def on_document_ready(doc, response) -> None:
+            async def on_document_ready(doc, response, sampling_method) -> None:
+                # ModelResponse is deliberately tagged outside the serialized
+                # response schema.  This keeps the queue compatible with the
+                # native details format while allowing mixed tasks to share a
+                # document and be scored by their actual request category.
+                response._rwkv_sampling_method = sampling_method
                 await self._submit_doc(scoring_queue, task_name, doc, response)
 
+            async def run_model_call(sampling_method, method_name, method_docs) -> None:
+                if not method_docs:
+                    return
+
+                async def ready(doc, response):
+                    await on_document_ready(doc, response, sampling_method)
+
+                method = getattr(self.model, method_name)
+                if inspect.iscoroutinefunction(method):
+                    await method(method_docs, on_document_ready=ready)
+                else:
+                    # Native synchronous adapters are allowed in the same
+                    # pipeline; run their blocking call off the HTTP loop.
+                    responses = await asyncio.to_thread(method, method_docs)
+                    for doc, response in zip(method_docs, responses, strict=True):
+                        await ready(doc, response)
+
             async def run_task() -> None:
-                await self.model.greedy_until(docs, on_document_ready=on_document_ready)
+                for sampling_method, method_name in (
+                    (SamplingMethod.GENERATIVE, "greedy_until"),
+                    (SamplingMethod.LOGPROBS, "loglikelihood"),
+                    (SamplingMethod.PERPLEXITY, "loglikelihood_rolling"),
+                ):
+                    method_docs = [doc for doc in docs if sampling_method in doc.sampling_methods]
+                    await run_model_call(sampling_method, method_name, method_docs)
                 await self._submit_task_done(scoring_queue, task_name)
 
             scoring_task = asyncio.create_task(run_task())
@@ -624,13 +605,25 @@ class RWKVPipeline(Pipeline):
             loop.call_soon_threadsafe(cls._resolve_score, future, error)
 
     def _score_doc(self, task_name: str, doc: Doc, response) -> None:
-        sampling_method_responses = {SamplingMethod.GENERATIVE: [response]}
-        self.sampling_docs = {SamplingMethod.GENERATIVE: [doc]}
-        self._post_process_outputs(sampling_method_responses)
+        sampling_method = getattr(response, "_rwkv_sampling_method", None)
+        if sampling_method is None:
+            categories = [
+                method
+                for method in (SamplingMethod.GENERATIVE, SamplingMethod.LOGPROBS, SamplingMethod.PERPLEXITY)
+                if method in doc.sampling_methods
+            ]
+            if len(categories) != 1:
+                raise ValueError(f"cannot infer request category for mixed task document {doc.id}")
+            sampling_method = categories[0]
+        if sampling_method != SamplingMethod.GENERATIVE:
+            response.text_post_processed = None
+        self.sampling_docs = {sampling_method: [doc]}
+        if sampling_method == SamplingMethod.GENERATIVE:
+            self._post_process_outputs({sampling_method: [response]})
         task = self.tasks_dict[task_name]
-        metric_category_metrics = [
-            metric for metric in task.metrics if metric.category == SamplingMethod.GENERATIVE
-        ]
+        metric_category_metrics = [metric for metric in task.metrics if metric.category == sampling_method]
+        if not metric_category_metrics:
+            raise ValueError(f"task {task_name} has no metrics for {sampling_method.name}")
         outputs = apply_metric(docs=[doc], responses=[response], metrics=metric_category_metrics)
         output = outputs[0]
         self.evaluation_tracker.metrics_logger.log(task_name, output)

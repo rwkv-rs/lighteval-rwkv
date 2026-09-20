@@ -88,7 +88,7 @@ def test_config_rejects_unknown_fields_and_duplicate_selectors(tmp_path):
     config = tmp_path / "eval.toml"
     config.write_text(
         f"""
-schema_version = 1
+schema_version = 2
 run_mode = "full"
 pool_manifest = "{manifest}"
 output_dir = "results"
@@ -112,7 +112,7 @@ def test_config_requires_referenced_manifest_environment(tmp_path):
     config = tmp_path / "eval.toml"
     config.write_text(
         """
-schema_version = 1
+schema_version = 2
 run_mode = "full"
 pool_manifest = "${RWKV_EVAL_POOL_MANIFEST}"
 output_dir = "results"
@@ -155,7 +155,7 @@ def test_config_rejects_ambiguous_run_mode(tmp_path, run_mode, max_samples, mess
     manifest.write_text("{}", encoding="utf-8")
     config = tmp_path / "eval.toml"
     config.write_text(
-        f'''schema_version = 1
+        f'''schema_version = 2
 run_mode = "{run_mode}"
 {max_samples}pool_manifest = "{manifest}"
 output_dir = "results"
@@ -209,5 +209,24 @@ def test_resolver_expands_supersets_and_rejects_perplexity(monkeypatch):
     assert resolved.selector_count == 1
     assert resolved.leaf_tasks == ("suite:one", "suite:two")
 
-    with pytest.raises(ConfigError, match="incompatible.*ppl"):
+    with pytest.raises(ConfigError, match="unsupported.*ppl"):
         resolve_benchmarks(("ppl",))
+
+
+def test_config_accepts_no_cot_mode(tmp_path):
+    manifest = tmp_path / "pool.json"
+    manifest.write_text("{}", encoding="utf-8")
+    config = tmp_path / "eval.toml"
+    config.write_text(
+        f'''schema_version = 2
+run_mode = "full"
+pool_manifest = "{manifest}"
+output_dir = "results"
+prompt_template = "bot"
+cot_mode = "no_cot"
+benchmarks = ["gsm8k"]
+''',
+        encoding="utf-8",
+    )
+
+    assert RWKVEvaluationConfig.read(config).cot_mode == "no_cot"
