@@ -41,6 +41,7 @@ from lighteval.utils.imports import is_package_available, requires
 
 
 logger = logging.getLogger(__name__)
+CHOICE_FALLBACK_MAX_NEW_TOKENS = 8
 
 
 def _strip_question_answer_completion_template(prompt: Any) -> Any:
@@ -447,6 +448,15 @@ class LiteLLMClient(LightevalModel):
                     self._prepare_choice_doc(doc)
             contexts = [self.prompt_manager.prepare_prompt_api(doc) for doc in dataset]
             max_new_tokens = split[0].generation_size  # could be none
+            if any((doc.specific or {}).get("_rwkv_choice_extractor") for doc in split):
+                # This is the generation fallback for a loglikelihood request.
+                # Never inherit a task's open-ended generation_size (for
+                # example BigBench Hard uses -1) for a NoCoT choice probe.
+                max_new_tokens = (
+                    min(max_new_tokens, CHOICE_FALLBACK_MAX_NEW_TOKENS)
+                    if max_new_tokens
+                    else CHOICE_FALLBACK_MAX_NEW_TOKENS
+                )
             return_logits = split[0].use_logits
             num_samples = split[0].num_samples
             stop_sequence = split[0].stop_sequences
