@@ -376,12 +376,18 @@ def _make_score(
         answers = [str(answer) for answer in (response.final_text or [])]
         choices = getattr(doc, "choices", None) or []
         logprobs = getattr(response, "logprobs", []) or []
+        nocot_choice_score: float | None = None
         if cot_mode == "NoCoT" and choices and len(logprobs) >= len(choices):
             # NoCoT details show the greedy option token, not a generated
-            # explanation that happened to contain an option letter.
+            # explanation that happened to contain an option letter.  Score
+            # and display the option index, because the choice text (e.g. 6)
+            # is not the answer token (C) sent by the model.
             if not (doc.specific or {}).get("_rwkv_missing_answer"):
                 predicted = max(range(len(choices)), key=logprobs.__getitem__)
                 answers = [chr(ord("A") + predicted)]
+                gold_indices = doc.gold_index if isinstance(doc.gold_index, (list, tuple)) else [doc.gold_index]
+                nocot_choice_score = float(predicted in gold_indices)
+                ground_truth = ", ".join(chr(ord("A") + int(index)) for index in gold_indices)
         elif not any(answer.strip() for answer in answers) and choices and len(logprobs) >= len(choices):
             predicted = max(range(len(choices)), key=logprobs.__getitem__)
             answers = [chr(ord("A") + predicted)]
@@ -392,7 +398,9 @@ def _make_score(
             truncated += int(is_truncated)
             total += 1
 
-            detail_score = _native_detail_score(native)
+            detail_score = nocot_choice_score
+            if detail_score is None:
+                detail_score = _native_detail_score(native)
             if detail_score is None:
                 detail_score = _detail_score(task, doc, response, index)
 
