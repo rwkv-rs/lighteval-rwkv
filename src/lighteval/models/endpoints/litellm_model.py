@@ -523,15 +523,25 @@ class LiteLLMClient(LightevalModel):
         return choices
 
     @staticmethod
-    def _candidate_logprob(choice: dict[str, Any], prefix_length: int) -> float:
+    def _candidate_logprob(choice: dict[str, Any], prefix_token_ids: list[int]) -> float:
         token_ids = choice.get("prompt_token_ids")
         prompt_logprobs = choice.get("prompt_logprobs")
         if not isinstance(token_ids, list) or not isinstance(prompt_logprobs, list):
             raise RuntimeError("RWKV prompt_logprobs response did not contain token ids and logprobs")
-        if prefix_length >= len(token_ids) or len(prompt_logprobs) != len(token_ids):
+        if len(prompt_logprobs) != len(token_ids):
             raise RuntimeError("RWKV prompt_logprobs response has an invalid candidate span")
+        # Tokenizers may merge the final prefix token with the first candidate
+        # bytes.  The candidate span therefore starts at the longest common
+        # token prefix, not necessarily len(tokenize(prefix)).
+        candidate_start = 0
+        for prefix_id, token_id in zip(prefix_token_ids, token_ids):
+            if prefix_id != token_id:
+                break
+            candidate_start += 1
+        if candidate_start >= len(token_ids):
+            raise RuntimeError("RWKV prompt_logprobs response contains no candidate tokens")
         score = 0.0
-        for index in range(prefix_length, len(token_ids)):
+        for index in range(candidate_start, len(token_ids)):
             entries = prompt_logprobs[index]
             if not isinstance(entries, dict):
                 raise RuntimeError(f"RWKV prompt logprob is missing at token position {index}")
@@ -560,7 +570,7 @@ class LiteLLMClient(LightevalModel):
             candidate_choices = self._prompt_logprobs_request(prompts, top_logprobs=20)
             if len(candidate_choices) != len(prompts):
                 raise RuntimeError("RWKV prompt_logprobs response count did not match choices")
-            scores = [self._candidate_logprob(choice, len(prefix_token_ids)) for choice in candidate_choices]
+            scores = [self._candidate_logprob(choice, prefix_token_ids) for choice in candidate_choices]
             results.append(
                 ModelResponse(
                     text=[""],
