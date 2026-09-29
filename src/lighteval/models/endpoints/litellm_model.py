@@ -502,19 +502,26 @@ class LiteLLMClient(LightevalModel):
 
     def _prompt_logprobs_request(self, prompt: str | list[str], *, top_logprobs: int) -> list[dict[str, Any]]:
         """Request prompt token logprobs from the OpenAI-compatible completions API."""
-        response = requests.post(
-            f"{self.base_url.rstrip('/')}/completions",
-            headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {},
-            json={
-                "model": self.model,
-                "prompt": prompt,
-                "max_tokens": 0,
-                "echo": True,
-                "prompt_logprobs": top_logprobs,
-                "return_token_ids": True,
-            },
-            timeout=self.timeout or 120.0,
-        )
+        request_url = f"{self.base_url.rstrip('/')}/completions"
+        request_headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
+        request_body = {
+            "model": self.model,
+            "prompt": prompt,
+            "max_tokens": 0,
+            "echo": True,
+            "prompt_logprobs": top_logprobs,
+            "return_token_ids": True,
+        }
+        for attempt in range(3):
+            response = requests.post(
+                request_url,
+                headers=request_headers,
+                json=request_body,
+                timeout=self.timeout or 120.0,
+            )
+            if response.status_code < 500 or attempt == 2:
+                break
+            time.sleep(2**attempt)
         response.raise_for_status()
         payload = response.json()
         choices = payload.get("choices")
