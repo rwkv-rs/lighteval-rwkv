@@ -21,7 +21,6 @@
 # SOFTWARE.
 
 import logging
-import re
 import time
 from concurrent.futures import ThreadPoolExecutor
 from json import JSONDecodeError
@@ -41,7 +40,6 @@ from lighteval.utils.imports import is_package_available, requires
 
 
 logger = logging.getLogger(__name__)
-CHOICE_FALLBACK_MAX_NEW_TOKENS = 8
 
 
 def _strip_question_answer_completion_template(prompt: Any) -> Any:
@@ -443,20 +441,8 @@ class LiteLLMClient(LightevalModel):
             position=0,
             disable=self.disable_tqdm,
         ):
-            if self.config.generation_only:
-                for doc in split:
-                    self._prepare_choice_doc(doc)
             contexts = [self.prompt_manager.prepare_prompt_api(doc) for doc in dataset]
             max_new_tokens = split[0].generation_size  # could be none
-            if any((doc.specific or {}).get("_rwkv_choice_extractor") for doc in split):
-                # This is the generation fallback for a loglikelihood request.
-                # Never inherit a task's open-ended generation_size (for
-                # example BigBench Hard uses -1) for a NoCoT choice probe.
-                max_new_tokens = (
-                    min(max_new_tokens, CHOICE_FALLBACK_MAX_NEW_TOKENS)
-                    if max_new_tokens
-                    else CHOICE_FALLBACK_MAX_NEW_TOKENS
-                )
             return_logits = split[0].use_logits
             num_samples = split[0].num_samples
             stop_sequence = split[0].stop_sequences
@@ -516,48 +502,10 @@ class LiteLLMClient(LightevalModel):
 
     @cached(SamplingMethod.LOGPROBS)
     def loglikelihood(self, docs: list[Doc]) -> list[ModelResponse]:
-        """Use generated choice answers when the endpoint has no logprob API."""
-        if not self.config.generation_only:
-            raise NotImplementedError
-        responses = self.greedy_until(docs)
-        for doc, response in zip(docs, responses):
-            predicted = self._choice_index(response.final_text[0], len(doc.choices)) if doc.choices else None
-            if doc.specific is None:
-                doc.specific = {}
-            doc.specific["_rwkv_missing_answer"] = predicted is None
-            response.logprobs = (
-                [0.0 if index == predicted else -1.0 for index in range(len(doc.choices))]
-                if predicted is not None
-                else [0.0 for _ in doc.choices]
-            )
-            response.output_tokens = [[] for _ in doc.choices]
-            if predicted is not None and not any(str(text).strip() for text in response.final_text):
-                # Logit-based answers otherwise have no assistant turn in
-                # details.  Materialize the greedy choice as the same A/B/C
-                # token exposed by the generated-choice prompt.
-                response.text = [chr(ord("A") + predicted)]
-                response.finish_reasons = ["stop"]
-        return responses
-
-    @staticmethod
-    def _prepare_choice_doc(doc: Doc) -> None:
-        if not isinstance(doc.choices, list) or len(doc.choices) < 2:
-            return
-        if doc.specific is None:
-            doc.specific = {}
-        doc.specific["_rwkv_choice_extractor"] = True
-        labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[: len(doc.choices)]
-        if not any(re.search(rf"(?m)^\s*{label}\s*[.):]", doc.query) for label in labels):
-            options = "\n".join(f"{label}. {choice.strip()}" for label, choice in zip(labels, doc.choices))
-            doc.query = f"{doc.query.rstrip()}\n\n{options}\n\nAnswer:"
-        doc.stop_sequences = []
-
-    @staticmethod
-    def _choice_index(text: str, choice_count: int) -> int | None:
-        from src.rwkv_eval.answer_extract.multi_choices import extract_choice_indices
-
-        indices = extract_choice_indices(text, choice_count)
-        return indices[0] if indices else None
+        """Evaluate choice loglikelihoods through the provider's logprob API."""
+        raise NotImplementedError(
+            "RWKV loglikelihood requires the native prompt_logprobs implementation; refusing generation fallback"
+        )
 
     @cached(SamplingMethod.PERPLEXITY)
     def loglikelihood_rolling(self, docs: list[Doc]) -> list[ModelResponse]:

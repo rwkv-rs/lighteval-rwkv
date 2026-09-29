@@ -169,10 +169,6 @@ def _litelm_model(
         max_model_length=endpoint.ctx_len,
         cache_dir=cache_dir or "~/.cache/huggingface/lighteval",
         api_max_retry=5,
-        generation_only=True,
-        target_completions=4096,
-        minimum_completions=3000,
-        maximum_completions=6000,
         extra_body=extra_body,
         generation_parameters=GenerationParameters(
             temperature=sampling.temp,
