@@ -500,12 +500,78 @@ class LiteLLMClient(LightevalModel):
 
         return max_tokens
 
+    def _prompt_logprobs_request(self, prompt: str | list[str], *, top_logprobs: int) -> list[dict[str, Any]]:
+        """Request prompt token logprobs from the OpenAI-compatible completions API."""
+        response = requests.post(
+            f"{self.base_url.rstrip('/')}/completions",
+            headers={"Authorization": f"Bearer {self.api_key}"} if self.api_key else {},
+            json={
+                "model": self.model,
+                "prompt": prompt,
+                "max_tokens": 0,
+                "echo": True,
+                "prompt_logprobs": top_logprobs,
+                "return_token_ids": True,
+            },
+            timeout=self.timeout or 120.0,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not all(isinstance(choice, dict) for choice in choices):
+            raise RuntimeError("RWKV prompt_logprobs response did not contain choices")
+        return choices
+
+    @staticmethod
+    def _candidate_logprob(choice: dict[str, Any], prefix_length: int) -> float:
+        token_ids = choice.get("prompt_token_ids")
+        prompt_logprobs = choice.get("prompt_logprobs")
+        if not isinstance(token_ids, list) or not isinstance(prompt_logprobs, list):
+            raise RuntimeError("RWKV prompt_logprobs response did not contain token ids and logprobs")
+        if prefix_length >= len(token_ids) or len(prompt_logprobs) != len(token_ids):
+            raise RuntimeError("RWKV prompt_logprobs response has an invalid candidate span")
+        score = 0.0
+        for index in range(prefix_length, len(token_ids)):
+            entries = prompt_logprobs[index]
+            if not isinstance(entries, dict):
+                raise RuntimeError(f"RWKV prompt logprob is missing at token position {index}")
+            value = entries.get(str(token_ids[index]))
+            if not isinstance(value, dict) or not isinstance(value.get("logprob"), (int, float)):
+                raise RuntimeError(
+                    "RWKV prompt_logprobs did not return the selected candidate token; "
+                    "increase the server prompt_logprobs limit"
+                )
+            score += float(value["logprob"])
+        return score
+
     @cached(SamplingMethod.LOGPROBS)
     def loglikelihood(self, docs: list[Doc]) -> list[ModelResponse]:
-        """Evaluate choice loglikelihoods through the provider's logprob API."""
-        raise NotImplementedError(
-            "RWKV loglikelihood requires the native prompt_logprobs implementation; refusing generation fallback"
-        )
+        """Score each choice with native prompt logprobs; never generate a fallback answer."""
+        results: list[ModelResponse] = []
+        for doc in docs:
+            if not isinstance(doc.choices, list) or not doc.choices:
+                raise ValueError("RWKV loglikelihood requires a non-empty choice list")
+            prefix = doc.query
+            prefix_choice = self._prompt_logprobs_request(prefix, top_logprobs=1)[0]
+            prefix_token_ids = prefix_choice.get("prompt_token_ids")
+            if not isinstance(prefix_token_ids, list):
+                raise RuntimeError("RWKV prompt_logprobs response did not contain prefix token ids")
+            prompts = [prefix + str(choice) for choice in doc.choices]
+            candidate_choices = self._prompt_logprobs_request(prompts, top_logprobs=20)
+            if len(candidate_choices) != len(prompts):
+                raise RuntimeError("RWKV prompt_logprobs response count did not match choices")
+            scores = [self._candidate_logprob(choice, len(prefix_token_ids)) for choice in candidate_choices]
+            results.append(
+                ModelResponse(
+                    text=[""],
+                    input=prefix,
+                    input_tokens=prefix_token_ids,
+                    logprobs=scores,
+                    output_tokens=[[] for _ in scores],
+                    finish_reasons=["stop"],
+                )
+            )
+        return results
 
     @cached(SamplingMethod.PERPLEXITY)
     def loglikelihood_rolling(self, docs: list[Doc]) -> list[ModelResponse]:
