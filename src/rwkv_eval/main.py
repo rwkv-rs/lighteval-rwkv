@@ -63,6 +63,7 @@ _NO_COT_BENCHMARKS = (
     "mmlu_redux_2",
     "arc",
     "ceval",
+    "ceval_zho_mcf",
     "truthfulqa",
     "openbookqa",
     "hellaswag",
