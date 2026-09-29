@@ -77,7 +77,10 @@ _HIGH_COT_BENCHMARKS = (
     "gpqa",
     "aime24",
     "aime25",
+    "aimo_progress_prize_1",
     "olympiad_bench",
+    "math",
+    "lcb",
 )
 _FAKE_COT_BENCHMARKS = ("asdiv", "arithmetic")
 
