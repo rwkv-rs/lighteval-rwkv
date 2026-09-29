@@ -301,6 +301,14 @@ def _choice_indices(doc: Any) -> list[int]:
     return [int(index) for index in value] if isinstance(value, (list, tuple)) else [int(value)]
 
 
+def _display_choice_prompt(query: str, choices: list[Any]) -> str:
+    """Show a readable multiple-choice prompt without changing model inputs."""
+    if any(re.search(rf"(?mi)^\s*{label}\s*[.)]", query) for label in "ABCDE"[: len(choices)]):
+        return query
+    options = "\n".join(f"{chr(ord('A') + index)}. {choice}" for index, choice in enumerate(choices))
+    return f"{query.rstrip()}\n\n{options}\n\nAnswer:"
+
+
 def _choice_distribution(choices: list[Any], logprobs: list[float], selected: int) -> str:
     maximum = max(logprobs)
     weights = [math.exp(value - maximum) for value in logprobs]
@@ -427,8 +435,15 @@ def _make_score(  # noqa: C901
             if detail_score is None:
                 detail_score = _detail_score(task, doc, response, index)
 
+            # NoCoT has several actual candidate requests, so do not expose
+            # their JSON audit envelope as if it were one user prompt.  The
+            # detail view shows the original query and choices once; scoring
+            # still uses the native candidate logprobs above.
+            detail_input = (
+                _display_choice_prompt(doc.query, choices) if cot_mode == "NoCoT" and choices else response.input
+            )
             messages = build_uploaded_messages(
-                response.input,
+                detail_input,
                 str(answer),
                 prompt_template=prompt_template,
                 generation_prompt=generation_prompt,
