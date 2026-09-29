@@ -56,6 +56,33 @@ BenchmarkField = Literal[
     "vision",
 ]
 CotMode = Literal["NoCoT", "FakeCoT", "CoT"]
+_NO_COT_BENCHMARKS = (
+    "mmlu",
+    "mmlu_pro",
+    "mmlu_redux_2",
+    "arc",
+    "ceval",
+    "truthfulqa",
+    "openbookqa",
+    "hellaswag",
+    "winogrande",
+    "commonsenseqa",
+    "med_qa",
+    "med_mcqa",
+    "mathqa",
+    "bigbench_hard",
+)
+_HIGH_COT_BENCHMARKS = (
+    "gpqa",
+    "gsm8k",
+    "gsm_plus",
+    "math",
+    "math_500",
+    "aime",
+    "aimo",
+    "olympiad",
+)
+_FAKE_COT_BENCHMARKS = ("asdiv", "arithmetic")
 
 
 class EvaluationError(RuntimeError):
@@ -68,6 +95,28 @@ def _prompt_template(selector: str, requested: str) -> str:
     name = selector.casefold()
     difficult = ("gpqa", "math", "aime", "olympiad", "code")
     return "bot" if any(keyword in name for keyword in difficult) else "assistant"
+
+
+def _benchmark_matches(selector: str, names: Sequence[str]) -> bool:
+    selector = selector.casefold()
+    return any(selector == name or selector.startswith(f"{name}:") for name in names)
+
+
+def _auto_cot_mode(selector: str, max_tokens: int) -> tuple[CotMode, int]:
+    """Select the evaluation mode and budget for one benchmark.
+
+    The request type is a better signal than the eventual output length: a
+    multiple-choice task should remain NoCoT even when a model could generate
+    a long explanation, while difficult generative math tasks need a larger
+    budget before generation starts.
+    """
+    if _benchmark_matches(selector, _NO_COT_BENCHMARKS):
+        return "NoCoT", max_tokens
+    if _benchmark_matches(selector, _FAKE_COT_BENCHMARKS):
+        return "FakeCoT", max_tokens
+    if _benchmark_matches(selector, _HIGH_COT_BENCHMARKS):
+        return "CoT", max(max_tokens, 16384)
+    return "CoT", max_tokens
 
 
 def _sampling_config(cot_mode: CotMode, max_tokens: int, seed: int) -> SamplingConfig:
@@ -457,7 +506,6 @@ async def evaluate(  # noqa: C901
     models: Sequence[ModelEndpoint],
     benchmarks: Sequence[BenchmarkSpec],
     *,
-    cot_mode: CotMode = "CoT",
     prompt_template: str = "assistant",
     max_samples: int | None = None,
     test_mode: bool = False,
@@ -470,8 +518,6 @@ async def evaluate(  # noqa: C901
 ) -> tuple[list[Score], list[Score]]:
     if not models or not benchmarks:
         raise ValueError("models and benchmarks must not be empty")
-    if cot_mode not in {"NoCoT", "FakeCoT", "CoT"}:
-        raise ValueError(f"unsupported cot_mode: {cot_mode!r}")
     if prompt_template not in {"bot", "assistant", "function_calling"}:
         raise ValueError(f"unsupported prompt_template: {prompt_template!r}")
     if not no_upload and not scoreboard_token:
@@ -581,15 +627,21 @@ async def evaluate(  # noqa: C901
         effective_max_samples,
         lightweight=test_mode,
     )
-    generation_prompt = {"FakeCoT": "fake_think", "CoT": "open_think"}.get(cot_mode)
-    sampling = _sampling_config(cot_mode, max_generated_tokens, seed)
-
     successful: list[Score] = []
-    pending: list[tuple[Score, BenchmarkField, Path]] = []
+    pending: list[tuple[Score, BenchmarkField, CotMode, Path]] = []
     for benchmark in benchmarks:
+        benchmark_cot_mode, benchmark_max_tokens = _auto_cot_mode(benchmark.selector, max_generated_tokens)
+        LOGGER.info(
+            "benchmark mode: selector=%s cot_mode=%s max_generated_tokens=%d",
+            benchmark.selector,
+            benchmark_cot_mode,
+            benchmark_max_tokens,
+        )
+        generation_prompt = {"FakeCoT": "fake_think", "CoT": "open_think"}.get(benchmark_cot_mode)
+        sampling = _sampling_config(benchmark_cot_mode, benchmark_max_tokens, seed)
         # NoCoT uses LightEval's loglikelihood/greedy-choice path.  It has no
         # RWKV generation prompt to render into the uploaded user message.
-        template = None if cot_mode == "NoCoT" else _prompt_template(benchmark.selector, prompt_template)
+        template = None if benchmark_cot_mode == "NoCoT" else _prompt_template(benchmark.selector, prompt_template)
         model_groups = [
             (group, replicas)
             for group, replicas in groups.items()
@@ -607,9 +659,9 @@ async def evaluate(  # noqa: C901
             model_config = _litelm_model(
                 replicas[0],
                 replicas,
-                cot_mode,
+                benchmark_cot_mode,
                 template,
-                max_generated_tokens,
+                benchmark_max_tokens,
                 seed,
                 cache_dir=str(Path(output_dir) / ".lighteval_cache"),
             )
@@ -647,7 +699,7 @@ async def evaluate(  # noqa: C901
                         sampling,
                         prompt_template=template,
                         generation_prompt=generation_prompt,
-                        cot_mode=cot_mode,
+                        cot_mode=benchmark_cot_mode,
                     )
                 )
 
@@ -677,19 +729,19 @@ async def evaluate(  # noqa: C901
                     output_dir,
                     "local_only" if no_upload else "pending_upload",
                     prompt_template=template,
-                    cot_mode=cot_mode,
+                    cot_mode=benchmark_cot_mode,
                 )
                 if not no_upload:
                     try:
                         await _upload(
                             score,
                             benchmark.field,
-                            cot_mode,
+                            benchmark_cot_mode,
                             scoreboard_token or "",
                             scoreboard_url,
                         )
                     except EvaluationError:
-                        pending.append((score, benchmark.field, score_path))
+                        pending.append((score, benchmark.field, benchmark_cot_mode, score_path))
                     else:
                         _set_score_status(score_path, "uploaded")
                         score.passed_details.clear()
@@ -698,9 +750,9 @@ async def evaluate(  # noqa: C901
             await asyncio.to_thread(pipeline.save_and_push_results)
 
     failures: list[Score] = []
-    for score, field, score_path in pending:
+    for score, field, score_cot_mode, score_path in pending:
         try:
-            await _upload(score, field, cot_mode, scoreboard_token or "", scoreboard_url)
+            await _upload(score, field, score_cot_mode, scoreboard_token or "", scoreboard_url)
         except EvaluationError:
             _set_score_status(score_path, "upload_failed")
             failures.append(score)
@@ -717,7 +769,6 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run RWKV through the LightEval pipeline.")
     parser.add_argument("--models", type=Path, default=root / "configs/models.toml")
     parser.add_argument("--benchmarks", type=Path, default=root / "configs/benchmarks.toml")
-    parser.add_argument("--cot-mode", choices=("NoCoT", "FakeCoT", "CoT"), default="CoT")
     parser.add_argument("--prompt-template", choices=("bot", "assistant", "function_calling"), default="assistant")
     parser.add_argument("--max-samples", type=int)
     parser.add_argument(
@@ -752,7 +803,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         evaluate(
             read_models(args.models),
             read_benchmarks(args.benchmarks),
-            cot_mode=args.cot_mode,
             prompt_template=args.prompt_template,
             max_samples=args.max_samples,
             test_mode=args.test_mode,
