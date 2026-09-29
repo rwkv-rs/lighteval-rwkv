@@ -72,6 +72,7 @@ _NO_COT_BENCHMARKS = (
     "med_mcqa",
     "mathqa",
     "bigbench_hard",
+    "agieval",
 )
 _HIGH_COT_BENCHMARKS = (
     "gpqa",
