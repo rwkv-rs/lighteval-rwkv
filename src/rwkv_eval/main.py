@@ -300,6 +300,15 @@ def _choice_indices(doc: Any) -> list[int]:
     return [int(index) for index in value] if isinstance(value, (list, tuple)) else [int(value)]
 
 
+def _choice_prompt_for_details(query: str, choices: list[Any]) -> str:
+    """Make separate loglikelihood candidates visible in uploaded details."""
+    labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"[: len(choices)]
+    if any(re.search(rf"(?m)^\s*{label}\s*[.):]", query) for label in labels):
+        return query
+    options = "\n".join(f"{label}. {choice}" for label, choice in zip(labels, choices))
+    return f"{query.rstrip()}\n\n{options}\n\nAnswer:"
+
+
 def _choice_distribution(choices: list[Any], logprobs: list[float], selected: int) -> str:
     maximum = max(logprobs)
     weights = [math.exp(value - maximum) for value in logprobs]
@@ -376,7 +385,7 @@ def _internal_task_name(pipeline: Any, public_task_name: str) -> str:
         ) from error
 
 
-def _make_score(
+def _make_score(  # noqa: C901
     pipeline: Any,
     task_name: str,
     metrics: dict[str, Any],
@@ -426,12 +435,18 @@ def _make_score(
             if detail_score is None:
                 detail_score = _detail_score(task, doc, response, index)
 
+            detail_query = doc.query
+            detail_input = response.input
+            if cot_mode == "NoCoT" and choices:
+                detail_query = _choice_prompt_for_details(doc.query, choices)
+                if isinstance(detail_input, str):
+                    detail_input = _choice_prompt_for_details(detail_input, choices)
             messages = build_uploaded_messages(
-                response.input,
+                detail_input,
                 str(answer),
                 prompt_template=prompt_template,
                 generation_prompt=generation_prompt,
-                fallback_query=doc.query,
+                fallback_query=detail_query,
                 rendered_prompt=None if cot_mode == "NoCoT" else rendered_prompt_from_response(response),
             )
             detail = Detail(
