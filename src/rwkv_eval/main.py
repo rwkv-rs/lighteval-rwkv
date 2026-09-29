@@ -43,7 +43,8 @@ from src.rwkv_eval.upload import upload as upload_score
 LOGGER = logging.getLogger(__name__)
 REQUEST_RETRIES = 5
 RETRY_DELAY = 1.0
-DEFAULT_MAX_GENERATED_TOKENS = 8192
+NORMAL_MAX_GENERATED_TOKENS = 4096
+HIGH_DIFFICULTY_MAX_GENERATED_TOKENS = 16384
 TEST_MODE_MAX_SAMPLES = 10
 
 BenchmarkField = Literal[
@@ -74,13 +75,9 @@ _NO_COT_BENCHMARKS = (
 )
 _HIGH_COT_BENCHMARKS = (
     "gpqa",
-    "gsm8k",
-    "gsm_plus",
-    "math",
-    "math_500",
-    "aime",
-    "aimo",
-    "olympiad",
+    "aime24",
+    "aime25",
+    "olympiad_bench",
 )
 _FAKE_COT_BENCHMARKS = ("asdiv", "arithmetic")
 
@@ -102,7 +99,7 @@ def _benchmark_matches(selector: str, names: Sequence[str]) -> bool:
     return any(selector == name or selector.startswith(f"{name}:") for name in names)
 
 
-def _auto_cot_mode(selector: str, max_tokens: int) -> tuple[CotMode, int]:
+def _auto_cot_mode(selector: str) -> tuple[CotMode, int]:
     """Select the evaluation mode and budget for one benchmark.
 
     The request type is a better signal than the eventual output length: a
@@ -111,12 +108,12 @@ def _auto_cot_mode(selector: str, max_tokens: int) -> tuple[CotMode, int]:
     budget before generation starts.
     """
     if _benchmark_matches(selector, _NO_COT_BENCHMARKS):
-        return "NoCoT", max_tokens
+        return "NoCoT", NORMAL_MAX_GENERATED_TOKENS
     if _benchmark_matches(selector, _FAKE_COT_BENCHMARKS):
-        return "FakeCoT", max_tokens
+        return "FakeCoT", NORMAL_MAX_GENERATED_TOKENS
     if _benchmark_matches(selector, _HIGH_COT_BENCHMARKS):
-        return "CoT", max(max_tokens, 16384)
-    return "CoT", max_tokens
+        return "CoT", HIGH_DIFFICULTY_MAX_GENERATED_TOKENS
+    return "CoT", NORMAL_MAX_GENERATED_TOKENS
 
 
 def _sampling_config(cot_mode: CotMode, max_tokens: int, seed: int) -> SamplingConfig:
@@ -509,7 +506,6 @@ async def evaluate(  # noqa: C901
     prompt_template: str = "assistant",
     max_samples: int | None = None,
     test_mode: bool = False,
-    max_generated_tokens: int = DEFAULT_MAX_GENERATED_TOKENS,
     seed: int = 42,
     scoreboard_token: str | None = None,
     scoreboard_url: str = "https://eval.rwkv.rs/test/api",
@@ -630,7 +626,7 @@ async def evaluate(  # noqa: C901
     successful: list[Score] = []
     pending: list[tuple[Score, BenchmarkField, CotMode, Path]] = []
     for benchmark in benchmarks:
-        benchmark_cot_mode, benchmark_max_tokens = _auto_cot_mode(benchmark.selector, max_generated_tokens)
+        benchmark_cot_mode, benchmark_max_tokens = _auto_cot_mode(benchmark.selector)
         LOGGER.info(
             "benchmark mode: selector=%s cot_mode=%s max_generated_tokens=%d",
             benchmark.selector,
@@ -778,7 +774,6 @@ def _argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=f"test mode: evaluate at most {TEST_MODE_MAX_SAMPLES} questions per benchmark",
     )
-    parser.add_argument("--max-generated-tokens", type=int, default=DEFAULT_MAX_GENERATED_TOKENS)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default="results")
     parser.add_argument("--scoreboard-token", default=os.environ.get("SCOREBOARD_API_TOKEN"))
@@ -797,8 +792,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     if args.max_samples is not None and args.max_samples <= 0:
         raise SystemExit("--max-samples must be positive")
-    if args.max_generated_tokens <= 0:
-        raise SystemExit("--max-generated-tokens must be positive")
     scores, failures = asyncio.run(
         evaluate(
             read_models(args.models),
@@ -806,7 +799,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             prompt_template=args.prompt_template,
             max_samples=args.max_samples,
             test_mode=args.test_mode,
-            max_generated_tokens=args.max_generated_tokens,
             seed=args.seed,
             scoreboard_token=args.scoreboard_token,
             scoreboard_url=args.scoreboard_url,
