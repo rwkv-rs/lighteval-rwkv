@@ -53,7 +53,7 @@ hellaswag = LightevalTaskConfig(
     few_shots_select=None,
     generation_size=1,
     metrics=[
-        Metrics.exact_match,
+        Metrics.loglikelihood_acc,
     ],
     stop_sequence=["\n"],
     version=0,
