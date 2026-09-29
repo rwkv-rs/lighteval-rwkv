@@ -43,6 +43,36 @@ from lighteval.utils.imports import is_package_available, requires
 logger = logging.getLogger(__name__)
 
 
+def _strip_question_answer_completion_template(prompt: Any) -> Any:
+    """Remove a completion-only wrapper before applying an RWKV chat template.
+
+    LightEval completion tasks commonly wrap the entire user request as
+    ``Question: ... Answer:``.  In generated RWKV modes the server adds its own
+    User/Assistant boundary, so retaining both wrappers gives the model two
+    competing answer cues.  Only rewrite a user message when both exact edge
+    markers are present; embedded labels and all other prompts stay unchanged.
+    """
+    if not isinstance(prompt, (list, tuple)):
+        return prompt
+
+    messages = list(prompt)
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        stripped = content.strip()
+        prefix, suffix = "Question: ", "Answer:"
+        if not stripped.startswith(prefix) or not stripped.endswith(suffix):
+            break
+        cleaned = stripped[len(prefix) : -len(suffix)].strip()
+        messages[index] = {**message, "content": cleaned}
+        break
+    return messages
+
+
 def _response_prompt_text(response: Any) -> str | None:
     """Read an optional server-rendered prompt without assuming provider fields."""
     candidates: list[Any] = [response]
@@ -233,6 +263,13 @@ class LiteLLMClient(LightevalModel):
 
         if return_logits and not self.provider == "openai":
             logger.warning("Returning logits is not supported for this provider, ignoring.")
+
+        chat_template_kwargs = self.config.extra_body.get("chat_template_kwargs", {}) if self.config.extra_body else {}
+        if isinstance(chat_template_kwargs, dict) and chat_template_kwargs.get("rwkv_generation_prompt") in {
+            "fake_think",
+            "open_think",
+        }:
+            prompt = _strip_question_answer_completion_template(prompt)
 
         # Prepare kwargs for completion call
         kwargs = {
