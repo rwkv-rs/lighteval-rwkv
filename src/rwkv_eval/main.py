@@ -445,7 +445,7 @@ def _make_score(
                 bucket.append(detail)
 
     completions = pipeline.task_completion_counts.get(task_name, total)
-    avg_k = pipeline.task_avg_k.get(task_name, 1)
+    avg_k = 1.0 if cot_mode == "NoCoT" else pipeline.task_avg_k.get(task_name, 1)
     return Score(
         model=RwkvModel(*_model_parts(pipeline.model.config.model_name, pipeline.model.config.max_model_length)),
         benchmark_name=task_name.split("|", 1)[0],
