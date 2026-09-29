@@ -294,6 +294,29 @@ def _ground_truth(doc: Any) -> str:
     return golds[0] if len(golds) == 1 else str(golds)
 
 
+def _choice_indices(doc: Any) -> list[int]:
+    value = doc.gold_index
+    return [int(index) for index in value] if isinstance(value, (list, tuple)) else [int(value)]
+
+
+def _choice_distribution(choices: list[Any], logprobs: list[float], selected: int) -> str:
+    maximum = max(logprobs)
+    weights = [math.exp(value - maximum) for value in logprobs]
+    normalizer = sum(weights) or 1.0
+    payload = {
+        "selected": chr(ord("A") + selected),
+        "choices": [
+            {
+                "label": chr(ord("A") + index),
+                "logprob": float(logprob),
+                "probability": weights[index] / normalizer,
+            }
+            for index, logprob in enumerate(logprobs)
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
 def _native_detail_score(native: Any) -> float | None:
     metric = getattr(native, "metric", None)
     if not isinstance(metric, dict) or not metric:
@@ -374,16 +397,18 @@ def _make_score(
         logprobs = getattr(response, "logprobs", []) or []
         nocot_choice_score: float | None = None
         if cot_mode == "NoCoT" and choices and len(logprobs) >= len(choices):
-            # NoCoT details show the greedy option token, not a generated
-            # explanation that happened to contain an option letter.  Score
-            # and display the option index, because the choice text (e.g. 6)
-            # is not the answer token (C) sent by the model.
+            # NoCoT details expose the native choice distribution.  A
+            # multi-answer task such as TruthfulQA cannot be represented by a
+            # single greedy letter without hiding the behavior used by MC2.
             if not (doc.specific or {}).get("_rwkv_missing_answer"):
                 predicted = max(range(len(choices)), key=logprobs.__getitem__)
-                answers = [chr(ord("A") + predicted)]
-                gold_indices = doc.gold_index if isinstance(doc.gold_index, (list, tuple)) else [doc.gold_index]
-                nocot_choice_score = float(predicted in gold_indices)
-                ground_truth = ", ".join(chr(ord("A") + int(index)) for index in gold_indices)
+                gold_indices = _choice_indices(doc)
+                ground_truth = ", ".join(chr(ord("A") + index) for index in gold_indices)
+                if len(gold_indices) > 1:
+                    answers = [_choice_distribution(choices, logprobs[: len(choices)], predicted)]
+                else:
+                    answers = [chr(ord("A") + predicted)]
+                    nocot_choice_score = float(predicted in gold_indices)
         elif not any(answer.strip() for answer in answers) and choices and len(logprobs) >= len(choices):
             predicted = max(range(len(choices)), key=logprobs.__getitem__)
             answers = [chr(ord("A") + predicted)]
