@@ -23,7 +23,7 @@
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from json import JSONDecodeError
+from json import JSONDecodeError, dumps
 from typing import Any
 
 import requests
@@ -564,7 +564,10 @@ class LiteLLMClient(LightevalModel):
             results.append(
                 ModelResponse(
                     text=[""],
-                    input=prefix,
+                    input=dumps(
+                        {"prefix_prompt": prefix, "candidate_prompts": prompts},
+                        ensure_ascii=False,
+                    ),
                     input_tokens=prefix_token_ids,
                     logprobs=scores,
                     output_tokens=[[] for _ in scores],
