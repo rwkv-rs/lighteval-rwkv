@@ -77,6 +77,7 @@ _NO_COT_BENCHMARKS = (
 )
 _HIGH_COT_BENCHMARKS = (
     "gpqa",
+    "hellaswag",
     "aime24",
     "aime25",
     "aimo_progress_prize_1",
