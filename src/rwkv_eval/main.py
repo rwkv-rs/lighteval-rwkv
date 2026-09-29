@@ -33,8 +33,10 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
+import httpx
+
 from src.rwkv_eval.configs import BenchmarkSpec, ModelEndpoint, RwkvModel, SamplingConfig, read_benchmarks, read_models
-from src.rwkv_eval.upload import Detail, Score
+from src.rwkv_eval.upload import Detail, Score, build_uploaded_messages, rendered_prompt_from_response
 from src.rwkv_eval.upload import upload as upload_score
 
 
@@ -57,7 +59,7 @@ CotMode = Literal["NoCoT", "FakeCoT", "CoT"]
 
 
 class EvaluationError(RuntimeError):
-    pass
+    """Raised when a score cannot be published after all retries."""
 
 
 def _prompt_template(selector: str, requested: str) -> str:
@@ -66,6 +68,73 @@ def _prompt_template(selector: str, requested: str) -> str:
     name = selector.casefold()
     difficult = ("gpqa", "math", "aime", "olympiad", "code")
     return "bot" if any(keyword in name for keyword in difficult) else "assistant"
+
+
+def _sampling_config(cot_mode: CotMode, max_tokens: int, seed: int) -> SamplingConfig:
+    values = {
+        "NoCoT": (0.0, 0, 1.0, 0.0, 0.0, 1.0),
+        "FakeCoT": (1.0, 32, 0.28, 0.0, 0.0, 1.0),
+        "CoT": (0.96, 32, 0.76, 1.0, 0.1, 0.988),
+    }
+    try:
+        temp, top_k, top_p, presence, frequency, decay = values[cot_mode]
+    except KeyError as error:
+        raise ValueError(f"unsupported cot_mode: {cot_mode!r}") from error
+    return SamplingConfig(max_tokens, temp, top_k, top_p, presence, frequency, decay, seed)
+
+
+def _litelm_model(
+    endpoint: ModelEndpoint,
+    replicas: Sequence[ModelEndpoint],
+    cot_mode: CotMode,
+    template: str | None,
+    max_tokens: int,
+    seed: int,
+    cache_dir: str | None = None,
+):
+    """Build the shared LiteLLM configuration for one RWKV endpoint pool."""
+    from lighteval.models.endpoints.litellm_model import LiteLLMModelConfig
+    from lighteval.models.model_input import GenerationParameters
+
+    if any(item.url != endpoint.url for item in replicas):
+        raise ValueError("LiteLLM endpoint pooling requires replicas to share one base URL")
+    sampling = _sampling_config(cot_mode, max_tokens, seed)
+    generation_prompt = {"FakeCoT": "fake_think", "CoT": "open_think"}.get(cot_mode)
+    extra_body: dict[str, Any] = {"penalty_decay": sampling.penalty_decay}
+    if cot_mode != "NoCoT":
+        extra_body.update(
+            {
+                "return_prompt_text": True,
+                "chat_template_kwargs": {
+                    "rwkv_prompt_template": template,
+                    "rwkv_generation_prompt": generation_prompt,
+                },
+            }
+        )
+    return LiteLLMModelConfig(
+        model_name=endpoint.model_name,
+        provider="openai",
+        base_url=f"{endpoint.url.rstrip('/')}/v1",
+        api_key=endpoint.api_key,
+        concurrent_requests=sum(item.max_num_seqs for item in replicas),
+        max_model_length=endpoint.ctx_len,
+        cache_dir=cache_dir or "~/.cache/huggingface/lighteval",
+        api_max_retry=5,
+        generation_only=True,
+        target_completions=4096,
+        minimum_completions=3000,
+        maximum_completions=6000,
+        extra_body=extra_body,
+        generation_parameters=GenerationParameters(
+            temperature=sampling.temp,
+            top_k=sampling.top_k,
+            top_p=sampling.top_p,
+            presence_penalty=sampling.presence_penalty,
+            frequency_penalty=sampling.frequency_penalty,
+            max_new_tokens=sampling.max_generated_tokens,
+            seed=sampling.seed,
+        ),
+    )
 
 
 def _order_benchmarks(
@@ -93,11 +162,7 @@ def _order_benchmarks(
     estimates: dict[str, tuple[int, int]] = {}
     for spec in benchmarks:
         selector = spec.selector.rsplit("|", 1)[0]
-        matched = [
-            task
-            for task in tasks.values()
-            if task.name == selector or task.name.startswith(f"{selector}:")
-        ]
+        matched = [task for task in tasks.values() if task.name == selector or task.name.startswith(f"{selector}:")]
         requires_cot = any(SamplingMethod.GENERATIVE in task.sampling_methods for task in matched)
         sample_count = 0
 
@@ -169,67 +234,6 @@ def _order_benchmarks(
     return [spec for _, spec in ordered]
 
 
-def _sampling_config(cot_mode: CotMode, max_tokens: int, seed: int) -> SamplingConfig:
-    values = {
-        "NoCoT": (0.0, 0, 1.0, 0.0, 0.0, 1.0),
-        "FakeCoT": (1.0, 32, 0.28, 0.0, 0.0, 1.0),
-        "CoT": (0.96, 32, 0.76, 1.0, 0.1, 0.988),
-    }
-    temp, top_k, top_p, presence, frequency, decay = values[cot_mode]
-    return SamplingConfig(max_tokens, temp, top_k, top_p, presence, frequency, decay, seed)
-
-
-def _litelm_model(
-    endpoint: ModelEndpoint,
-    replicas: Sequence[ModelEndpoint],
-    cot_mode: CotMode,
-    template: str,
-    max_tokens: int,
-    seed: int,
-    cache_dir: str | None = None,
-):
-    from lighteval.models.endpoints.litellm_model import LiteLLMModelConfig
-    from lighteval.models.model_input import GenerationParameters
-
-    if any(item.url != endpoint.url for item in replicas):
-        raise ValueError("LiteLLM endpoint pooling requires replicas to share one base URL")
-    sampling = _sampling_config(cot_mode, max_tokens, seed)
-    return LiteLLMModelConfig(
-        model_name=endpoint.model_name,
-        provider="openai",
-        base_url=f"{endpoint.url.rstrip('/')}/v1",
-        api_key=endpoint.api_key,
-        concurrent_requests=sum(item.max_num_seqs for item in replicas),
-        max_model_length=endpoint.ctx_len,
-        cache_dir=cache_dir or "~/.cache/huggingface/lighteval",
-        api_max_retry=5,
-        generation_only=True,
-        target_completions=4096,
-        minimum_completions=3000,
-        maximum_completions=6000,
-        extra_body={
-            "chat_template_kwargs": {
-                "rwkv_prompt_template": template,
-                "rwkv_generation_prompt": {
-                    "NoCoT": "no_think",
-                    "FakeCoT": "fake_think",
-                    "CoT": "open_think",
-                }[cot_mode],
-            },
-            "penalty_decay": sampling.penalty_decay,
-        },
-        generation_parameters=GenerationParameters(
-            temperature=sampling.temp,
-            top_k=sampling.top_k,
-            top_p=sampling.top_p,
-            presence_penalty=sampling.presence_penalty,
-            frequency_penalty=sampling.frequency_penalty,
-            max_new_tokens=sampling.max_generated_tokens,
-            seed=sampling.seed,
-        ),
-    )
-
-
 def _metric_value(value: Any) -> float:
     if isinstance(value, dict):
         value = next((item for item in value.values() if isinstance(item, (int, float))), 0.0)
@@ -245,10 +249,24 @@ def _ground_truth(doc: Any) -> str:
     return golds[0] if len(golds) == 1 else str(golds)
 
 
+def _native_detail_score(native: Any) -> float | None:
+    metric = getattr(native, "metric", None)
+    if not isinstance(metric, dict) or not metric:
+        return None
+    return _metric_value(next(iter(metric.values())))
+
+
+def _native_score(pipeline: Any, task_name: str, metrics: dict[str, Any]) -> float:
+    del pipeline, task_name
+    values = [value for name, value in metrics.items() if not name.endswith("_stderr")]
+    return _metric_value(values[0]) if values else 0.0
+
+
 def _detail_score(task: Any, doc: Any, response: Any, index: int) -> float:
-    metric = next((item for item in task.metrics if str(getattr(item.category, "value", item.category)) == "GENERATIVE"), None)
-    if metric is None:
-        metric = task.metrics[0] if task.metrics else None
+    metric = next(
+        (item for item in task.metrics if str(getattr(item.category, "value", item.category)) == "GENERATIVE"),
+        None,
+    ) or (task.metrics[0] if task.metrics else None)
     if metric is None:
         return 0.0
     sample = response[index] if response.text and index < len(response.text) else response
@@ -269,25 +287,6 @@ def _detail_score(task: Any, doc: Any, response: Any, index: int) -> float:
         return 0.0
 
 
-def _native_detail_score(native: Any) -> float | None:
-    """Read a score already computed by LightEval for one retained detail."""
-    metric = getattr(native, "metric", None)
-    if not isinstance(metric, dict) or not metric:
-        return None
-    value = next(iter(metric.values()))
-    try:
-        return _metric_value(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _native_score(pipeline: Any, task_name: str, metrics: dict[str, Any]) -> float:
-    values = [value for name, value in metrics.items() if not name.endswith("_stderr")]
-    if not values:
-        return 0.0
-    return _metric_value(values[0])
-
-
 def _internal_task_name(pipeline: Any, public_task_name: str) -> str:
     """Translate LightEval's display name back to its internal task key.
 
@@ -304,50 +303,70 @@ def _internal_task_name(pipeline: Any, public_task_name: str) -> str:
         return display_to_internal[public_task_name]
     except KeyError as error:
         raise KeyError(
-            f"LightEval returned task {public_task_name!r}, but the pipeline contains "
-            f"{sorted(task_names)!r}"
+            f"LightEval returned task {public_task_name!r}, but the pipeline contains {sorted(task_names)!r}"
         ) from error
 
 
-def _make_score(pipeline: Any, task_name: str, metrics: dict[str, Any], sampling: SamplingConfig) -> Score:
+def _make_score(
+    pipeline: Any,
+    task_name: str,
+    metrics: dict[str, Any],
+    sampling: SamplingConfig,
+    *,
+    prompt_template: str | None = None,
+    generation_prompt: str | None = None,
+    cot_mode: CotMode | None = None,
+) -> Score:
     task = pipeline.tasks_dict[task_name]
     native_details = pipeline.get_details().get(task_name, [])
     passed, wrong, failed = [], [], []
     truncated = total = 0
     for native in native_details:
         doc, response = native.doc, native.model_response
+        ground_truth = _ground_truth(doc)
         answers = [str(answer) for answer in (response.final_text or [])]
-        if not any(answer.strip() for answer in answers):
-            choices = getattr(doc, "choices", None) or []
-            logprobs = getattr(response, "logprobs", []) or []
-            if choices and len(logprobs) >= len(choices):
+        choices = getattr(doc, "choices", None) or []
+        logprobs = getattr(response, "logprobs", []) or []
+        if cot_mode == "NoCoT" and choices and len(logprobs) >= len(choices):
+            # NoCoT details show the greedy option token, not a generated
+            # explanation that happened to contain an option letter.
+            if not (doc.specific or {}).get("_rwkv_missing_answer"):
                 predicted = max(range(len(choices)), key=logprobs.__getitem__)
-                # Materialize the greedy choice for logit-only responses.
                 answers = [chr(ord("A") + predicted)]
+        elif not any(answer.strip() for answer in answers) and choices and len(logprobs) >= len(choices):
+            predicted = max(range(len(choices)), key=logprobs.__getitem__)
+            answers = [chr(ord("A") + predicted)]
         for index, answer in enumerate(answers or [""]):
-            finish_reason = response.finish_reasons[index] if index < len(response.finish_reasons) else "stop"
+            finish_reasons = response.finish_reasons or []
+            finish_reason = finish_reasons[index] if index < len(finish_reasons) else "stop"
             is_truncated = finish_reason.lower() in {"length", "max_tokens"}
             truncated += int(is_truncated)
             total += 1
+
             detail_score = _native_detail_score(native)
             if detail_score is None:
                 detail_score = _detail_score(task, doc, response, index)
-            messages = (
-                [dict(message) for message in response.input]
-                if isinstance(response.input, list)
-                else [{"role": "user", "content": str(response.input or doc.query)}]
+
+            messages = build_uploaded_messages(
+                response.input,
+                str(answer),
+                prompt_template=prompt_template,
+                generation_prompt=generation_prompt,
+                fallback_query=doc.query,
+                rendered_prompt=None if cot_mode == "NoCoT" else rendered_prompt_from_response(response),
             )
-            messages.append({"role": "assistant", "content": str(answer)})
             detail = Detail(
                 messages=messages,
                 sampling_config=sampling,
                 answer=str(answer),
-                ground_truth=_ground_truth(doc),
+                ground_truth=ground_truth,
                 is_passed=not is_truncated and bool(str(answer).strip()) and detail_score == 1.0,
             )
             bucket = failed if is_truncated or not str(answer).strip() else passed if detail.is_passed else wrong
             if len(bucket) < 20:
                 bucket.append(detail)
+
+    completions = pipeline.task_completion_counts.get(task_name, total)
     avg_k = pipeline.task_avg_k.get(task_name, 1)
     return Score(
         model=RwkvModel(*_model_parts(pipeline.model.config.model_name, pipeline.model.config.max_model_length)),
@@ -355,12 +374,9 @@ def _make_score(pipeline: Any, task_name: str, metrics: dict[str, Any], sampling
         num_samples=pipeline.task_sample_counts.get(task_name, len(native_details)),
         avg_k=float(avg_k),
         score=_native_score(pipeline, task_name, metrics),
-        truncation_rate=(
-            pipeline.task_truncation_counts.get(task_name, truncated)
-            / pipeline.task_completion_counts.get(task_name, total)
-            if pipeline.task_completion_counts.get(task_name, total)
-            else 0.0
-        ),
+        truncation_rate=pipeline.task_truncation_counts.get(task_name, truncated) / completions
+        if completions
+        else 0.0,
         passed_details=passed,
         wrong_details=wrong,
         failed_details=failed,
@@ -394,10 +410,22 @@ def _score_path(score: Score, output_dir: str) -> Path:
     return path
 
 
-def _persist_score(score: Score, field: BenchmarkField, output_dir: str, status: str) -> Path:
+def _persist_score(
+    score: Score,
+    field: BenchmarkField,
+    output_dir: str,
+    status: str,
+    *,
+    prompt_template: str | None = None,
+    cot_mode: CotMode | None = None,
+) -> Path:
     path = _score_path(score, output_dir)
     payload = asdict(score)
     payload.update({"field": field, "upload_status": status})
+    if prompt_template is not None:
+        payload["prompt_template"] = prompt_template
+    if cot_mode is not None:
+        payload["cot_mode"] = cot_mode
     temporary = path.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     temporary.replace(path)
@@ -442,39 +470,133 @@ async def evaluate(  # noqa: C901
 ) -> tuple[list[Score], list[Score]]:
     if not models or not benchmarks:
         raise ValueError("models and benchmarks must not be empty")
+    if cot_mode not in {"NoCoT", "FakeCoT", "CoT"}:
+        raise ValueError(f"unsupported cot_mode: {cot_mode!r}")
+    if prompt_template not in {"bot", "assistant", "function_calling"}:
+        raise ValueError(f"unsupported prompt_template: {prompt_template!r}")
     if not no_upload and not scoreboard_token:
         raise ValueError("scoreboard token is required unless --no-upload is used")
-
-    from lighteval.logging.evaluation_tracker import EvaluationTracker
-    from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters
 
     effective_max_samples = max_samples
     if test_mode:
         effective_max_samples = (
-            TEST_MODE_MAX_SAMPLES
-            if max_samples is None
-            else min(max_samples, TEST_MODE_MAX_SAMPLES)
+            TEST_MODE_MAX_SAMPLES if max_samples is None else min(max_samples, TEST_MODE_MAX_SAMPLES)
         )
         LOGGER.info(
             "test mode enabled: evaluating at most %d questions per benchmark",
             effective_max_samples,
         )
 
+    groups: dict[tuple[str, int], list[ModelEndpoint]] = {}
+    group_model_keys: dict[tuple[str, int], tuple[str, str, str, int]] = {}
+    for endpoint in models:
+        group = (endpoint.model_name, endpoint.ctx_len)
+        groups.setdefault(group, []).append(endpoint)
+        model = _model_parts(endpoint.model_name, endpoint.ctx_len)
+        group_model_keys[group] = (
+            model[0].casefold(),
+            model[1].casefold(),
+            model[2].casefold(),
+            model[3],
+        )
+
+    if no_upload:
+        pending_pairs = {
+            (model_key, benchmark.selector, benchmark.field)
+            for model_key in group_model_keys.values()
+            for benchmark in benchmarks
+        }
+    else:
+        task_rows: list[Any] | None = None
+        last_error: Exception | None = None
+        for attempt in range(REQUEST_RETRIES):
+            try:
+                async with httpx.AsyncClient(
+                    base_url=f"{scoreboard_url.rstrip('/')}/",
+                    headers={"Authorization": f"Bearer {scoreboard_token}"},
+                    timeout=30.0,
+                ) as client:
+                    response = await client.post("get_tasks", json={"frameworks": ["lighteval"]})
+                    response.raise_for_status()
+                    payload = response.json()
+                if not isinstance(payload, dict) or not isinstance(payload.get("tasks"), list):
+                    raise ValueError("Scoreboard get_tasks response must contain a tasks list")
+                task_rows = payload["tasks"]
+                break
+            except Exception as error:
+                last_error = error
+                if attempt + 1 < REQUEST_RETRIES:
+                    await asyncio.sleep(RETRY_DELAY * 2**attempt)
+        if task_rows is None:
+            raise RuntimeError(f"could not get pending tasks after {REQUEST_RETRIES} attempts") from last_error
+
+        pending_pairs: set[tuple[tuple[str, str, str, int], str, str]] = set()
+        for task in task_rows:
+            if (
+                not isinstance(task, dict)
+                or not isinstance(task.get("model"), dict)
+                or not isinstance(task.get("benchmark"), dict)
+            ):
+                raise ValueError(f"invalid task returned by Scoreboard: {task!r}")
+            task_model = task["model"]
+            task_benchmark = task["benchmark"]
+            if task_benchmark.get("framework", "lighteval") != "lighteval":
+                continue
+            try:
+                benchmark_name = task_benchmark["name"]
+                benchmark_field = task_benchmark["field"]
+                task_model_key = (
+                    str(task_model["arch_version"]).casefold(),
+                    str(task_model["data_version"]).casefold(),
+                    str(task_model["param_size"]).casefold(),
+                    int(task_model["ctx_len"]),
+                )
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError(f"invalid task returned by Scoreboard: {task!r}") from error
+            if (
+                not isinstance(benchmark_name, str)
+                or not benchmark_name
+                or not isinstance(benchmark_field, str)
+                or not benchmark_field
+            ):
+                raise ValueError(f"invalid benchmark in Scoreboard task: {task!r}")
+            pending_pairs.add((task_model_key, benchmark_name, benchmark_field))
+
+        LOGGER.info("Scoreboard returned %d pending model/benchmark pairs", len(pending_pairs))
+
+    benchmarks = [
+        benchmark
+        for benchmark in benchmarks
+        if any((group_model_keys[group], benchmark.selector, benchmark.field) in pending_pairs for group in groups)
+    ]
+    if not benchmarks:
+        LOGGER.info("all configured model/benchmark pairs already have an active score")
+        return [], []
+
+    from lighteval.logging.evaluation_tracker import EvaluationTracker
+    from lighteval.pipeline import ParallelismManager, Pipeline, PipelineParameters
+
     benchmarks = _order_benchmarks(
         benchmarks,
         effective_max_samples,
         lightweight=test_mode,
     )
+    generation_prompt = {"FakeCoT": "fake_think", "CoT": "open_think"}.get(cot_mode)
     sampling = _sampling_config(cot_mode, max_generated_tokens, seed)
-    groups: dict[tuple[str, int], list[ModelEndpoint]] = {}
-    for endpoint in models:
-        groups.setdefault((endpoint.model_name, endpoint.ctx_len), []).append(endpoint)
 
     successful: list[Score] = []
     pending: list[tuple[Score, BenchmarkField, Path]] = []
     for benchmark in benchmarks:
+        # NoCoT uses LightEval's loglikelihood/greedy-choice path.  It has no
+        # RWKV generation prompt to render into the uploaded user message.
+        template = None if cot_mode == "NoCoT" else _prompt_template(benchmark.selector, prompt_template)
+        model_groups = [
+            (group, replicas)
+            for group, replicas in groups.items()
+            if (group_model_keys[group], benchmark.selector, benchmark.field) in pending_pairs
+        ]
         pipelines = []
-        for (model_name, ctx_len), replicas in groups.items():
+        for (model_name, ctx_len), replicas in model_groups:
             LOGGER.info(
                 "starting LightEval for model=%s benchmark=%s replicas=%d concurrent_requests=%d",
                 model_name,
@@ -486,11 +608,9 @@ async def evaluate(  # noqa: C901
                 replicas[0],
                 replicas,
                 cot_mode,
-                _prompt_template(benchmark.selector, prompt_template),
+                template,
                 max_generated_tokens,
                 seed,
-                # SampleCache adds model name and model-config hash below this
-                # directory, so model groups never share response parquet files.
                 cache_dir=str(Path(output_dir) / ".lighteval_cache"),
             )
             tracker = EvaluationTracker(
@@ -516,14 +636,20 @@ async def evaluate(  # noqa: C901
             pipeline.show_results()
             rows: list[Score] = []
             for public_task_name, metrics in pipeline.get_results()["results"].items():
-                if (
-                    public_task_name == "all"
-                    or ":_average:" in public_task_name
-                    or ":_average|" in public_task_name
-                ):
+                if public_task_name == "all" or ":_average:" in public_task_name or ":_average|" in public_task_name:
                     continue
                 task_name = _internal_task_name(pipeline, public_task_name)
-                rows.append(_make_score(pipeline, task_name, metrics, sampling))
+                rows.append(
+                    _make_score(
+                        pipeline,
+                        task_name,
+                        metrics,
+                        sampling,
+                        prompt_template=template,
+                        generation_prompt=generation_prompt,
+                        cot_mode=cot_mode,
+                    )
+                )
 
             # A selector that expands to multiple LightEval tasks is one
             # benchmark in the external scoreboard.
@@ -534,12 +660,13 @@ async def evaluate(  # noqa: C901
                 aggregate.benchmark_name, aggregate.num_samples = benchmark.selector, total_samples
                 aggregate.avg_k = total_completions / total_samples if total_samples else 0.0
                 aggregate.score = sum(item.score * weight for item, weight in zip(rows, weights)) / total_completions
-                aggregate.truncation_rate = sum(
-                    item.truncation_rate * weight for item, weight in zip(rows, weights)
-                ) / total_completions
-                details = [[detail for item in rows for detail in getattr(item, name)][:20] for name in (
-                    "passed_details", "wrong_details", "failed_details"
-                )]
+                aggregate.truncation_rate = (
+                    sum(item.truncation_rate * weight for item, weight in zip(rows, weights)) / total_completions
+                )
+                details = [
+                    [detail for item in rows for detail in getattr(item, name)][:20]
+                    for name in ("passed_details", "wrong_details", "failed_details")
+                ]
                 aggregate.passed_details, aggregate.wrong_details, aggregate.failed_details = details
                 rows = [aggregate]
             for score in rows:
@@ -549,6 +676,8 @@ async def evaluate(  # noqa: C901
                     benchmark.field,
                     output_dir,
                     "local_only" if no_upload else "pending_upload",
+                    prompt_template=template,
+                    cot_mode=cot_mode,
                 )
                 if not no_upload:
                     try:
@@ -602,7 +731,9 @@ def _argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default="results")
     parser.add_argument("--scoreboard-token", default=os.environ.get("SCOREBOARD_API_TOKEN"))
-    parser.add_argument("--scoreboard-url", default=os.environ.get("SCOREBOARD_API_URL", "https://eval.rwkv.rs/test/api"))
+    parser.add_argument(
+        "--scoreboard-url", default=os.environ.get("SCOREBOARD_API_URL", "https://eval.rwkv.rs/test/api")
+    )
     parser.add_argument("--no-upload", action="store_true")
     parser.add_argument("-v", "--verbose", action="store_true")
     return parser
@@ -610,7 +741,9 @@ def _argument_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _argument_parser().parse_args(argv)
-    logging.basicConfig(level=logging.INFO if args.verbose else logging.WARNING, format="%(asctime)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=logging.INFO if args.verbose else logging.WARNING, format="%(asctime)s %(levelname)s %(message)s"
+    )
     if args.max_samples is not None and args.max_samples <= 0:
         raise SystemExit("--max-samples must be positive")
     if args.max_generated_tokens <= 0:

@@ -74,6 +74,7 @@ This repository needs to periodically sync with the upstream LightEval repositor
 
 ## Env
 Use uv to manage the local and remote dedicated environment ./.venv. This project is strictly prohibited from using other environments, and other projects are strictly prohibited from using this project's environment, to avoid environment pollution issues.
+If need to clear the database, ssh rwkv-rs-server.
 
 ## Inference API
 url: api.rwkv.rs

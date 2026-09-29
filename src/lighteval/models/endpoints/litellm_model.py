@@ -42,6 +42,29 @@ from lighteval.utils.imports import is_package_available, requires
 
 logger = logging.getLogger(__name__)
 
+
+def _response_prompt_text(response: Any) -> str | None:
+    """Read an optional server-rendered prompt without assuming provider fields."""
+    candidates: list[Any] = [response]
+    model_dump = getattr(response, "model_dump", None)
+    if callable(model_dump):
+        try:
+            dumped = model_dump()
+        except Exception:
+            dumped = None
+        if isinstance(dumped, dict):
+            candidates.append(dumped)
+    hidden_params = getattr(response, "_hidden_params", None)
+    if isinstance(hidden_params, dict):
+        candidates.append(hidden_params)
+    for candidate in candidates:
+        for name in ("prompt_text", "rendered_prompt"):
+            value = candidate.get(name) if isinstance(candidate, dict) else getattr(candidate, name, None)
+            if isinstance(value, str):
+                return value
+    return None
+
+
 if is_package_available("litellm"):
     import litellm
     from litellm import encode, supports_reasoning
@@ -52,6 +75,9 @@ if is_package_available("litellm"):
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
     logging.getLogger("LiteLLM").handlers.clear()
 
+    # Include provider-specific request parameters (for example RWKV's
+    # top_k and extra_body fields) in LiteLLM's response-cache key.
+    litellm.enable_caching_on_provider_specific_optional_params = True
     litellm.cache = Cache(type=LiteLLMCacheType.DISK)
 else:
     from unittest.mock import Mock
@@ -235,7 +261,17 @@ class LiteLLMClient(LightevalModel):
         if kwargs.get("max_completion_tokens", None) is None:
             kwargs["max_completion_tokens"] = max_new_tokens
         if self.config.extra_body:
-            kwargs["extra_body"] = self.config.extra_body
+            extra_body = dict(self.config.extra_body)
+            chat_template_kwargs = extra_body.get("chat_template_kwargs")
+            if isinstance(chat_template_kwargs, dict) and (
+                "rwkv_prompt_template" in chat_template_kwargs or "rwkv_generation_prompt" in chat_template_kwargs
+            ):
+                # vLLM's RWKV endpoint exposes the exact post-template text
+                # through this provider-specific flag.  Preserve an explicit
+                # caller value, while making RWKV configs self-describing for
+                # details saved by the LightEval tracker.
+                extra_body.setdefault("return_prompt_text", True)
+            kwargs["extra_body"] = extra_body
 
         last_error: BaseException | None = None
         for attempt in range(self.API_MAX_RETRY):
@@ -386,6 +422,7 @@ class LiteLLMClient(LightevalModel):
             responses = self.__call_api_parallel(contexts, return_logits, max_new_tokens, num_samples, stop_sequence)
 
             for response, context in zip(responses, contexts):
+                rendered_prompt = _response_prompt_text(response)
                 result: list[str] = [choice.message.content for choice in response.choices]
                 reasonings: list[str | None] = [
                     getattr(choice.message, "reasoning_content", None) for choice in response.choices
@@ -397,7 +434,7 @@ class LiteLLMClient(LightevalModel):
                     text=result if result and result[0] else [""],
                     reasonings=reasonings,
                     finish_reasons=finish_reasons,
-                    input=context,
+                    input=rendered_prompt if rendered_prompt is not None else context,
                 )
                 results.append(cur_response)
 
