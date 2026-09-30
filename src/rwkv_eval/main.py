@@ -175,6 +175,7 @@ def _litelm_model(
         cache_dir=cache_dir or "~/.cache/huggingface/lighteval",
         api_max_retry=6,
         extra_body=extra_body,
+        generation_only=cot_mode != "NoCoT",
         generation_parameters=GenerationParameters(
             temperature=sampling.temp,
             top_k=sampling.top_k,
