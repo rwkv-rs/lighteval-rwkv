@@ -46,6 +46,7 @@ RETRY_DELAY = 1.0
 NORMAL_MAX_GENERATED_TOKENS = 4096
 HIGH_DIFFICULTY_MAX_GENERATED_TOKENS = 32768
 TEST_MODE_MAX_SAMPLES = 10
+ENDPOINT_MAX_CONTEXT_LENGTH = 32768
 
 BenchmarkField = Literal[
     "knowledge",
@@ -168,7 +169,7 @@ def _litelm_model(
         base_url=f"{endpoint.url.rstrip('/')}/v1",
         api_key=endpoint.api_key,
         concurrent_requests=sum(item.max_num_seqs for item in replicas),
-        max_model_length=endpoint.ctx_len,
+        max_model_length=max(endpoint.ctx_len, ENDPOINT_MAX_CONTEXT_LENGTH),
         cache_dir=cache_dir or "~/.cache/huggingface/lighteval",
         api_max_retry=5,
         extra_body=extra_body,
