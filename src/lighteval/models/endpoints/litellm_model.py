@@ -239,18 +239,27 @@ class LiteLLMClient(LightevalModel):
                 stop_sequence = [s for s in stop_sequence if s and s.strip()]
         return stop_sequence
 
-    def _prepare_max_new_tokens(self, max_new_tokens) -> int | None:
-        """Calculate completion tokens based on max_new_tokens."""
+    def _prepare_max_new_tokens(self, max_new_tokens, prompt: Any = None) -> int | None:
+        """Fit the requested completion budget inside the model context."""
         if not max_new_tokens or max_new_tokens <= 0:
             return None
 
         if supports_reasoning(self.model):
-            # We need to allow more tokens to include reasoning tokens
             max_new_tokens = min(max_new_tokens * 10, self.max_length)
-
             logger.warning(
                 f"Reasoning model detected, increasing max_new_tokens to {max_new_tokens} to allow for reasoning tokens",
             )
+
+        if self.max_length and max_new_tokens >= self.max_length:
+            texts = []
+            messages = prompt if isinstance(prompt, (list, tuple)) else [prompt]
+            for message in messages:
+                if isinstance(message, dict) and isinstance(message.get("content"), str):
+                    texts.append(message["content"])
+                elif isinstance(message, str):
+                    texts.append(message)
+            prompt_tokens = len(self.tokenizer(model=self.model, text="\n".join(texts)))
+            max_new_tokens = min(max_new_tokens, max(1, self.max_length - prompt_tokens - 512))
 
         return max_new_tokens
 
@@ -258,17 +267,19 @@ class LiteLLMClient(LightevalModel):
         """Make API call with retries."""
         response = LitellmModelResponse()
         stop_sequence = self._prepare_stop_sequence(stop_sequence)
-        max_new_tokens = self._prepare_max_new_tokens(max_new_tokens)
-
-        if return_logits and not self.provider == "openai":
-            logger.warning("Returning logits is not supported for this provider, ignoring.")
-
-        chat_template_kwargs = self.config.extra_body.get("chat_template_kwargs", {}) if self.config.extra_body else {}
+        if isinstance(self.config.extra_body, dict):
+            chat_template_kwargs = self.config.extra_body.get("chat_template_kwargs", {})
+        else:
+            chat_template_kwargs = {}
         if isinstance(chat_template_kwargs, dict) and chat_template_kwargs.get("rwkv_generation_prompt") in {
             "fake_think",
             "open_think",
         }:
             prompt = _strip_question_answer_completion_template(prompt)
+        max_new_tokens = self._prepare_max_new_tokens(max_new_tokens, prompt)
+
+        if return_logits and not self.provider == "openai":
+            logger.warning("Returning logits is not supported for this provider, ignoring.")
 
         # Prepare kwargs for completion call
         kwargs = {
