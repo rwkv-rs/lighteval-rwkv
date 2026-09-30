@@ -41,10 +41,11 @@ from src.rwkv_eval.upload import upload as upload_score
 
 
 LOGGER = logging.getLogger(__name__)
-REQUEST_RETRIES = 5
+REQUEST_RETRIES = 6
 RETRY_DELAY = 1.0
 NORMAL_MAX_GENERATED_TOKENS = 4096
-HIGH_DIFFICULTY_MAX_GENERATED_TOKENS = 16384
+HIGH_DIFFICULTY_MAX_GENERATED_TOKENS = 32768
+ENDPOINT_MAX_CONTEXT_LENGTH = 32768
 TEST_MODE_MAX_SAMPLES = 10
 
 BenchmarkField = Literal[
@@ -169,9 +170,10 @@ def _litelm_model(
         base_url=f"{endpoint.url.rstrip('/')}/v1",
         api_key=endpoint.api_key,
         concurrent_requests=sum(item.max_num_seqs for item in replicas),
-        max_model_length=endpoint.ctx_len,
+        max_model_length=max(endpoint.ctx_len, ENDPOINT_MAX_CONTEXT_LENGTH),
+        scoreboard_ctx_len=endpoint.ctx_len,
         cache_dir=cache_dir or "~/.cache/huggingface/lighteval",
-        api_max_retry=5,
+        api_max_retry=6,
         extra_body=extra_body,
         generation_parameters=GenerationParameters(
             temperature=sampling.temp,
@@ -450,7 +452,12 @@ def _make_score(  # noqa: C901
     completions = pipeline.task_completion_counts.get(task_name, total)
     avg_k = 1.0 if cot_mode == "NoCoT" else pipeline.task_avg_k.get(task_name, 1)
     return Score(
-        model=RwkvModel(*_model_parts(pipeline.model.config.model_name, pipeline.model.config.max_model_length)),
+        model=RwkvModel(
+            *_model_parts(
+                pipeline.model.config.model_name,
+                pipeline.model.config.scoreboard_ctx_len or pipeline.model.config.max_model_length,
+            )
+        ),
         benchmark_name=task_name.split("|", 1)[0],
         num_samples=pipeline.task_sample_counts.get(task_name, len(native_details)),
         avg_k=float(avg_k),
