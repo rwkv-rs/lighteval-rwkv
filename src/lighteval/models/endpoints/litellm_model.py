@@ -271,11 +271,14 @@ class LiteLLMClient(LightevalModel):
             chat_template_kwargs = self.config.extra_body.get("chat_template_kwargs", {})
         else:
             chat_template_kwargs = {}
-        if isinstance(chat_template_kwargs, dict) and chat_template_kwargs.get("rwkv_generation_prompt") in {
-            "fake_think",
-            "open_think",
-        }:
+        rwkv_generation_prompt = (
+            chat_template_kwargs.get("rwkv_generation_prompt") if isinstance(chat_template_kwargs, dict) else None
+        )
+        if rwkv_generation_prompt in {"fake_think", "open_think"}:
             prompt = _strip_question_answer_completion_template(prompt)
+            # A task's newline stop sequence is valid for a one-token answer,
+            # but it terminates the RWKV reasoning trace before the answer.
+            stop_sequence = []
         max_new_tokens = self._prepare_max_new_tokens(max_new_tokens, prompt)
 
         if return_logits and not self.provider == "openai":
