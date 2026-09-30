@@ -304,9 +304,8 @@ class LiteLLMClient(LightevalModel):
             logger.warning("O1 models do not support temperature, top_p, stop sequence. Disabling.")
         else:
             kwargs.update(self.generation_parameters.to_litellm_dict())
-
-        if kwargs.get("max_completion_tokens", None) is None:
-            kwargs["max_completion_tokens"] = max_new_tokens
+        kwargs["max_tokens"] = max_new_tokens
+        kwargs["max_completion_tokens"] = max_new_tokens
         if self.config.extra_body:
             extra_body = dict(self.config.extra_body)
             chat_template_kwargs = extra_body.get("chat_template_kwargs")
