@@ -23,7 +23,7 @@
 import logging
 import time
 from concurrent.futures import ThreadPoolExecutor
-from json import JSONDecodeError, dumps
+from json import JSONDecodeError
 from typing import Any
 
 import requests
@@ -239,8 +239,8 @@ class LiteLLMClient(LightevalModel):
                 stop_sequence = [s for s in stop_sequence if s and s.strip()]
         return stop_sequence
 
-    def _prepare_max_new_tokens(self, max_new_tokens, prompt: Any = None) -> int | None:
-        """Fit the requested completion budget inside the model context."""
+    def _prepare_max_new_tokens(self, max_new_tokens) -> int | None:
+        """Calculate completion tokens based on max_new_tokens."""
         if not max_new_tokens or max_new_tokens <= 0:
             return None
 
@@ -249,17 +249,6 @@ class LiteLLMClient(LightevalModel):
             logger.warning(
                 f"Reasoning model detected, increasing max_new_tokens to {max_new_tokens} to allow for reasoning tokens",
             )
-
-        if self.max_length and max_new_tokens >= self.max_length:
-            texts = []
-            messages = prompt if isinstance(prompt, (list, tuple)) else [prompt]
-            for message in messages:
-                if isinstance(message, dict) and isinstance(message.get("content"), str):
-                    texts.append(message["content"])
-                elif isinstance(message, str):
-                    texts.append(message)
-            prompt_tokens = len(self.tokenizer(model=self.model, text="\n".join(texts)))
-            max_new_tokens = min(max_new_tokens, max(1, self.max_length - prompt_tokens - 512))
 
         return max_new_tokens
 
@@ -279,7 +268,7 @@ class LiteLLMClient(LightevalModel):
             # A task's newline stop sequence is valid for a one-token answer,
             # but it terminates the RWKV reasoning trace before the answer.
             stop_sequence = []
-        max_new_tokens = self._prepare_max_new_tokens(max_new_tokens, prompt)
+        max_new_tokens = self._prepare_max_new_tokens(max_new_tokens)
 
         if return_logits and not self.provider == "openai":
             logger.warning("Returning logits is not supported for this provider, ignoring.")
@@ -307,8 +296,21 @@ class LiteLLMClient(LightevalModel):
             logger.warning("O1 models do not support temperature, top_p, stop sequence. Disabling.")
         else:
             kwargs.update(self.generation_parameters.to_litellm_dict())
-        kwargs["max_tokens"] = max_new_tokens
-        kwargs["max_completion_tokens"] = max_new_tokens
+        if rwkv_generation_prompt in {"fake_think", "open_think"}:
+            kwargs["max_tokens"] = max_new_tokens
+            kwargs["max_completion_tokens"] = max_new_tokens
+            kwargs["stop"] = stop_sequence
+            logger.info(
+                "RWKV request: model=%s endpoint=%s/chat/completions mode=%s max_tokens=%s context=%s stop=%r",
+                self.model,
+                self.base_url,
+                rwkv_generation_prompt,
+                max_new_tokens,
+                self.max_length,
+                stop_sequence,
+            )
+        elif kwargs.get("max_completion_tokens") is None:
+            kwargs["max_completion_tokens"] = max_new_tokens
         if self.config.extra_body:
             extra_body = dict(self.config.extra_body)
             chat_template_kwargs = extra_body.get("chat_template_kwargs")
@@ -337,6 +339,8 @@ class LiteLLMClient(LightevalModel):
 
                 return response
             except litellm.BadRequestError as e:
+                if rwkv_generation_prompt in {"fake_think", "open_think"}:
+                    raise
                 if "message" in e.__dict__:
                     error_string = (
                         "The response was filtered due to the prompt triggering Microsoft's content management policy"
@@ -356,7 +360,7 @@ class LiteLLMClient(LightevalModel):
 
         message = f"API call failed after {self.API_MAX_RETRY} attempts"
         logger.error(message)
-        if self.config.generation_only:
+        if self.config.generation_only or rwkv_generation_prompt in {"fake_think", "open_think"}:
             raise RuntimeError(message) from last_error
         return LitellmModelResponse()
 
@@ -594,10 +598,7 @@ class LiteLLMClient(LightevalModel):
             results.append(
                 ModelResponse(
                     text=[""],
-                    input=dumps(
-                        {"prefix_prompt": prefix, "candidate_prompts": prompts},
-                        ensure_ascii=False,
-                    ),
+                    input=prefix,
                     input_tokens=prefix_token_ids,
                     logprobs=scores,
                     output_tokens=[[] for _ in scores],

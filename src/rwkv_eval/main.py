@@ -44,9 +44,8 @@ LOGGER = logging.getLogger(__name__)
 REQUEST_RETRIES = 5
 RETRY_DELAY = 1.0
 NORMAL_MAX_GENERATED_TOKENS = 4096
-HIGH_DIFFICULTY_MAX_GENERATED_TOKENS = 32768
+HIGH_DIFFICULTY_MAX_GENERATED_TOKENS = 16384
 TEST_MODE_MAX_SAMPLES = 10
-ENDPOINT_MAX_CONTEXT_LENGTH = 32768
 
 BenchmarkField = Literal[
     "knowledge",
@@ -83,6 +82,7 @@ _HIGH_COT_BENCHMARKS = (
     "aimo_progress_prize_1",
     "olympiad_bench",
     "math",
+    "math_500",
     "lcb",
 )
 _FAKE_COT_BENCHMARKS = ("asdiv", "arithmetic")
@@ -169,7 +169,7 @@ def _litelm_model(
         base_url=f"{endpoint.url.rstrip('/')}/v1",
         api_key=endpoint.api_key,
         concurrent_requests=sum(item.max_num_seqs for item in replicas),
-        max_model_length=max(endpoint.ctx_len, ENDPOINT_MAX_CONTEXT_LENGTH),
+        max_model_length=endpoint.ctx_len,
         cache_dir=cache_dir or "~/.cache/huggingface/lighteval",
         api_max_retry=5,
         extra_body=extra_body,
@@ -302,14 +302,6 @@ def _choice_indices(doc: Any) -> list[int]:
     return [int(index) for index in value] if isinstance(value, (list, tuple)) else [int(value)]
 
 
-def _display_choice_prompt(query: str, choices: list[Any]) -> str:
-    """Show a readable multiple-choice prompt without changing model inputs."""
-    if any(re.search(rf"(?mi)^\s*{label}\s*[.)]", query) for label in "ABCDE"[: len(choices)]):
-        return query
-    options = "\n".join(f"{chr(ord('A') + index)}. {choice}" for index, choice in enumerate(choices))
-    return f"{query.rstrip()}\n\n{options}\n\nAnswer:"
-
-
 def _choice_distribution(choices: list[Any], logprobs: list[float], selected: int) -> str:
     maximum = max(logprobs)
     weights = [math.exp(value - maximum) for value in logprobs]
@@ -436,15 +428,8 @@ def _make_score(  # noqa: C901
             if detail_score is None:
                 detail_score = _detail_score(task, doc, response, index)
 
-            # NoCoT has several actual candidate requests, so do not expose
-            # their JSON audit envelope as if it were one user prompt.  The
-            # detail view shows the original query and choices once; scoring
-            # still uses the native candidate logprobs above.
-            detail_input = (
-                _display_choice_prompt(doc.query, choices) if cot_mode == "NoCoT" and choices else response.input
-            )
             messages = build_uploaded_messages(
-                detail_input,
+                response.input,
                 str(answer),
                 prompt_template=prompt_template,
                 generation_prompt=generation_prompt,
