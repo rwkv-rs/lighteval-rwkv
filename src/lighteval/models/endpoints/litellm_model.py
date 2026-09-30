@@ -455,7 +455,7 @@ class LiteLLMClient(LightevalModel):
             disable=self.disable_tqdm,
         ):
             contexts = [self.prompt_manager.prepare_prompt_api(doc) for doc in dataset]
-            max_new_tokens = split[0].generation_size  # could be none
+            max_new_tokens = self.generation_parameters.max_new_tokens or split[0].generation_size
             return_logits = split[0].use_logits
             num_samples = split[0].num_samples
             stop_sequence = split[0].stop_sequences
