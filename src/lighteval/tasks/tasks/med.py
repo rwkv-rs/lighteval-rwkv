@@ -20,6 +20,9 @@ https://medmcqa.github.io/
 
 from string import ascii_uppercase
 
+from inspect_ai.scorer import choice
+from inspect_ai.solver import multiple_choice
+
 from lighteval.metrics.metrics import Metrics
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
@@ -76,10 +79,12 @@ med_mcqa = LightevalTaskConfig(
     few_shots_select=None,
     generation_size=5,
     metrics=[
-        Metrics.exact_match,
+        Metrics.loglikelihood_acc,
     ],
     stop_sequence=["\n"],
     version=0,
+    solver=[multiple_choice(cache=True)],
+    scorer=choice(),
 )
 
 
@@ -112,10 +117,12 @@ med_qa = LightevalTaskConfig(
     few_shots_select=None,
     generation_size=5,
     metrics=[
-        Metrics.exact_match,
+        Metrics.loglikelihood_acc,
     ],
     stop_sequence=["\n"],
     version=0,
+    solver=[multiple_choice(cache=True)],
+    scorer=choice(),
 )
 
 TASKS_TABLE = [

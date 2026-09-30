@@ -24,6 +24,9 @@ https://arxiv.org/abs/1809.02789
 
 from string import ascii_uppercase
 
+from inspect_ai.scorer import choice
+from inspect_ai.solver import multiple_choice
+
 from lighteval.metrics.metrics import Metrics
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
@@ -56,10 +59,12 @@ openbookqa = LightevalTaskConfig(
     few_shots_select=None,
     generation_size=1,
     metrics=[
-        Metrics.exact_match,
+        Metrics.loglikelihood_acc,
     ],
     stop_sequence=["\n"],
     version=0,
+    solver=[multiple_choice(cache=True)],
+    scorer=choice(),
 )
 
 TASKS_TABLE = [

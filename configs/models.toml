@@ -3,21 +3,25 @@ url = "api.rwkv.rs"
 api_key = "bba3a207dc4e1dc00ace4cf658385051cf411d98be4891f92f5e154874b3ca78"
 model_name = "rwkv7-g1j-1.5b"
 max_num_seqs = 1024
+ctx_len = 32768
 
 [[model]]
 url = "api.rwkv.rs"
 api_key = "bba3a207dc4e1dc00ace4cf658385051cf411d98be4891f92f5e154874b3ca78"
 model_name = "rwkv7-g1j-2.9b"
 max_num_seqs = 1024
+ctx_len = 32768
 
 [[model]]
 url = "api.rwkv.rs"
 api_key = "bba3a207dc4e1dc00ace4cf658385051cf411d98be4891f92f5e154874b3ca78"
 model_name = "rwkv7-g1j-7.2b"
 max_num_seqs = 512
+ctx_len = 32768
 
 [[model]]
 url = "api.rwkv.rs"
 api_key = "bba3a207dc4e1dc00ace4cf658385051cf411d98be4891f92f5e154874b3ca78"
 model_name = "rwkv7-g1j-13.3b"
 max_num_seqs = 1280
+ctx_len = 32768

@@ -44,7 +44,7 @@ LOGGER = logging.getLogger(__name__)
 REQUEST_RETRIES = 5
 RETRY_DELAY = 1.0
 NORMAL_MAX_GENERATED_TOKENS = 4096
-HIGH_DIFFICULTY_MAX_GENERATED_TOKENS = 16384
+HIGH_DIFFICULTY_MAX_GENERATED_TOKENS = 32768
 TEST_MODE_MAX_SAMPLES = 10
 
 BenchmarkField = Literal[
@@ -77,7 +77,6 @@ _NO_COT_BENCHMARKS = (
 )
 _HIGH_COT_BENCHMARKS = (
     "gpqa",
-    "hellaswag",
     "aime24",
     "aime25",
     "aimo_progress_prize_1",
