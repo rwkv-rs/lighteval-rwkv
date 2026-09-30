@@ -386,8 +386,6 @@ def _make_score(  # noqa: C901
     metrics: dict[str, Any],
     sampling: SamplingConfig,
     *,
-    prompt_template: str | None = None,
-    generation_prompt: str | None = None,
     cot_mode: CotMode | None = None,
 ) -> Score:
     task = pipeline.tasks_dict[task_name]
@@ -433,8 +431,6 @@ def _make_score(  # noqa: C901
             messages = build_uploaded_messages(
                 response.input,
                 str(answer),
-                prompt_template=prompt_template,
-                generation_prompt=generation_prompt,
                 fallback_query=doc.query,
                 rendered_prompt=None if cot_mode == "NoCoT" else rendered_prompt_from_response(response),
             )
@@ -675,7 +671,6 @@ async def evaluate(  # noqa: C901
             benchmark_cot_mode,
             benchmark_max_tokens,
         )
-        generation_prompt = {"FakeCoT": "fake_think", "CoT": "open_think"}.get(benchmark_cot_mode)
         sampling = _sampling_config(benchmark_cot_mode, benchmark_max_tokens, seed)
         # NoCoT uses LightEval's loglikelihood/greedy-choice path.  It has no
         # RWKV generation prompt to render into the uploaded user message.
@@ -735,8 +730,6 @@ async def evaluate(  # noqa: C901
                         task_name,
                         metrics,
                         sampling,
-                        prompt_template=template,
-                        generation_prompt=generation_prompt,
                         cot_mode=benchmark_cot_mode,
                     )
                 )
