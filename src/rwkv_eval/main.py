@@ -729,9 +729,10 @@ async def evaluate(  # noqa: C901
                 await asyncio.to_thread(Pipeline, benchmark.selector, params, tracker, model_config=model_config)
             )
 
-        # Evaluate one benchmark concurrently across independent model pools;
-        # the next benchmark starts only after this wave has been collected.
-        await asyncio.gather(*(asyncio.to_thread(pipeline.evaluate) for pipeline in pipelines))
+        # Evaluate model pools one at a time so a transient endpoint failure
+        # cannot cancel a completed pool's cached rollouts or hide its score.
+        for pipeline in pipelines:
+            await asyncio.to_thread(pipeline.evaluate)
         for pipeline in pipelines:
             pipeline.show_results()
             rows: list[Score] = []

@@ -241,7 +241,7 @@ class LiteLLMClient(LightevalModel):
             prompt_tokens = len(self.tokenizer(model=self.model, text=text))
             # Reserve room for chat-template markers and tokenizer boundary
             # differences between the client-side message and server render.
-            max_new_tokens = min(max_new_tokens, max(1, self.max_length - prompt_tokens - 128))
+            max_new_tokens = min(max_new_tokens, max(1, self.max_length - prompt_tokens - 512))
 
         return max_new_tokens
 
