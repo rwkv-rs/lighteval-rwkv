@@ -72,28 +72,6 @@ def _strip_question_answer_completion_template(prompt: Any) -> Any:
     return messages
 
 
-def _response_prompt_text(response: Any) -> str | None:
-    """Read an optional server-rendered prompt without assuming provider fields."""
-    candidates: list[Any] = [response]
-    model_dump = getattr(response, "model_dump", None)
-    if callable(model_dump):
-        try:
-            dumped = model_dump()
-        except Exception:
-            dumped = None
-        if isinstance(dumped, dict):
-            candidates.append(dumped)
-    hidden_params = getattr(response, "_hidden_params", None)
-    if isinstance(hidden_params, dict):
-        candidates.append(hidden_params)
-    for candidate in candidates:
-        for name in ("prompt_text", "rendered_prompt"):
-            value = candidate.get(name) if isinstance(candidate, dict) else getattr(candidate, name, None)
-            if isinstance(value, str):
-                return value
-    return None
-
-
 if is_package_available("litellm"):
     import litellm
     from litellm import encode, supports_reasoning
@@ -194,6 +172,7 @@ class LiteLLMModelConfig(ModelConfig):
     # LiteLLM are forwarded through the provider's extra_body mechanism.
     extra_body: dict[str, Any] | None = None
     generation_only: bool = False
+    rwkv_answer_extractor: str | None = None
     target_completions: int = 0
     minimum_completions: int = 0
     maximum_completions: int = 0
@@ -486,7 +465,27 @@ class LiteLLMClient(LightevalModel):
             responses = self.__call_api_parallel(contexts, return_logits, max_new_tokens, num_samples, stop_sequence)
 
             for response, context in zip(responses, contexts):
-                rendered_prompt = _response_prompt_text(response)
+                candidates: list[Any] = [response]
+                if callable(model_dump := getattr(response, "model_dump", None)):
+                    dumped = model_dump()
+                    if isinstance(dumped, dict):
+                        candidates.append(dumped)
+                if isinstance(hidden := getattr(response, "_hidden_params", None), dict):
+                    candidates.append(hidden)
+                rendered_prompt = next(
+                    (
+                        value
+                        for candidate in candidates
+                        for name in ("prompt_text", "rendered_prompt")
+                        if isinstance(
+                            value := candidate.get(name)
+                            if isinstance(candidate, dict)
+                            else getattr(candidate, name, None),
+                            str,
+                        )
+                    ),
+                    None,
+                )
                 result: list[str] = [choice.message.content for choice in response.choices]
                 reasonings: list[str | None] = [
                     getattr(choice.message, "reasoning_content", None) for choice in response.choices
@@ -496,6 +495,7 @@ class LiteLLMClient(LightevalModel):
                 cur_response = ModelResponse(
                     # In empty responses, the model should return an empty string instead of None
                     text=result if result and result[0] else [""],
+                    rendered_prompt=rendered_prompt,
                     reasonings=reasonings,
                     finish_reasons=finish_reasons,
                     input=rendered_prompt if rendered_prompt is not None else context,

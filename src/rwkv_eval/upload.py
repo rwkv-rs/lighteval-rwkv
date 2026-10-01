@@ -52,8 +52,13 @@ def rendered_prompt_from_response(response: Any) -> str | None:
     The producer asks vLLM/RWKV for ``prompt_text``.  Uploading that value is
     preferable to duplicating the server's chat-template implementation here.
     """
+    rendered_prompt = getattr(response, "rendered_prompt", None)
+    if isinstance(rendered_prompt, str):
+        return rendered_prompt
+    if isinstance(response, dict) and isinstance(response.get("rendered_prompt"), str):
+        return response["rendered_prompt"]
     candidates = [response]
-    if (model_dump := getattr(response, "model_dump", None)):
+    if model_dump := getattr(response, "model_dump", None):
         dumped = model_dump()
         if isinstance(dumped, dict):
             candidates.append(dumped)
@@ -100,7 +105,9 @@ def _stored_model_name(record: dict[str, Any]) -> str:
     config = _stored_model_config(record)
     if isinstance(config, dict) and isinstance(config.get("model_name"), str):
         return config["model_name"]
-    if isinstance(config, str) and (match := re.search(r"(?:['\"])?model_name(?:['\"])?\s*[:=]\s*['\"]([^'\"]+)", config)):
+    if isinstance(config, str) and (
+        match := re.search(r"(?:['\"])?model_name(?:['\"])?\s*[:=]\s*['\"]([^'\"]+)", config)
+    ):
         return match.group(1)
     if isinstance(name := record.get("model_name"), str):
         return name
@@ -113,7 +120,9 @@ def _stored_context_length(record: dict[str, Any]) -> int:
         for key in ("max_model_length", "ctx_len"):
             if isinstance(value := config.get(key), int) and not isinstance(value, bool) and value > 0:
                 return value
-    elif isinstance(config, str) and (match := re.search(r"(?:['\"])?(?:max_model_length|ctx_len)(?:['\"])?\s*[:=]\s*(\d+)", config)):
+    elif isinstance(config, str) and (
+        match := re.search(r"(?:['\"])?(?:max_model_length|ctx_len)(?:['\"])?\s*[:=]\s*(\d+)", config)
+    ):
         return int(match.group(1))
     return record.get("ctx_len", 4096) if isinstance(record.get("ctx_len", 4096), int) else 4096
 
@@ -167,24 +176,55 @@ def get_score(file_path: str | Path) -> Score:
         raise ValueError(f"{path}: results and config_tasks must contain the same single benchmark")
     task_config, task_metrics = record["config_tasks"][task_name], record["results"][task_name]
     truncation_rate = task_metrics.get("truncation_rate")
-    if isinstance(truncation_rate, bool) or not isinstance(truncation_rate, (int, float)) or not math.isfinite(truncation_rate) or not 0 <= truncation_rate <= 1:
+    if (
+        isinstance(truncation_rate, bool)
+        or not isinstance(truncation_rate, (int, float))
+        or not math.isfinite(truncation_rate)
+        or not 0 <= truncation_rate <= 1
+    ):
         raise ValueError(f"{path}: results must contain a finite truncation_rate in [0, 1]")
-    metric_name = next(name for name in task_metrics if not name.endswith("_stderr") and name not in {"n_samples", "n_completions", "n_truncated", "truncation_rate"})
+    metric_name = next(
+        name
+        for name in task_metrics
+        if not name.endswith("_stderr")
+        and name not in {"n_samples", "n_completions", "n_truncated", "truncation_rate"}
+    )
     num_samples = task_config["effective_num_docs"]
     summary = record["summary_tasks"][task_name]
     avg_k = summary["n_completions"] / num_samples if summary["n_completions"] else 1
     results_root = next(parent for parent in path.parents if parent.name == "results")
     date_id = path.stem.removeprefix("results_")
-    detail_path = results_root.parent / "details" / path.parent.relative_to(results_root) / date_id / f"details_{task_name}_{date_id}.parquet"
+    detail_path = (
+        results_root.parent
+        / "details"
+        / path.parent.relative_to(results_root)
+        / date_id
+        / f"details_{task_name}_{date_id}.parquet"
+    )
     passed, wrong, failed = get_eg_details(detail_path, no_cot=record.get("cot_mode") == "NoCoT")
-    return Score(_parse_stored_model(record), task_config["name"], num_samples, float(avg_k), float(task_metrics[metric_name]), float(truncation_rate), passed, wrong, failed)
+    return Score(
+        _parse_stored_model(record),
+        task_config["name"],
+        num_samples,
+        float(avg_k),
+        float(task_metrics[metric_name]),
+        float(truncation_rate),
+        passed,
+        wrong,
+        failed,
+    )
 
 
 def get_eg_details(file_path: str | Path, *, no_cot: bool = False) -> tuple[list[Detail], list[Detail], list[Detail]]:
     """Read up to 20 passed, wrong, and failed examples from one parquet file."""
     path = Path(file_path)
     details_root = next(parent for parent in path.parents if parent.name == "details")
-    sampling_path = details_root.parent / "results" / path.parent.parent.relative_to(details_root) / f"sampling_config_{path.parent.name}.json"
+    sampling_path = (
+        details_root.parent
+        / "results"
+        / path.parent.parent.relative_to(details_root)
+        / f"sampling_config_{path.parent.name}.json"
+    )
     sampling_config = get_sampling_config(sampling_path)
     buckets: tuple[list[Detail], list[Detail], list[Detail]] = ([], [], [])
     with pq.ParquetFile(path) as parquet_file:
@@ -192,15 +232,35 @@ def get_eg_details(file_path: str | Path, *, no_cot: bool = False) -> tuple[list
             for row in batch.to_pylist():
                 doc, response, choices = row["doc"], row["model_response"], row["doc"]["choices"]
                 gold_indices = doc["gold_index"] if isinstance(doc["gold_index"], list) else [doc["gold_index"]]
-                golds = [gold for index in gold_indices for gold in (choices[index] if isinstance(choices[index], list) else [choices[index]])]
+                golds = [
+                    gold
+                    for index in gold_indices
+                    for gold in (choices[index] if isinstance(choices[index], list) else [choices[index]])
+                ]
                 ground_truth = str(golds[0]) if len(golds) == 1 else json.dumps(golds, ensure_ascii=False)
-                model_input = doc.get("query", "") if no_cot and isinstance(response.get("input"), str) else response.get("input")
+                rendered_prompt = rendered_prompt_from_response(response)
+                if not no_cot and rendered_prompt is None:
+                    raise ValueError("generated detail is missing the server-rendered prompt")
+                model_input = (
+                    doc.get("query", "")
+                    if no_cot and isinstance(response.get("input"), str)
+                    else response.get("input")
+                )
                 if no_cot and response.get("logprobs"):
                     choice_scores = response["logprobs"][: len(choices)]
                     predicted = max(range(len(choice_scores)), key=choice_scores.__getitem__)
-                    scores, answers, finishes = [float(predicted in gold_indices)], [chr(ord("A") + predicted)], ["stop"]
+                    scores, answers, finishes = (
+                        [float(predicted in gold_indices)],
+                        [chr(ord("A") + predicted)],
+                        ["stop"],
+                    )
                 elif response["text"]:
-                    scores, answers, finishes = doc["specific"]["rwkv_rollout_scores"], doc["specific"]["rwkv_rollout_extracted_answers"], response["finish_reasons"] or ["stop"] * len(doc["specific"]["rwkv_rollout_extracted_answers"])
+                    scores, answers, finishes = (
+                        doc["specific"]["rwkv_rollout_scores"],
+                        doc["specific"]["rwkv_rollout_extracted_answers"],
+                        response["finish_reasons"]
+                        or ["stop"] * len(doc["specific"]["rwkv_rollout_extracted_answers"]),
+                    )
                 else:
                     choice_scores = response["logprobs"][: len(choices)]
                     predicted = max(range(len(choice_scores)), key=choice_scores.__getitem__)
@@ -209,7 +269,20 @@ def get_eg_details(file_path: str | Path, *, no_cot: bool = False) -> tuple[list
                     answer = str(answer)
                     bucket = 2 if finish == "length" or not answer.strip() else int(score != 1)
                     if len(buckets[bucket]) < 20:
-                        buckets[bucket].append(Detail(build_uploaded_messages(model_input, answer, fallback_query=doc.get("query", ""), rendered_prompt=rendered_prompt_from_response(response)), sampling_config, answer, ground_truth, bucket == 0))
+                        buckets[bucket].append(
+                            Detail(
+                                build_uploaded_messages(
+                                    model_input,
+                                    answer,
+                                    fallback_query=doc.get("query", ""),
+                                    rendered_prompt=rendered_prompt,
+                                ),
+                                sampling_config,
+                                answer,
+                                ground_truth,
+                                bucket == 0,
+                            )
+                        )
                 if all(len(bucket) == 20 for bucket in buckets):
                     return buckets
     return buckets
@@ -261,7 +334,9 @@ def upload(
             for name in ("passed_details", "wrong_details", "failed_details")
         },
     }
-    with httpx.Client(base_url=f"{api_url.rstrip('/')}/", headers={"Authorization": f"Bearer {token}"}, timeout=30.0) as client:
+    with httpx.Client(
+        base_url=f"{api_url.rstrip('/')}/", headers={"Authorization": f"Bearer {token}"}, timeout=30.0
+    ) as client:
         response = client.post("upload", json=payload)
         response.raise_for_status()
         return response.json()

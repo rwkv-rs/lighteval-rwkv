@@ -515,12 +515,20 @@ class Pipeline:
         if self.pipeline_parameters.remove_reasoning_tags:
             rwkv_generation = getattr(getattr(self.model, "config", None), "generation_only", False)
             if rwkv_generation:
-                from src.rwkv_eval.answer_extract.free_response import extract_free_response
+                from src.rwkv_eval.answer_extract.free_response import (
+                    extract_code_answer,
+                    extract_free_response,
+                    extract_math_answer,
+                )
 
             for _, responses in sampling_method_responses.items():
                 for response in responses:
                     response.text_post_processed = [
-                        extract_free_response(text)
+                        extract_math_answer(text)
+                        if rwkv_generation and getattr(self.model.config, "rwkv_answer_extractor", None) == "math"
+                        else extract_code_answer(text)
+                        if rwkv_generation and getattr(self.model.config, "rwkv_answer_extractor", None) == "code"
+                        else extract_free_response(text)
                         if rwkv_generation
                         else remove_reasoning_tags(
                             text=text,
@@ -570,9 +578,7 @@ class Pipeline:
 
     def _compute_metrics_for_sampling(self, sampling_docs, sampling_method_responses):
         task_metric_category_groups = collections.defaultdict(lambda: collections.defaultdict(list))
-        remaining = collections.Counter(
-            id(doc) for docs in sampling_docs.values() for doc in docs
-        )
+        remaining = collections.Counter(id(doc) for docs in sampling_docs.values() for doc in docs)
         for sampling_method, model_responses in sampling_method_responses.items():
             for doc, response in zip(sampling_docs[sampling_method], model_responses):
                 task_metric_category_groups[doc.task_name][sampling_method].append((doc, response))
@@ -603,7 +609,8 @@ class Pipeline:
         answers = response.final_text or [""]
         finish_reasons = getattr(response, "finish_reasons", [])
         failed = any(
-            index < len(finish_reasons) and finish_reasons[index].lower() in {"length", "max_tokens"}
+            index < len(finish_reasons)
+            and finish_reasons[index].lower() in {"length", "max_tokens"}
             or not str(answer).strip()
             for index, answer in enumerate(answers)
         )

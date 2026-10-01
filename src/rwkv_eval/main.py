@@ -35,6 +35,7 @@ from typing import Any, Literal, Sequence
 
 import httpx
 
+from src.rwkv_eval.answer_extract.free_response import extract_math_answer
 from src.rwkv_eval.configs import BenchmarkSpec, ModelEndpoint, RwkvModel, SamplingConfig, read_benchmarks, read_models
 from src.rwkv_eval.upload import Detail, Score, build_uploaded_messages, rendered_prompt_from_response
 from src.rwkv_eval.upload import upload as upload_score
@@ -93,14 +94,6 @@ class EvaluationError(RuntimeError):
     """Raised when a score cannot be published after all retries."""
 
 
-def _prompt_template(selector: str, requested: str) -> str:
-    if requested != "assistant":
-        return requested
-    name = selector.casefold()
-    difficult = ("gpqa", "math", "aime", "olympiad", "code")
-    return "bot" if any(keyword in name for keyword in difficult) else "assistant"
-
-
 def _benchmark_matches(selector: str, names: Sequence[str]) -> bool:
     selector = selector.casefold()
     return any(selector == name or selector.startswith(f"{name}:") for name in names)
@@ -144,6 +137,7 @@ def _litelm_model(
     max_tokens: int,
     seed: int,
     cache_dir: str | None = None,
+    answer_extractor: str | None = None,
 ):
     """Build the shared LiteLLM configuration for one RWKV endpoint pool."""
     from lighteval.models.endpoints.litellm_model import LiteLLMModelConfig
@@ -176,6 +170,7 @@ def _litelm_model(
         api_max_retry=6,
         extra_body=extra_body,
         generation_only=cot_mode != "NoCoT",
+        rwkv_answer_extractor=answer_extractor,
         generation_parameters=GenerationParameters(
             temperature=sampling.temp,
             top_k=sampling.top_k,
@@ -396,6 +391,9 @@ def _make_score(  # noqa: C901
     for native in native_details:
         doc, response = native.doc, native.model_response
         ground_truth = _ground_truth(doc)
+        benchmark_name = task_name.split("|", 1)[0].split(":", 1)[0]
+        if benchmark_name in {"math", "math_500"}:
+            ground_truth = extract_math_answer(ground_truth)
         answers = [str(answer) for answer in (response.final_text or [])]
         choices = getattr(doc, "choices", None) or []
         logprobs = getattr(response, "logprobs", []) or []
@@ -429,11 +427,14 @@ def _make_score(  # noqa: C901
             if detail_score is None:
                 detail_score = _detail_score(task, doc, response, index)
 
+            rendered_prompt = None if cot_mode == "NoCoT" else rendered_prompt_from_response(response)
+            if cot_mode != "NoCoT" and rendered_prompt is None:
+                raise EvaluationError("RWKV generation response did not include the server-rendered prompt")
             messages = build_uploaded_messages(
                 response.input,
                 str(answer),
                 fallback_query=doc.query,
-                rendered_prompt=None if cot_mode == "NoCoT" else rendered_prompt_from_response(response),
+                rendered_prompt=rendered_prompt,
             )
             detail = Detail(
                 messages=messages,
@@ -675,7 +676,13 @@ async def evaluate(  # noqa: C901
         sampling = _sampling_config(benchmark_cot_mode, benchmark_max_tokens, seed)
         # NoCoT uses LightEval's loglikelihood/greedy-choice path.  It has no
         # RWKV generation prompt to render into the uploaded user message.
-        template = None if benchmark_cot_mode == "NoCoT" else _prompt_template(benchmark.selector, prompt_template)
+        if benchmark_cot_mode == "NoCoT":
+            template = None
+        elif prompt_template != "assistant":
+            template = prompt_template
+        else:
+            difficult = ("gpqa", "math", "aime", "olympiad", "code")
+            template = "bot" if any(keyword in benchmark.selector.casefold() for keyword in difficult) else "assistant"
         model_groups = [
             (group, replicas)
             for group, replicas in groups.items()
@@ -698,6 +705,13 @@ async def evaluate(  # noqa: C901
                 benchmark_max_tokens,
                 seed,
                 cache_dir=str(Path(output_dir) / ".lighteval_cache"),
+                answer_extractor=(
+                    "math"
+                    if _benchmark_matches(benchmark.selector, ("math", "math_500"))
+                    else "code"
+                    if _benchmark_matches(benchmark.selector, ("lcb",))
+                    else None
+                ),
             )
             tracker = EvaluationTracker(
                 output_dir=output_dir,

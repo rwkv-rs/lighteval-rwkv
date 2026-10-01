@@ -120,6 +120,7 @@ class ModelResponse:
 
     # Model inputs
     input: str | list | None = None
+    rendered_prompt: str | None = None
     input_tokens: list[int] = field(default_factory=list)
 
     # Model text outputs
@@ -148,6 +149,7 @@ class ModelResponse:
     def __getitem__(self, index: int) -> "ModelResponse":
         return ModelResponse(
             input=self.input,
+            rendered_prompt=self.rendered_prompt,
             input_tokens=self.input_tokens,
             text=[self.text[index]],
             text_post_processed=[self.text_post_processed[index]] if self.text_post_processed else None,

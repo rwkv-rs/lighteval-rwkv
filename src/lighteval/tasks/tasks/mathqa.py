@@ -24,6 +24,9 @@ https://arxiv.org/abs/1905.13319
 import ast
 import re
 
+from inspect_ai.scorer import choice
+from inspect_ai.solver import multiple_choice
+
 from lighteval.metrics.metrics import Metrics
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
@@ -70,7 +73,6 @@ def mathqa_prompt(line, task_name: str = None):
     query = f"Problem: {line['Problem']}\n"
     query += "Options:\n"
     query += "".join(f"{key}) {choice}\n" for key, choice in zip("abcde", options))
-    query += "Answer:"
     correct = re.search(r"[a-e]", str(line["correct"]).lower())
     if correct is None:
         raise ValueError(f"Invalid MathQA answer label: {line['correct']!r}")
@@ -91,7 +93,9 @@ mathqa = LightevalTaskConfig(
     evaluation_splits=["test"],
     few_shots_split=None,
     few_shots_select=None,
-    generation_size=-1,
+    solver=[multiple_choice(cache=True)],
+    scorer=choice(),
+    generation_size=1,
     metrics=[Metrics.loglikelihood_acc],
     stop_sequence=["\n"],
     version=0,

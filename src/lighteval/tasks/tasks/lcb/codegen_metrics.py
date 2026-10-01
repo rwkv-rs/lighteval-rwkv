@@ -659,6 +659,8 @@ def translate_private_test_cases(encoded_data: str) -> dict[str, str]:
 def extract_code(model_output: str) -> str:
     outputlines = model_output.split("\n")
     indexlines = [i for i, line in enumerate(outputlines) if "```" in line]
+    if not indexlines:
+        return model_output.strip()
     if len(indexlines) < 2:
         return ""
     return "\n".join(outputlines[indexlines[-2] + 1 : indexlines[-1]])
