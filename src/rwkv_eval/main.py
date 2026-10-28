@@ -373,7 +373,7 @@ def _sampling_config(cot_mode: CotMode, max_tokens: int, seed: int) -> SamplingC
     values = {
         "NoCoT": (0.0, 0, 1.0, 0.0, 0.0, 1.0),
         "FakeCoT": (1.0, 32, 0.28, 0.0, 0.0, 1.0),
-        "CoT": (0.96, 32, 0.76, 1.0, 0.1, 0.988),
+        "CoT": (0.96, -1, 0.90, 1.0, 0.09, 0.994),
     }
     try:
         temp, top_k, top_p, presence, frequency, decay = values[cot_mode]
@@ -400,6 +400,8 @@ def _litelm_model(
     sampling = _sampling_config(cot_mode, max_tokens, seed)
     generation_prompt = {"FakeCoT": "fake_think", "CoT": "open_think"}.get(cot_mode)
     extra_body: dict[str, Any] = {"penalty_decay": sampling.penalty_decay}
+    if sampling.top_k == -1:
+        extra_body["top_k"] = -1
     if cot_mode != "NoCoT":
         extra_body.update(
             {
@@ -425,7 +427,7 @@ def _litelm_model(
         generation_only=cot_mode != "NoCoT",
         generation_parameters=GenerationParameters(
             temperature=sampling.temp,
-            top_k=sampling.top_k,
+            top_k=None if sampling.top_k == -1 else sampling.top_k,
             top_p=sampling.top_p,
             presence_penalty=sampling.presence_penalty,
             frequency_penalty=sampling.frequency_penalty,

@@ -1168,6 +1168,15 @@ class TestRWKVNonInterference(unittest.TestCase):
                         self.assertEqual(call.call_args.kwargs["max_tokens"], budget)
                         self.assertEqual(call.call_args.kwargs["max_completion_tokens"], budget)
                         self.assertEqual(call.call_args.kwargs["stop"], [])
+                        self.assertEqual(
+                            {
+                                key: call.call_args.kwargs[key]
+                                for key in ("temperature", "top_p", "presence_penalty", "frequency_penalty")
+                            },
+                            {"temperature": 0.96, "top_p": 0.90, "presence_penalty": 1.0, "frequency_penalty": 0.09},
+                        )
+                        self.assertEqual(call.call_args.kwargs["extra_body"]["top_k"], -1)
+                        self.assertEqual(call.call_args.kwargs["extra_body"]["penalty_decay"], 0.994)
                         converted = model._generation_response(response, prompt)
                         self.assertEqual(converted.effective_max_new_tokens, budget)
                         self.assertEqual(converted[0].prompt_token_count, 40000)
@@ -1294,10 +1303,8 @@ class TestRWKVNonInterference(unittest.TestCase):
 
         import httpx
         from litellm.llms.openai.common_utils import BaseOpenAILLM
-        from pydantic import SecretStr
-
         from lighteval.models.endpoints import litellm_model
-        from lighteval.models.model_input import GenerationParameters
+        from src.rwkv_eval.main import _litelm_model
 
         payloads = []
         transports = []
@@ -1325,18 +1332,15 @@ class TestRWKVNonInterference(unittest.TestCase):
             return client
 
         with tempfile.TemporaryDirectory() as directory:
+            endpoint = SimpleNamespace(
+                model_name="rwkv-wire-test",
+                url="https://wire-test.invalid",
+                api_key="test-key",
+                ctx_len=32,
+                max_num_seqs=1,
+            )
             model = litellm_model.LiteLLMClient(
-                litellm_model.LiteLLMModelConfig(
-                    model_name="rwkv-wire-test",
-                    provider="openai",
-                    api_key=SecretStr("test-key"),
-                    base_url="https://wire-test.invalid/v1",
-                    cache_dir=directory,
-                    max_model_length=32,
-                    api_max_retry=1,
-                    extra_body={"chat_template_kwargs": {"rwkv_generation_prompt": "open_think"}},
-                    generation_parameters=GenerationParameters(temperature=0.96, top_p=0.76, seed=42),
-                )
+                _litelm_model(endpoint, [endpoint], "CoT", "bot", 16, 42, cache_dir=directory)
             )
             try:
                 with (
@@ -1351,6 +1355,22 @@ class TestRWKVNonInterference(unittest.TestCase):
                 self.assertEqual(payloads[1]["seed"], 43)
                 self.assertEqual(payloads[1]["max_completion_tokens"], 16)
                 self.assertEqual(payloads[1]["stop"], [])
+                self.assertEqual(
+                    {
+                        key: payloads[1][key]
+                        for key in (
+                            "temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty", "penalty_decay"
+                        )
+                    },
+                    {
+                        "temperature": 0.96,
+                        "top_p": 0.90,
+                        "top_k": -1,
+                        "presence_penalty": 1.0,
+                        "frequency_penalty": 0.09,
+                        "penalty_decay": 0.994,
+                    },
+                )
                 self.assertEqual(payloads[1]["messages"], [{"role": "user", "content": "Q"}])
             finally:
                 for client in transports:

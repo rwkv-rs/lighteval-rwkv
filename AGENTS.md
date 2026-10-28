@@ -72,7 +72,7 @@ param_size: parameter scale, only includes 0.1b, 0.4b, 1.5b (often used in RL), 
 ## Correctness Checks
 1. Whether the three sets of Prompt Templates provided in the transformers-rwkv and corresponding rwkv7-g1-st weight repositories can be correctly applied
 2. Use wkv_mode=fp32io16 by default
-3. When using Open Think mode, use decoding parameters temp 0.96, top_p 0.76, top_k 32, presence_penalty 1.0, frequency_penalty 0.1, penalty_decay 0.988; when using Fake Think mode, use decoding parameters temperature 1.0, top_p 0.28, top_k 32; when using Open Think + Function Call mode, use decoding parameters temp 0.96, top_p 0.76, top_k 32, and disable penalty.
+3. When using Open Think mode, use decoding parameters temp 0.96, top_p 0.90, top_k -1, presence_penalty 1.0, frequency_penalty 0.09, penalty_decay 0.994; when using Fake Think mode, use decoding parameters temperature 1.0, top_p 0.28, top_k 32; when using Open Think + Function Call mode, use decoding parameters temp 0.96, top_p 0.76, top_k 32, and disable penalty.
 4. Refer to https://github.com/BlinkDL/Albatross/blob/main/faster3a_2605/eval_gpqa_diamond.py to complete the implementation of a general grader for multiple-choice questions
 5. Refer to https://github.com/BlinkDL/Albatross/blob/main/faster3a_2605/eval_math500.py to complete the implementation of a general grader for short-answer questions
 6. Model scores should be similar to those of Qwen3.5 models with similar parameter counts
