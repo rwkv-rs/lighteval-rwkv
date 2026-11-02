@@ -75,6 +75,9 @@ def _is_retryable_error(error: Exception) -> bool:
         ):
             return False
         cause = cause.__cause__ or cause.__context__
+    # LiteLLM assigns status 408 to transport timeouts.
+    if isinstance(error, litellm.Timeout):
+        return True
     status = getattr(getattr(error, "response", None), "status_code", None) or getattr(error, "status_code", None)
     if status is not None:
         return status == 429 or 500 <= status < 600
