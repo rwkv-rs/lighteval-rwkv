@@ -40,6 +40,11 @@ def asdiv_prompt(line, task_name: str = None):
 def rwkv_asdiv_prompt(line, task_name: str = None):
     """Prototype: asdiv_prompt; preserve native target components."""
     doc = asdiv_prompt(line, task_name)
+    doc.query = doc.query.removesuffix("Answer:") + (
+        "Write exactly one final \\boxed{...}, containing only the answer values without labels or units. "
+        "For multiple answers, use semicolons in question order, e.g. \\boxed{value1; value2; value3}. "
+        "Do not put individual answers in separate boxes.\n"
+    )
     doc.choices = ["; ".join(part.split(" (")[0].strip() for part in line["answer"].split(";"))]
     return doc
 
