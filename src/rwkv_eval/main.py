@@ -22,7 +22,7 @@ import re
 import subprocess
 import time
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import fields
+from dataclasses import asdict, fields
 from functools import partial
 from multiprocessing import get_context
 from pathlib import Path
@@ -30,7 +30,7 @@ from typing import Literal, Sequence
 
 import httpx
 
-from lighteval.metrics.metrics_sample import AvgAtN, SamplingMetric
+from lighteval.metrics.metrics_sample import SamplingMetric
 from lighteval.pipeline import Pipeline
 from lighteval.tasks.lighteval_task import LightevalTask
 from lighteval.tasks.registry import Registry
@@ -50,7 +50,7 @@ from src.rwkv_eval.configs import (
     read_models,
 )
 from src.rwkv_eval.rwkv_model import RWKVClient, _litelm_model, _sampling_config
-from src.rwkv_eval.upload import Detail, Score
+from src.rwkv_eval.upload import Detail, Score, get_score
 from src.rwkv_eval.upload import upload as upload_score
 
 
@@ -138,21 +138,17 @@ class RWKVPipeline(Pipeline):
                         metric.metric_name = [re.sub(r"n=\d+", f"n={count}", name) for name in metric.metric_name]
                     else:
                         metric.metric_name = re.sub(r"n=\d+", f"n={count}", metric.metric_name)
-            if task.sampling_methods != [SamplingMethod.GENERATIVE] or task.name.startswith("lcb:codegeneration"):
-                continue
-            if any(isinstance(metric.sample_level_fn, RWKVAvgAtN) for metric in task.metrics):
+            primary = task.metrics[0]
+            if isinstance(primary.sample_level_fn, RWKVAvgAtN):
                 continue
             from lighteval.metrics.metrics import Metrics
 
-            primary = task.metrics[0]
             average = copy.deepcopy(Metrics.avg_at_n.value)
-            average.sample_level_fn = RWKVAvgAtN(primary, count)
-            if isinstance(primary.sample_level_fn, AvgAtN):
-                average.metric_name = primary.metric_name
-                task.metrics = (average, *task.metrics[1:])
-            else:
-                average.metric_name = "rwkv_avg@n"
-                task.metrics = (*task.metrics, average)
+            average.category = primary.category
+            average.sample_level_fn = (
+                primary.sample_level_fn if task.name.startswith("lcb:codegeneration") else RWKVAvgAtN(primary, count)
+            )
+            task.metrics = [average]
             task.config.metrics = task.metrics
 
     def _init_tasks_and_requests(self, tasks: str):
@@ -231,6 +227,13 @@ class RWKVPipeline(Pipeline):
                 copy.deepcopy(doc), copy.deepcopy(response), copy.deepcopy(output)
             )
         )
+
+
+def _persist_score(score: Score, path: Path, metadata: dict) -> None:
+    payload = {**metadata, **asdict(score)}
+    temporary = path.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    temporary.replace(path)
 
 
 def evaluate(  # noqa: C901
@@ -483,11 +486,7 @@ def evaluate(  # noqa: C901
                         "test_mode": test_mode,
                     }
                     if restored:
-                        if (
-                            payload.get("score_contract") != "rwkv_avg_at_k_v1"
-                            or payload.get("metric_type") != "average"
-                            or payload.get("metric_k") != payload.get("avg_k")
-                        ):
+                        if payload.get("score_contract") != "rwkv_avg_at_k_v1":
                             raise ValueError(f"stored score requires explicit replay: {path}")
                         score = Score(
                             **{
@@ -514,40 +513,74 @@ def evaluate(  # noqa: C901
                         if payload.get("run_identity") != identity:
                             raise ValueError(f"stored score has a different run identity: {path}")
                     else:
-                        score = Score.from_pipeline(
-                            pipeline,
-                            spec.selector,
-                            _sampling_config(mode, budget, seed),
-                            cot_mode=mode,
-                            is_preview=endpoint.is_preview,
+                        tracker = pipeline.evaluation_tracker
+                        tracker.details_logger.details = pipeline.get_details()
+                        tracker.should_save_details = True
+                        pipeline.save_and_push_results()
+                        date_id = tracker._streaming_date_id
+                        model_name = tracker.general_config_logger.model_name.strip("/")
+                        result_path = Path(output_dir) / "results" / model_name / f"results_{date_id}.json"
+                        record = json.loads(result_path.read_text(encoding="utf-8"))
+                        names = [name for name, count in pipeline.task_sample_counts.items() if count]
+                        record["results"] = {
+                            name: {
+                                **record["results"][name],
+                                "truncation_rate": pipeline.task_truncation_counts[name]
+                                / pipeline.task_completion_counts[name]
+                                if pipeline.task_completion_counts[name]
+                                else 0.0,
+                            }
+                            for name in names
+                        }
+                        record["config_tasks"] = {name: record["config_tasks"][name] for name in names}
+                        for name in names:
+                            record["config_tasks"][name]["effective_num_docs"] = pipeline.task_sample_counts[name]
+                            record["summary_tasks"][name] = {
+                                "n_completions": pipeline.task_sample_counts[name] * pipeline.task_avg_k[name]
+                            }
+                        record.update(benchmark_name=spec.selector, cot_mode=mode, is_preview=endpoint.is_preview)
+                        tracker.save_results(date_id, record)
+                        sampling_path = result_path.with_name(f"sampling_config_{date_id}.json")
+                        sampling_path.write_text(
+                            json.dumps(asdict(_sampling_config(mode, budget, seed))), encoding="utf-8"
                         )
+                        score = get_score(result_path)
                         if registered_k[pair] is not None and score.avg_k != registered_k[pair]:
                             raise RuntimeError(f"{spec.selector}: actual avg_k differs from registered avg_k")
                         payload = {
                             "field": spec.field,
                             "upload_status": "local_only" if no_upload else "pending_upload",
                             "model_name": endpoint.model_name,
-                            "metric_k": score.avg_k,
                             "score_contract": "rwkv_avg_at_k_v1",
                             "cot_mode": mode,
                             "run_identity": identity,
                         }
                         if template is not None:
                             payload["prompt_template"] = template
-                        score.save(path, payload)
+                        _persist_score(score, path, payload)
                         successful.append(score)
-                        pipeline.save_and_push_results()
                     pending_pairs.discard(pair)
                     if no_upload:
                         continue
                 try:
-                    upload_score(
-                        score,
-                        field=spec.field,
-                        cot_mode=payload["cot_mode"],
-                        token=scoreboard_token or "",
-                        api_url=scoreboard_url,
-                    )
+                    for attempt in range(REQUEST_RETRIES):
+                        try:
+                            upload_score(
+                                score,
+                                field=spec.field,
+                                cot_mode=payload["cot_mode"],
+                                token=scoreboard_token or "",
+                                api_url=scoreboard_url,
+                            )
+                            break
+                        except (httpx.HTTPStatusError, httpx.TransportError) as error:
+                            if (
+                                isinstance(error, httpx.HTTPStatusError)
+                                and error.response.status_code != 429
+                                and error.response.status_code < 500
+                            ) or attempt + 1 == REQUEST_RETRIES:
+                                raise
+                            time.sleep(RETRY_DELAY * 2**attempt)
                 except (httpx.HTTPStatusError, httpx.TransportError) as error:
                     rejected = (
                         isinstance(error, httpx.HTTPStatusError)
@@ -556,7 +589,7 @@ def evaluate(  # noqa: C901
                     )
                     if rejected or final_attempt:
                         payload["upload_status"] = "upload_failed"
-                        score.save(path, payload)
+                        _persist_score(score, path, payload)
                         if rejected:
                             raise
                         failures.append(score)
@@ -564,7 +597,7 @@ def evaluate(  # noqa: C901
                         pending_uploads.append((score, spec, payload, path, restored))
                 else:
                     payload["upload_status"] = "uploaded"
-                    score.save(path, payload)
+                    _persist_score(score, path, payload)
                     if restored and not final_attempt:
                         successful.append(score)
                     score.passed_details.clear()

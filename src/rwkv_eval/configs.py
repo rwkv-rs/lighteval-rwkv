@@ -82,7 +82,11 @@ class RWKVAvgAtN(AvgAtN):
             scores.append(float(score))
             return score
 
-        result = AvgAtN(n=self.n, sample_scoring_function=compute_score).compute(doc, model_response, **kwargs)
+        result = (
+            compute_score(doc, model_response)
+            if doc.sampling_methods == [SamplingMethod.LOGPROBS]
+            else AvgAtN(n=self.n, sample_scoring_function=compute_score).compute(doc, model_response, **kwargs)
+        )
         doc.specific = {**(doc.specific or {}), "rwkv_rollout_scores": scores}
         return result
 
