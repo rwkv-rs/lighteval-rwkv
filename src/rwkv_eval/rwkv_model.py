@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import logging
+import ssl
 import time
 import uuid
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
@@ -46,6 +47,44 @@ from src.rwkv_eval.configs import ModelEndpoint, SamplingConfig
 
 
 LOGGER = logging.getLogger(__name__)
+
+
+def _is_retryable_error(error: Exception) -> bool:
+    """Prototype: producer HTTP retries; retry only transient request failures."""
+    cause = error
+    seen = set()
+    while cause is not None and id(cause) not in seen:
+        seen.add(id(cause))
+        if isinstance(
+            cause,
+            (
+                ssl.SSLCertVerificationError,
+                requests.exceptions.SSLError,
+                requests.exceptions.InvalidURL,
+                requests.exceptions.InvalidSchema,
+                requests.exceptions.MissingSchema,
+                httpx.InvalidURL,
+                httpx.LocalProtocolError,
+                httpx.UnsupportedProtocol,
+            ),
+        ):
+            return False
+        cause = cause.__cause__ or cause.__context__
+    status = getattr(getattr(error, "response", None), "status_code", None) or getattr(error, "status_code", None)
+    if status is not None:
+        return status == 429 or 500 <= status < 600
+    return isinstance(
+        error,
+        (
+            requests.exceptions.ConnectionError,
+            requests.exceptions.Timeout,
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+            litellm.APIConnectionError,
+            litellm.Timeout,
+        ),
+    )
 
 
 def _sampling_config(cot_mode: str, max_tokens: int, seed: int) -> SamplingConfig:
@@ -149,6 +188,7 @@ class RWKVClient(LiteLLMClient):
             "api_key": self.api_key,
             "n": num_samples,
             "extra_body": extra_body,
+            "max_retries": 0,
         }
         kwargs.update(self.generation_parameters.to_litellm_dict())
         # SampleCache persists each rollout; no-store also prevents LiteLLM's
@@ -182,7 +222,6 @@ class RWKVClient(LiteLLMClient):
             stop_sequence,
         )
 
-        last_error: BaseException | None = None
         for attempt in range(self.API_MAX_RETRY):
             started = time.monotonic()
             try:
@@ -206,12 +245,12 @@ class RWKVClient(LiteLLMClient):
                     time.monotonic() - started,
                 )
                 return response
-            except litellm.BadRequestError:
-                raise
             except Exception as e:
-                if getattr(e, "status_code", None) in {401, 403}:
+                e.rwkv_request_error = True
+                e.rwkv_retry_rounds = attempt + 1
+                e.rwkv_retry_exhausted = _is_retryable_error(e) and attempt + 1 == self.API_MAX_RETRY
+                if not _is_retryable_error(e) or e.rwkv_retry_exhausted:
                     raise
-                last_error = e
                 wait_time = min(64, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER**attempt))
                 headers = getattr(getattr(e, "response", None), "headers", {}) or {}
                 LOGGER.warning(
@@ -226,10 +265,6 @@ class RWKVClient(LiteLLMClient):
                     wait_time,
                 )
                 time.sleep(wait_time)
-
-        message = f"API call failed after {self.API_MAX_RETRY} attempts"
-        LOGGER.error(message)
-        raise RuntimeError(message) from last_error
 
     def greedy_until(
         self,
@@ -401,8 +436,7 @@ class RWKVClient(LiteLLMClient):
             "prompt_logprobs": 0,
             "return_token_ids": True,
         }
-        # Prototype: __call_api. Retry transient transport failures as well
-        # as upstream 5xx, without changing the scoring request or its budget.
+        # Prototype: __call_api; use the same bounded transient-error policy.
         for attempt in range(6):
             started = time.monotonic()
             try:
@@ -412,18 +446,6 @@ class RWKVClient(LiteLLMClient):
                     json=request_body,
                     timeout=300.0,
                 )
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as error:
-                LOGGER.warning(
-                    "RWKV LOGPROBS transport failure: model=%s request_id=%s attempt=%d elapsed=%.2fs error=%s",
-                    self.model,
-                    request_id,
-                    attempt + 1,
-                    time.monotonic() - started,
-                    type(error).__name__,
-                )
-                if attempt == 5:
-                    raise
-            else:
                 elapsed = time.monotonic() - started
                 if response.status_code >= 500 or elapsed >= 30:
                     LOGGER.warning(
@@ -435,15 +457,27 @@ class RWKVClient(LiteLLMClient):
                         elapsed,
                         response.status_code,
                     )
-                if response.status_code < 500 or attempt == 5:
-                    break
-            time.sleep(min(2**attempt, 16))
-        response.raise_for_status()
-        payload = response.json()
-        choices = payload.get("choices")
-        if not isinstance(choices, list) or not all(isinstance(choice, dict) for choice in choices):
-            raise RuntimeError("RWKV prompt_logprobs response did not contain choices")
-        return choices
+                response.raise_for_status()
+                payload = response.json()
+                choices = payload.get("choices")
+                if not isinstance(choices, list) or not all(isinstance(choice, dict) for choice in choices):
+                    raise RuntimeError("RWKV prompt_logprobs response did not contain choices")
+                return choices
+            except Exception as error:
+                error.rwkv_request_error = True
+                error.rwkv_retry_rounds = attempt + 1
+                error.rwkv_retry_exhausted = _is_retryable_error(error) and attempt == 5
+                if not _is_retryable_error(error) or error.rwkv_retry_exhausted:
+                    raise
+                LOGGER.warning(
+                    "RWKV LOGPROBS transport failure: model=%s request_id=%s attempt=%d elapsed=%.2fs error=%s",
+                    self.model,
+                    request_id,
+                    attempt + 1,
+                    time.monotonic() - started,
+                    type(error).__name__,
+                )
+                time.sleep(min(2**attempt, 16))
 
     @staticmethod
     def _candidate_logprob(choice: dict[str, Any], prefix_token_ids: list[int]) -> float:

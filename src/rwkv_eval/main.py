@@ -21,6 +21,7 @@ import pwd
 import re
 import subprocess
 import time
+import traceback
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict, fields
 from functools import partial
@@ -29,6 +30,7 @@ from pathlib import Path
 from typing import Any, Literal, Sequence
 
 import httpx
+from huggingface_hub.errors import OfflineModeIsEnabled
 
 from lighteval.metrics.metrics_sample import SamplingMetric
 from lighteval.pipeline import Pipeline
@@ -49,7 +51,7 @@ from src.rwkv_eval.configs import (
     read_benchmarks,
     read_models,
 )
-from src.rwkv_eval.rwkv_model import RWKVClient, _litelm_model, _sampling_config
+from src.rwkv_eval.rwkv_model import RWKVClient, _is_retryable_error, _litelm_model, _sampling_config
 from src.rwkv_eval.upload import Detail, Score, get_detail
 from src.rwkv_eval.upload import upload as upload_score
 
@@ -281,6 +283,64 @@ def _persist_score(score: Score, path: Path, metadata: dict) -> None:
     temporary.replace(path)
 
 
+def _persist_failure_report(
+    path: Path,
+    report: dict,
+    *,
+    error: Exception | None = None,
+    benchmark: BenchmarkSpec | None = None,
+    stage: str | None = None,
+    result_path: Path | None = None,
+    warning: bool = False,
+    secrets: Sequence[str] = (),
+) -> None:
+    """Prototype: _persist_score; persist a safe exception handoff atomically."""
+    if error is not None:
+        status = getattr(getattr(error, "response", None), "status_code", None) or getattr(error, "status_code", None)
+        reason = f"HTTP {status}" if status is not None else f"{stage} failed ({type(error).__name__})"
+        frames = traceback.extract_tb(error.__traceback__)
+        if isinstance(error, FileNotFoundError) or (
+            type(error) in {ValueError, BlockingIOError, RuntimeError}
+            and frames
+            and frames[-1].filename in {__file__, str(Path(__file__).with_name("rwkv_model.py"))}
+        ):
+            reason = str(error)
+        trace = "".join(traceback.format_list(frames))
+        for secret in secrets:
+            if secret:
+                reason = reason.replace(secret, "[REDACTED]")
+                trace = trace.replace(secret, "[REDACTED]")
+        entry = {
+            "model_name": report["model_name"],
+            "benchmark": benchmark.selector if benchmark else None,
+            "field": benchmark.field if benchmark else None,
+            "stage": stage,
+            "exception_type": type(error).__name__,
+            "http_status": status,
+            "retry_exhausted": getattr(error, "rwkv_retry_exhausted", False),
+            "retry_rounds": getattr(error, "rwkv_retry_rounds", None),
+            "result_path": str(result_path) if result_path is not None else None,
+            "reason": reason,
+        }
+        report["warnings" if warning else "failures"].append(entry)
+        if benchmark is not None and not warning:
+            item = {"benchmark": benchmark.selector, "field": benchmark.field}
+            if item not in report["failed_benchmarks"]:
+                report["failed_benchmarks"].append(item)
+            if item in report["not_executed_benchmarks"]:
+                report["not_executed_benchmarks"].remove(item)
+        LOGGER.log(logging.WARNING if warning else logging.ERROR, "%s\n%s", entry, trace)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+        temporary.replace(path)
+    except OSError as error:
+        error.rwkv_report_failure = True
+        LOGGER.error("could not write failure report %s: %s", path, type(error).__name__)
+        raise
+
+
 def evaluate(  # noqa: C901
     models: Sequence[ModelEndpoint],
     benchmarks: Sequence[BenchmarkSpec],
@@ -293,7 +353,7 @@ def evaluate(  # noqa: C901
     scoreboard_url: str = "https://eval.rwkv.rs/test/api",
     no_upload: bool = False,
     output_dir: str = "results",
-) -> tuple[list[Score], list[Score]]:
+) -> tuple[list[Score], list[dict[str, Any]]]:
     """Run native LightEval independently for each configured model pool."""
     from lighteval.logging.evaluation_tracker import EvaluationTracker
     from lighteval.pipeline import ParallelismManager, PipelineParameters
@@ -334,16 +394,33 @@ def evaluate(  # noqa: C901
                 )
                 for replicas in groups.values()
             ]
-            for job in jobs:
+            for replicas, job in zip(groups.values(), jobs, strict=True):
                 try:
                     results.append(job.result())
                 except Exception as error:
-                    errors.append(error)
-        if errors:
-            raise errors[0]
+                    LOGGER.error(
+                        "model process failed: model=%s error=%s\n%s",
+                        replicas[0].model_name,
+                        type(error).__name__,
+                        "".join(traceback.format_list(traceback.extract_tb(error.__traceback__))),
+                    )
+                    errors.append(
+                        {
+                            "model_name": replicas[0].model_name,
+                            "benchmark": None,
+                            "field": None,
+                            "stage": "process",
+                            "exception_type": type(error).__name__,
+                            "http_status": None,
+                            "retry_exhausted": False,
+                            "retry_rounds": None,
+                            "result_path": None,
+                            "reason": "model process failed; inspect its journal and failure report",
+                        }
+                    )
         return [score for scores, _ in results for score in scores], [
-            score for _, failures in results for score in failures
-        ]
+            failure for _, failures in results for failure in failures
+        ] + errors
 
     endpoint = models[0]
     model = RwkvModel.from_model_name(endpoint.model_name, endpoint.ctx_len, endpoint.is_preview)
@@ -357,11 +434,33 @@ def evaluate(  # noqa: C901
     )
     directory.mkdir(parents=True, exist_ok=True)
     descriptor = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+    report = None
+    successful = []
+    spec = None
+    path = None
+    stage = "startup"
+    secrets = [scoreboard_token or "", *(item.api_key for item in models)]
     try:
         try:
             fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise BlockingIOError(f"another evaluation producer owns {directory}") from error
+        run_id = str(time.time_ns())
+        report_path = Path(output_dir) / "failures" / directory.name / f"{run_id}.json"
+        report = {
+            "model_name": endpoint.model_name,
+            "run_id": run_id,
+            "started_at": time.time(),
+            "finished_at": None,
+            "status": "running",
+            "completed_benchmarks": [],
+            "failed_benchmarks": [],
+            "not_executed_benchmarks": [{"benchmark": item.selector, "field": item.field} for item in benchmarks],
+            "failures": [],
+            "warnings": [],
+        }
+        _persist_failure_report(report_path, report)
+        stage = "manifest"
         effective_max_samples = max_samples
         if test_mode:
             effective_max_samples = (
@@ -390,11 +489,9 @@ def evaluate(  # noqa: C901
                             raise ValueError("Scoreboard scores response must be a list")
                         break
                     except (httpx.HTTPStatusError, httpx.TransportError) as error:
-                        if (
-                            isinstance(error, httpx.HTTPStatusError)
-                            and error.response.status_code != 429
-                            and error.response.status_code < 500
-                        ) or attempt + 1 == REQUEST_RETRIES:
+                        error.rwkv_retry_rounds = attempt + 1
+                        error.rwkv_retry_exhausted = _is_retryable_error(error) and attempt + 1 == REQUEST_RETRIES
+                        if not _is_retryable_error(error) or error.rwkv_retry_exhausted:
                             raise
                         time.sleep(RETRY_DELAY * 2**attempt)
             registered, known, pending_pairs = set(), set(), set()
@@ -451,29 +548,68 @@ def evaluate(  # noqa: C901
             if missing := {pair for pair, count in registered_k.items() if count is None}:
                 raise ValueError(f"Scoreboard manifest lacks registered avg_k for {sorted(missing)}")
 
-        work = []
+        stage = "restore"
+        work, protected_paths = [], set()
         if not no_upload:
             for path in sorted(directory.glob("*.json")):
-                payload = json.loads(path.read_text(encoding="utf-8"))
-                if payload.get("upload_status") in {"pending_upload", "upload_failed"}:
+                spec = None
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    if not isinstance(payload, dict):
+                        raise ValueError("stored result is not an object")
+                    if payload.get("upload_status") not in {"pending_upload", "upload_failed"}:
+                        continue
                     spec = configured.get((payload.get("benchmark_name"), payload.get("field")))
-                    if spec is not None:
-                        work.append((spec, payload, path))
-        registries = {
-            spec: RWKVRegistry(tasks=spec.selector, load_multilingual=True)
-            for spec in benchmarks
-            if (spec.selector, spec.field) in pending_pairs or any(item[0] == spec for item in work)
-        }
-        tasks = {spec: registry.load_tasks() for spec, registry in registries.items()}
+                    if spec is None:
+                        raise ValueError("stored score benchmark/field is not selected")
+                    if payload.get("score_contract") != "rwkv_avg_at_k_v1":
+                        raise ValueError("stored score requires explicit replay")
+                except (ValueError, UnicodeError) as error:
+                    protected_paths.add(path)
+                    _persist_failure_report(
+                        report_path,
+                        report,
+                        error=error,
+                        benchmark=spec,
+                        stage=stage,
+                        result_path=path,
+                        warning=True,
+                        secrets=secrets,
+                    )
+                    continue
+                if spec is not None:
+                    work.append((spec, payload, path))
+        report["not_executed_benchmarks"] = [
+            {"benchmark": item.selector, "field": item.field}
+            for item in benchmarks
+            if (item.selector, item.field) in pending_pairs or any(candidate[0] == item for candidate in work)
+        ]
+        registries, tasks = {}, {}
+        for spec in benchmarks:
+            if (spec.selector, spec.field) not in pending_pairs and not any(item[0] == spec for item in work):
+                continue
+            stage = "registry"
+            try:
+                registry = RWKVRegistry(tasks=spec.selector, load_multilingual=True)
+                loaded = registry.load_tasks()
+            except (ValueError, FileNotFoundError, ConnectionError) as error:
+                if isinstance(error, ConnectionError) and not isinstance(
+                    error.__context__, (FileNotFoundError, OfflineModeIsEnabled)
+                ):
+                    raise
+                _persist_failure_report(report_path, report, error=error, benchmark=spec, stage=stage, secrets=secrets)
+                continue
+            registries[spec], tasks[spec] = registry, loaded
+        work = [item for item in work if item[0] in tasks]
         ordered = sorted(
-            (spec for spec in benchmarks if (spec.selector, spec.field) in pending_pairs),
+            (spec for spec in benchmarks if (spec.selector, spec.field) in pending_pairs and spec in tasks),
             key=lambda spec: any(SamplingMethod.GENERATIVE in task.sampling_methods for task in tasks[spec].values()),
         )
         LOGGER.info("benchmark order: %s", [spec.selector for spec in ordered])
         work.extend(
             (spec, None, directory / (re.sub(r"[^A-Za-z0-9_.-]+", "_", spec.selector) + ".json")) for spec in ordered
         )
-        successful, failures, pending_uploads = [], [], []
+        failures, pending_uploads = report["failures"], []
         # Restored and newly computed scores share the same publication path.
         for final_attempt in (False, True):
             for item in pending_uploads if final_attempt else work:
@@ -485,6 +621,7 @@ def evaluate(  # noqa: C901
                     restored = payload is not None
                     if not restored and pair not in pending_pairs:
                         continue
+                    stage = "initialize"
                     task = next(iter(tasks[spec].values()))
                     mode, budget = task.cot_mode, task.generation_size
                     template = None if mode == "NoCoT" else prompt_template or task.config.prompt_template
@@ -520,8 +657,41 @@ def evaluate(  # noqa: C901
                     if registered_k[pair] is not None:
                         pipeline._configure_sampling_counts()
                     if not restored:
-                        pipeline.evaluate()
+                        stage = "evaluate"
+                        item_identity = {"benchmark": spec.selector, "field": spec.field}
+                        if item_identity in report["not_executed_benchmarks"]:
+                            report["not_executed_benchmarks"].remove(item_identity)
+                        try:
+                            pipeline.evaluate()
+                        except Exception as error:
+                            status = getattr(getattr(error, "response", None), "status_code", None) or getattr(
+                                error, "status_code", None
+                            )
+                            if status in {400, 422} or (
+                                (
+                                    isinstance(error, (ValueError, FileNotFoundError))
+                                    or (
+                                        isinstance(error, ConnectionError)
+                                        and isinstance(error.__context__, (FileNotFoundError, OfflineModeIsEnabled))
+                                    )
+                                )
+                                and not getattr(error, "rwkv_request_error", False)
+                                and not str(error).startswith("unverifiable cached RWKV rollout ")
+                            ):
+                                _persist_failure_report(
+                                    report_path,
+                                    report,
+                                    error=error,
+                                    benchmark=spec,
+                                    stage=stage,
+                                    result_path=path,
+                                    secrets=secrets,
+                                )
+                                pending_pairs.discard(pair)
+                                continue
+                            raise
                         pipeline.show_results()
+                    stage = "contract"
                     identity = {
                         "model_hash": pipeline.model._cache.model_hash,
                         "task_hashes": {
@@ -531,45 +701,81 @@ def evaluate(  # noqa: C901
                         "test_mode": test_mode,
                     }
                     if restored:
-                        if payload.get("score_contract") != "rwkv_avg_at_k_v1":
-                            raise ValueError(f"stored score requires explicit replay: {path}")
-                        score = Score(
-                            **{
-                                **{field.name: payload[field.name] for field in fields(Score)},
-                                "model": RwkvModel(**payload["model"]),
+                        stage = "restore"
+                        try:
+                            if payload.get("score_contract") != "rwkv_avg_at_k_v1":
+                                raise ValueError(f"stored score requires explicit replay: {path}")
+                            score = Score(
                                 **{
-                                    name: [
-                                        Detail(
-                                            **{
-                                                **detail,
-                                                "sampling_config": SamplingConfig(**detail["sampling_config"]),
-                                            }
-                                        )
-                                        for detail in payload[name]
-                                    ]
-                                    for name in ("passed_details", "wrong_details", "failed_details")
-                                },
-                            }
-                        )
-                        if payload.get("model_name") != endpoint.model_name or score.model.key != model.key:
-                            raise ValueError(f"stored score has a different model identity: {path}")
-                        if payload.get("cot_mode") != mode or score.avg_k != registered_k[pair]:
-                            raise ValueError(f"stored score has a different evaluation configuration: {path}")
-                        if payload.get("run_identity") != identity:
-                            raise ValueError(f"stored score has a different run identity: {path}")
-                    else:
-                        rows = [
-                            _make_score(
-                                pipeline,
-                                name,
-                                pipeline.evaluation_tracker.metrics_logger.metric_aggregated[name],
-                                _sampling_config(mode, budget, seed),
-                                cot_mode=mode,
-                                is_preview=endpoint.is_preview,
+                                    **{field.name: payload[field.name] for field in fields(Score)},
+                                    "model": RwkvModel(**payload["model"]),
+                                    **{
+                                        name: [
+                                            Detail(
+                                                **{
+                                                    **detail,
+                                                    "sampling_config": SamplingConfig(**detail["sampling_config"]),
+                                                }
+                                            )
+                                            for detail in payload[name]
+                                        ]
+                                        for name in ("passed_details", "wrong_details", "failed_details")
+                                    },
+                                }
                             )
-                            for name, count in pipeline.task_sample_counts.items()
-                            if count
-                        ]
+                            if payload.get("model_name") != endpoint.model_name or score.model.key != model.key:
+                                raise ValueError(f"stored score has a different model identity: {path}")
+                            if payload.get("cot_mode") != mode or score.avg_k != registered_k[pair]:
+                                raise ValueError(f"stored score has a different evaluation configuration: {path}")
+                            if payload.get("run_identity") != identity:
+                                raise ValueError(f"stored score has a different run identity: {path}")
+                        except (ValueError, TypeError, KeyError) as error:
+                            protected_paths.add(path)
+                            _persist_failure_report(
+                                report_path,
+                                report,
+                                error=error,
+                                benchmark=spec,
+                                stage=stage,
+                                result_path=path,
+                                warning=True,
+                                secrets=secrets,
+                            )
+                            continue
+                    else:
+                        stage = "details"
+                        try:
+                            rows = [
+                                _make_score(
+                                    pipeline,
+                                    name,
+                                    pipeline.evaluation_tracker.metrics_logger.metric_aggregated[name],
+                                    _sampling_config(mode, budget, seed),
+                                    cot_mode=mode,
+                                    is_preview=endpoint.is_preview,
+                                )
+                                for name, count in pipeline.task_sample_counts.items()
+                                if count
+                            ]
+                        except ValueError as error:
+                            if str(error) in {
+                                "NoCoT detail is missing the exact candidate inputs or scores",
+                                "generated detail is missing the server-rendered prompt",
+                                "RWKV detail is missing per-rollout scores",
+                            }:
+                                raise
+                            _persist_failure_report(
+                                report_path,
+                                report,
+                                error=error,
+                                benchmark=spec,
+                                stage=stage,
+                                result_path=path,
+                                secrets=secrets,
+                            )
+                            pending_pairs.discard(pair)
+                            continue
+                        stage = "contract"
                         score = rows[0]
                         score.benchmark_name = spec.selector
                         if len(rows) > 1:
@@ -595,12 +801,24 @@ def evaluate(  # noqa: C901
                         }
                         if template is not None:
                             payload["prompt_template"] = template
+                        if path in protected_paths:
+                            suffix = hashlib.sha256(
+                                json.dumps(
+                                    {"benchmark_name": spec.selector, "field": spec.field, "run_identity": identity},
+                                    sort_keys=True,
+                                ).encode()
+                            ).hexdigest()[:16]
+                            path = path.with_name(f"{path.stem}.{suffix}.json")
+                        stage = "save"
                         _persist_score(score, path, payload)
                         successful.append(score)
                         pipeline.save_and_push_results()
                     pending_pairs.discard(pair)
                     if no_upload:
+                        report["completed_benchmarks"].append({"benchmark": spec.selector, "field": spec.field})
+                        _persist_failure_report(report_path, report)
                         continue
+                stage = "upload"
                 try:
                     for attempt in range(REQUEST_RETRIES):
                         try:
@@ -613,26 +831,38 @@ def evaluate(  # noqa: C901
                             )
                             break
                         except (httpx.HTTPStatusError, httpx.TransportError) as error:
-                            if (
-                                isinstance(error, httpx.HTTPStatusError)
-                                and error.response.status_code != 429
-                                and error.response.status_code < 500
-                            ) or attempt + 1 == REQUEST_RETRIES:
+                            error.rwkv_retry_rounds = attempt + 1
+                            error.rwkv_retry_exhausted = _is_retryable_error(error) and attempt + 1 == REQUEST_RETRIES
+                            if not _is_retryable_error(error) or error.rwkv_retry_exhausted:
                                 raise
                             time.sleep(RETRY_DELAY * 2**attempt)
                 except (httpx.HTTPStatusError, httpx.TransportError) as error:
-                    rejected = (
-                        isinstance(error, httpx.HTTPStatusError)
-                        and error.response.status_code != 429
-                        and error.response.status_code < 500
-                    )
+                    rejected = not _is_retryable_error(error)
                     if rejected or final_attempt:
                         payload["upload_status"] = "upload_failed"
                         _persist_score(score, path, payload)
                         if rejected:
                             raise
-                        failures.append(score)
+                        _persist_failure_report(
+                            report_path,
+                            report,
+                            error=error,
+                            benchmark=spec,
+                            stage=stage,
+                            result_path=path,
+                            secrets=secrets,
+                        )
                     else:
+                        _persist_failure_report(
+                            report_path,
+                            report,
+                            error=error,
+                            benchmark=spec,
+                            stage=stage,
+                            result_path=path,
+                            warning=True,
+                            secrets=secrets,
+                        )
                         pending_uploads.append((score, spec, payload, path, restored))
                 else:
                     payload["upload_status"] = "uploaded"
@@ -642,7 +872,37 @@ def evaluate(  # noqa: C901
                     score.passed_details.clear()
                     score.wrong_details.clear()
                     score.failed_details.clear()
+                    item_identity = {"benchmark": spec.selector, "field": spec.field}
+                    report["completed_benchmarks"].append(item_identity)
+                    if item_identity in report["not_executed_benchmarks"]:
+                        report["not_executed_benchmarks"].remove(item_identity)
+                    _persist_failure_report(report_path, report)
+        report["status"] = "completed_with_failures" if failures else "completed"
+        report["finished_at"] = time.time()
+        _persist_failure_report(report_path, report)
+        LOGGER.warning(
+            "evaluation finished: model=%s failures=%d warnings=%d report=%s",
+            endpoint.model_name,
+            len(failures),
+            len(report["warnings"]),
+            report_path,
+        )
         return successful, failures
+    except Exception as error:
+        if report is None or getattr(error, "rwkv_report_failure", False):
+            raise
+        report["status"] = "stopped"
+        report["finished_at"] = time.time()
+        _persist_failure_report(
+            report_path, report, error=error, benchmark=spec, stage=stage, result_path=path, secrets=secrets
+        )
+        LOGGER.error(
+            "evaluation stopped: model=%s failures=%d report=%s",
+            endpoint.model_name,
+            len(report["failures"]),
+            report_path,
+        )
+        return successful, report["failures"]
     finally:
         os.close(descriptor)
 
@@ -728,6 +988,8 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
                     "--property=Restart=on-failure",
                     "--property=RestartSec=30s",
                     "--property=RestartPreventExitStatus=78",
+                    "--property=StartLimitIntervalSec=600s",
+                    "--property=StartLimitBurst=3",
                     "--property=LimitNOFILE=65536",
                     "--property=NoNewPrivileges=yes",
                     "/usr/bin/timeout",
@@ -799,18 +1061,32 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
                     if properties.get("LoadState") != "not-found":
                         if properties.get("Description") != description:
                             raise RuntimeError(f"{unit}.service already exists with different launch settings")
-                        if properties.get("ActiveState") in {"active", "activating", "reloading"}:
+                        if properties.get("ActiveState") not in {"inactive", "failed"}:
                             print(f"Already running {unit}.service", flush=True)
                             continue
                     if properties.get("LoadState") != "not-found":
-                        start = ([] if os.geteuid() == 0 else ["sudo", "-n"]) + [
+                        reset = ([] if os.geteuid() == 0 else ["sudo", "-n"]) + [
                             "/usr/bin/systemctl",
-                            "start",
+                            "reset-failed",
                             f"{unit}.service",
                         ]
-                        subprocess.run(start, check=True, timeout=30)
-                        print(f"Resumed {unit}.service", flush=True)
-                        continue
+                        subprocess.run(reset, check=True, timeout=30)
+                        status = subprocess.run(
+                            ["/usr/bin/systemctl", "show", f"{unit}.service", "--property=LoadState"],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                            timeout=10,
+                        )
+                        if "LoadState=not-found" not in status.stdout:
+                            start = ([] if os.geteuid() == 0 else ["sudo", "-n"]) + [
+                                "/usr/bin/systemctl",
+                                "start",
+                                f"{unit}.service",
+                            ]
+                            subprocess.run(start, check=True, timeout=30)
+                            print(f"Resumed {unit}.service", flush=True)
+                            continue
                     subprocess.run(command, check=True, timeout=30)
                 except (RuntimeError, OSError, subprocess.SubprocessError) as error:
                     failures.append(f"{unit}: {error}")
@@ -841,12 +1117,14 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
         if args.launch:
             LOGGER.error("%s", error)
             return 1
-        raise
+        LOGGER.error("evaluation configuration failed: %s", error)
+        return 78
     except RuntimeError as error:
         if args.launch:
             LOGGER.error("%s", error)
             return 1
-        raise
+        LOGGER.error("evaluation configuration failed: %s", error)
+        return 78
     try:
         scores, failures = evaluate(
             models,
@@ -861,31 +1139,15 @@ def main(argv: Sequence[str] | None = None) -> int:  # noqa: C901
             output_dir=args.output_dir,
         )
     except Exception as error:
-        if service:
-            response = getattr(error, "response", None)
-            status = getattr(response, "status_code", None) or getattr(error, "status_code", None)
-            if status in {401, 403}:
-                LOGGER.error("evaluation authentication failed; check inference and Scoreboard credentials")
-                return 78
-            if isinstance(error, (ValueError, BlockingIOError)) or (
-                isinstance(error, httpx.HTTPStatusError) and status != 429 and status < 500
-            ):
-                LOGGER.error("%s", error)
-                return 78
-            from huggingface_hub import constants
-            from huggingface_hub.errors import OfflineModeIsEnabled
-
-            missing_file = isinstance(error, FileNotFoundError) or (
-                isinstance(error, ConnectionError)
-                and isinstance(error.__context__, (FileNotFoundError, OfflineModeIsEnabled))
-            )
-            if constants.HF_HUB_OFFLINE and missing_file:
-                LOGGER.error("required file is missing in offline mode: %s", error)
-                return 78
-        raise
+        LOGGER.error(
+            "evaluation terminated: error=%s\n%s",
+            type(error).__name__,
+            "".join(traceback.format_list(traceback.extract_tb(error.__traceback__))),
+        )
+        return 78
     if failures:
-        LOGGER.error("%d score uploads remain pending", len(failures))
-        return 1
+        LOGGER.error("%d evaluation failures require attention: %s", len(failures), failures)
+        return 78
     LOGGER.info("completed %d scores", len(scores))
     return 0
 
