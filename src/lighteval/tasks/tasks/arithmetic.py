@@ -19,12 +19,16 @@ paper:
 https://arxiv.org/abs/2005.14165
 """
 
+from pathlib import Path
+
 from inspect_ai.dataset import Sample
 from inspect_ai.solver import generate
 
 from lighteval.metrics.metrics import Metrics, math_scorer
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
+from src.rwkv_eval.answer_extract.free_response import extract_math_answer
+from src.rwkv_eval.configs import RWKVExactMatches, RWKVLightevalTaskConfig
 
 
 # The Hub's original Python builder is no longer exposed by the current
@@ -34,11 +38,21 @@ _ARITHMETIC_DATA_URL = "https://huggingface.co/datasets/EleutherAI/arithmetic/re
 
 
 def arithmetic_prompt(line, task_name: str = None):
-    return Doc(task_name=task_name, query=line["context"], choices=[line["completion"]], gold_index=[0])
+    sample = record_to_sample(line)
+    return Doc(task_name=task_name, query=sample.input, choices=[sample.target], gold_index=[0])
 
 
 def record_to_sample(record):
-    return Sample(input=record["context"], target=record["completion"])
+    context = record["context"].strip().replace("\n\n", "\n").replace("Q:", "Question:").replace("A:", "Answer:")
+    return Sample(input=context, target=record["completion"])
+
+
+def rwkv_arithmetic_prompt(line, task_name: str = None):
+    doc = arithmetic_prompt(line, task_name)
+    doc.choices = [extract_math_answer(str(gold)) for gold in doc.choices]
+    if any(gold is None for gold in doc.get_golds()):
+        raise RuntimeError("RWKV task has an unextractable gold answer")
+    return doc
 
 
 arithmetic_1dc = LightevalTaskConfig(
@@ -54,7 +68,7 @@ arithmetic_1dc = LightevalTaskConfig(
     generation_size=256,
     metrics=[Metrics.exact_match],
     stop_sequence=["\n"],
-    version=0,
+    version=1,
     sample_fields=record_to_sample,
     solver=[generate(cache=True)],
     scorer=math_scorer(),
@@ -73,7 +87,7 @@ arithmetic_2da = LightevalTaskConfig(
     generation_size=256,
     metrics=[Metrics.exact_match],
     stop_sequence=["\n"],
-    version=0,
+    version=1,
     sample_fields=record_to_sample,
     solver=[generate(cache=True)],
     scorer=math_scorer(),
@@ -92,7 +106,7 @@ arithmetic_2dm = LightevalTaskConfig(
     generation_size=256,
     metrics=[Metrics.exact_match],
     stop_sequence=["\n"],
-    version=0,
+    version=1,
     sample_fields=record_to_sample,
     solver=[generate(cache=True)],
     scorer=math_scorer(),
@@ -111,7 +125,7 @@ arithmetic_2ds = LightevalTaskConfig(
     generation_size=256,
     metrics=[Metrics.exact_match],
     stop_sequence=["\n"],
-    version=0,
+    version=1,
     sample_fields=record_to_sample,
     solver=[generate(cache=True)],
     scorer=math_scorer(),
@@ -130,7 +144,7 @@ arithmetic_3da = LightevalTaskConfig(
     generation_size=256,
     metrics=[Metrics.exact_match],
     stop_sequence=["\n"],
-    version=0,
+    version=1,
     sample_fields=record_to_sample,
     solver=[generate(cache=True)],
     scorer=math_scorer(),
@@ -149,7 +163,7 @@ arithmetic_3ds = LightevalTaskConfig(
     generation_size=256,
     metrics=[Metrics.exact_match],
     stop_sequence=["\n"],
-    version=0,
+    version=1,
     sample_fields=record_to_sample,
     solver=[generate(cache=True)],
     scorer=math_scorer(),
@@ -168,7 +182,7 @@ arithmetic_4da = LightevalTaskConfig(
     generation_size=256,
     metrics=[Metrics.exact_match],
     stop_sequence=["\n"],
-    version=0,
+    version=1,
     sample_fields=record_to_sample,
     solver=[generate(cache=True)],
     scorer=math_scorer(),
@@ -187,7 +201,7 @@ arithmetic_4ds = LightevalTaskConfig(
     generation_size=256,
     metrics=[Metrics.exact_match],
     stop_sequence=["\n"],
-    version=0,
+    version=1,
     sample_fields=record_to_sample,
     solver=[generate(cache=True)],
     scorer=math_scorer(),
@@ -206,7 +220,7 @@ arithmetic_5da = LightevalTaskConfig(
     generation_size=256,
     metrics=[Metrics.exact_match],
     stop_sequence=["\n"],
-    version=0,
+    version=1,
     sample_fields=record_to_sample,
     solver=[generate(cache=True)],
     scorer=math_scorer(),
@@ -225,7 +239,7 @@ arithmetic_5ds = LightevalTaskConfig(
     generation_size=256,
     metrics=[Metrics.exact_match],
     stop_sequence=["\n"],
-    version=0,
+    version=1,
     sample_fields=record_to_sample,
     solver=[generate(cache=True)],
     scorer=math_scorer(),
@@ -242,4 +256,37 @@ TASKS_TABLE = [
     arithmetic_4ds,
     arithmetic_5da,
     arithmetic_5ds,
+]
+
+
+class RWKVArithmeticTaskConfig(RWKVLightevalTaskConfig):
+    """Resolve cached JSONL files when a selected offline task reads its data files."""
+
+    @property
+    def hf_data_files(self):
+        from huggingface_hub import constants, hf_hub_download
+
+        if not constants.HF_HUB_OFFLINE:
+            return self._hf_data_files
+        return {
+            split: hf_hub_download(
+                repo_id="EleutherAI/arithmetic",
+                filename=f"data/{Path(url).name}",
+                repo_type="dataset",
+                local_files_only=True,
+            )
+            for split, url in self._hf_data_files.items()
+        }
+
+    @hf_data_files.setter
+    def hf_data_files(self, data_files):
+        self._hf_data_files = data_files
+
+
+# Private RWKV overrides; native models retain TASKS_TABLE.
+RWKV_TASKS_TABLE = [
+    RWKVArithmeticTaskConfig(
+        task, sample_scoring_function=RWKVExactMatches(), prompt_function=rwkv_arithmetic_prompt, cot_mode="FakeCoT"
+    )
+    for task in TASKS_TABLE
 ]

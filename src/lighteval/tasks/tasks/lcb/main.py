@@ -25,6 +25,7 @@ true
 """
 
 import json
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -40,6 +41,7 @@ from lighteval.tasks.tasks.lcb.codegen_metrics import (
     extract_code,
     translate_private_test_cases,
 )
+from src.rwkv_eval.configs import RWKVLightevalTaskConfig
 
 
 def prepare_prompt(line: dict[str, Any]) -> str:
@@ -104,6 +106,28 @@ class CodegenMetric(SampleLevelComputation):
         return metrics["pass@1"]
 
 
+class RWKVCodegenMetric(CodegenMetric):
+    """Prototype: CodegenMetric; retain each native execution result."""
+
+    def __str__(self):
+        return str(CodegenMetric())
+
+    def compute(self, model_response: ModelResponse, doc: Doc, **kwargs) -> float:
+        evaluation_sample = {
+            "inputs": doc.specific["inputs"],
+            "outputs": doc.specific["outputs"],
+            "fn_name": doc.specific["fn_name"],
+        }
+        metrics, results = codegen_metrics(
+            [{"input_output": json.dumps(evaluation_sample)}],
+            [model_response.final_text],
+            k_list=[1],
+            num_process_evaluate=8,
+        )
+        doc.specific["rwkv_rollout_scores"] = [float(np.all(np.asarray(result) > 0)) for result in results[0]]
+        return metrics["pass@1"]
+
+
 lcb_codegen_metric = SampleLevelMetric(
     metric_name="codegen_pass@1:16",  # This is the way of informing the number of generations currently
     category=SamplingMethod.GENERATIVE,
@@ -163,3 +187,15 @@ for subset in configs:
 
 
 TASKS_TABLE = tasks
+
+
+# Private RWKV overrides; native models retain TASKS_TABLE.
+RWKV_TASKS_TABLE = [
+    RWKVLightevalTaskConfig(
+        task,
+        metrics=[replace(lcb_codegen_metric, sample_level_fn=RWKVCodegenMetric())],
+        generation_size=24576,
+        prompt_template="bot",
+    )
+    for task in TASKS_TABLE
+]

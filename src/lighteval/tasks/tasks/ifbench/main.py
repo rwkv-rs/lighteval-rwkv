@@ -21,6 +21,8 @@ starred:
 true
 """
 
+from dataclasses import replace
+
 import numpy as np
 from inspect_ai.dataset import Sample
 from inspect_ai.scorer import Score, Target, accuracy, scorer, stderr
@@ -34,9 +36,17 @@ from lighteval.models.model_output import ModelResponse
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc, SamplingMethod
 from lighteval.tasks.tasks.ifbench import evaluation_lib
-from lighteval.tasks.tasks.ifbench.instructions import EmojiSentenceChecker, RWKVEmojiSentenceChecker
+from lighteval.tasks.tasks.ifbench.instructions import (
+    EmojiSentenceChecker,
+    LastWordFirstNextChecker,
+    NGramOverlapChecker,
+    RWKVEmojiSentenceChecker,
+    RWKVLastWordFirstNextChecker,
+    RWKVNGramOverlapChecker,
+)
 from lighteval.tasks.tasks.ifbench.instructions_registry import INSTRUCTION_DICT
 from lighteval.utils.imports import requires
+from src.rwkv_eval.configs import RWKVLightevalTaskConfig
 
 
 def ifbench_prompt(line, task_name: str = ""):
@@ -97,12 +107,18 @@ class IFBench(SampleLevelComputation):
 
 
 class RWKVIFBench(IFBench):
-    """Prototype: IFBench; inject one checker without mutating its global registry."""
+    """Prototype: IFBench; inject private checkers without mutating the global registry."""
 
     def __init__(self):
         super().__init__(
             instruction_dict={
-                key: RWKVEmojiSentenceChecker if checker is EmojiSentenceChecker else checker
+                key: RWKVEmojiSentenceChecker
+                if checker is EmojiSentenceChecker
+                else RWKVLastWordFirstNextChecker
+                if checker is LastWordFirstNextChecker
+                else RWKVNGramOverlapChecker
+                if checker is NGramOverlapChecker
+                else checker
                 for key, checker in INSTRUCTION_DICT.items()
             }
         )
@@ -114,6 +130,8 @@ class RWKVIFBench(IFBench):
             super()
             .__str__()
             .replace(repr(RWKVEmojiSentenceChecker), "<class 'src.rwkv_eval.main.RWKVEmojiSentenceChecker'>")
+            .replace(repr(RWKVLastWordFirstNextChecker), repr(LastWordFirstNextChecker))
+            .replace(repr(RWKVNGramOverlapChecker), repr(NGramOverlapChecker))
         )
 
 
@@ -218,3 +236,9 @@ ifbench_multiturn = LightevalTaskConfig(
 )
 
 TASKS_TABLE = [ifbench_test, ifbench_multiturn]
+
+
+RWKV_TASKS_TABLE = [
+    RWKVLightevalTaskConfig(task, metrics=[replace(ifbench_metrics, sample_level_fn=RWKVIFBench())])
+    for task in TASKS_TABLE
+]

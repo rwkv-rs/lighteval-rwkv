@@ -15,6 +15,7 @@ reasoning
 paper:
 """
 
+import re
 from string import ascii_uppercase
 
 from inspect_ai.dataset import Sample
@@ -24,6 +25,7 @@ from inspect_ai.solver import multiple_choice
 from lighteval.metrics.metrics import Metrics
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
+from src.rwkv_eval.configs import RWKVLightevalTaskConfig
 
 
 def bbh_prompt(line, task_name: str = None):
@@ -43,6 +45,28 @@ def bbh_prompt(line, task_name: str = None):
         gold_index=line["target_idx"],
         instruction=line.get("task_prefix", None),
     )
+
+
+def rwkv_bbh_prompt(line, task_name: str = None):
+    """Prototype: bbh_prompt; correct tracking data and balance answer positions.
+
+    Each copied RWKV task cycles its gold position by the dataset row index.
+    The gold option's text is retained; only its displayed position changes.
+    """
+    line = dict(line)
+    if "target" in line:
+        # The canonical BBH mirror stores the question and labelled options
+        # together. Adapt that record to the native formatter's fields.
+        question, options = line["input"].rsplit("\nOptions:\n", 1)
+        line["input"] = question
+        line["choices"] = re.findall(r"(?m)^\([A-Z]\) (.+)$", options)
+        line["target_idx"] = ascii_uppercase.index(line["target"].strip("()"))
+    choices = line["choices"]
+    target = line["__index"] % len(choices)
+    offset = (line["target_idx"] - target) % len(choices)
+    line["choices"] = choices[offset:] + choices[:offset]
+    line["target_idx"] = target
+    return bbh_prompt(line, task_name)
 
 
 def record_to_sample(record):
@@ -396,4 +420,25 @@ TASKS_TABLE = [
     tracking_shuffled_objects_five_objects,
     tracking_shuffled_objects_seven_objects,
     tracking_shuffled_objects_three_objects,
+]
+
+
+RWKV_TASKS_TABLE = [
+    RWKVLightevalTaskConfig(
+        task,
+        prompt_function=rwkv_bbh_prompt,
+        version=task.version + 1,
+        **(
+            {
+                "hf_repo": "lukaemon/bbh",
+                "hf_revision": "982bb89fd79532a8ac676a61fc42eb1aeec63f99",
+                "hf_subset": "tracking_shuffled_objects_three_objects",
+                "hf_avail_splits": ["test"],
+                "evaluation_splits": ["test"],
+            }
+            if task.name == "bigbench_hard:tracking_shuffled_objects_three_objects"
+            else {}
+        ),
+    )
+    for task in TASKS_TABLE
 ]

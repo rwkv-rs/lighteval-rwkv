@@ -35,6 +35,8 @@ from lighteval.metrics.utils.extractive_match_utils import (
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
 from lighteval.utils.language import Language
+from src.rwkv_eval.answer_extract.free_response import extract_math_answer
+from src.rwkv_eval.configs import RWKVExactMatches, RWKVLightevalTaskConfig
 
 
 chinese_answer_type_dict = {"Numerical": "数值", "Expression": "表达式", "Equation": "方程", "Interval": "区间"}
@@ -246,6 +248,21 @@ def olympiad_bench_prompt(line, task_name: str = None):
     )
 
 
+def rwkv_olympiad_bench_prompt(line, task_name: str = None):
+    doc = olympiad_bench_prompt(line, task_name)
+    doc.choices = [
+        [extract_math_answer(str(gold)) for gold in choice]
+        if isinstance(choice, list)
+        else extract_math_answer(str(choice))
+        for choice in doc.choices
+    ]
+    if any(gold is None for gold in doc.get_golds()):
+        raise RuntimeError("RWKV task has an unextractable gold answer")
+    if line["is_multiple_answer"]:
+        doc.choices = [", ".join(choice) if isinstance(choice, list) else choice for choice in doc.choices]
+    return doc
+
+
 # * OE: Open-ended questions
 # * TP: Theorem proof problems
 # * MM: Multimodal
@@ -256,6 +273,7 @@ def olympiad_bench_prompt(line, task_name: str = None):
 # * zh: Chinese
 # * COMP: Competition problems
 # * CEE: Chinese College Entrance Exam problems
+
 
 question_type = ["OE"]  # TP  # TP cannot be replicated
 multimodality = ["TO"]  # MM  # We do not allow multimodal tasks
@@ -325,3 +343,16 @@ for subset in olympiad_bench_subsets:
 
 
 TASKS_TABLE = task_configs
+
+
+# Private RWKV overrides; native models retain TASKS_TABLE.
+RWKV_TASKS_TABLE = [
+    RWKVLightevalTaskConfig(
+        task,
+        sample_scoring_function=RWKVExactMatches(),
+        prompt_function=rwkv_olympiad_bench_prompt,
+        generation_size=24576,
+        prompt_template="bot",
+    )
+    for task in TASKS_TABLE
+]

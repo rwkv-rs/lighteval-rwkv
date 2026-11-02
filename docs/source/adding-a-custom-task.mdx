@@ -163,9 +163,320 @@ lighteval accelerate \
 
 ## Mandatory RWKV Benchmark Audit
 
+
+### Response-extraction rollback (2026-11-01)
+
+The user rejected the working-tree response-extraction changes and requested
+that they be discarded. Restore `free_response.py` to its committed implementation.
+This supersedes the numeric/ASDiv extraction experiments described in earlier
+approvals: GSM8K/GSM-Plus again select `math`; remove numeric presentation,
+English-number, entity/Yes-No, unit-conversion and multiple-box heuristics, their
+extra extraction arguments, and the Decimal-only verification shortcut. Keep the
+committed bounded mathematical verifier and its native comparison precision.
+
+GSM native scalar gold fields and the previously approved boxed prompts remain.
+ASDiv retains native body/question fields, unit-stripped target components and
+FakeCoT/GENERATIVE requests; remove formula-derived entities and manual annotation
+corrections. Mathematical benchmark formatters call the existing
+`extract_math_answer` directly, preserving grouped accepted answers and the
+OlympiadBench all-components contract. Keep modes, request paths, sampling,
+stops, budgets, failure placeholders and non-RWKV definitions unchanged.
+
+Verify exact committed-file equality, imports, boxed expression preservation,
+native verifier precision, formatter golds, and native pipeline/detail contracts
+with hermetic tests. This rollback does not deploy, rerun producers, migrate
+caches, expire scores or publish replacements. Any later publication requires
+regrading retained outputs under the restored contract and the required
+populated two-model smoke acceptance below.
+
 This section applies to the RWKV producer, including changes to existing
 benchmarks. It does not change the evaluation protocol for other LightEval
 models. Read it before editing task prompts, metrics, extraction, or publication.
+
+### Approved declarative benchmark configuration (2026-11-01)
+
+The user requested retaining Arithmetic's offline adapter and the private IFEval
+checker while moving their configuration into their benchmark modules, removing
+the redundant LOGPROBS guard and leaving Registry responsible for generic loading
+and selector expansion. The same boundary moves the remaining IFBench/LCB metric
+bindings and mathematical/choice comparator selection into `RWKV_TASKS_TABLE`.
+Prototypes are native task configuration, dataclass metric replacement,
+`ExactMatches`, `SamplingMetric.compute_score`, and the existing private tables.
+No prompt, dataset, gold, scorer behavior, average/expected credit, sampling,
+budget, stop, detail format, truncation or upload contract changes are approved.
+
+Arithmetic keeps its ten JSONL sources and all fields/query/gold contracts below.
+Its private configuration resolves Hub-cached local paths only when the selected
+task's `hf_data_files` is read in offline mode; constructing/importing tables
+performs no cache lookup. Online/native configurations retain their URLs. IFEval
+keeps the uppercase-English checker correction; IFBench keeps its three private
+checker fixes; LCB keeps its single code execution and retained rollout scores.
+Each module declares its private metric copy without changing metric singletons.
+The shared private configuration installs explicitly supplied comparators without
+benchmark-name dispatch. Keep the mathematical verifier module lightweight for
+its isolated worker and preserve serialized task/cache identities.
+
+Verify all configured expanded native/private task identities before and after,
+selected/unselected Arithmetic cache access, online/offline file configuration,
+real offline rows, metric wiring, native isolation and existing pipeline contracts.
+No new files, remote deployment or score publication are part of this refactor.
+Existing remote smoke and populated test-detail acceptance remain the publication
+gate for the previously approved benchmark changes recorded below.
+
+Local validation passed 110 tests and 590 subtests. Before/after normalized
+serialized configuration hashes match for all 247 native tasks and all 247
+RWKV tasks with one rollout. The Arithmetic test constructs/discovers private
+configurations without cache lookup, selects an unrelated task without lookup,
+then resolves only the selected JSONL and loads a real local fixture through
+native `eval_docs`. Online/native URLs remain unchanged. Existing IFEval,
+IFBench, all 23 LCB variants, mathematical grading, 1/N credit, avg@k, request
+routing, details and recovery tests pass. Ruff, formatting and diff checks pass;
+shared LiteLLM and public LCB extraction remain upstream-identical. No remote
+deployment, evaluation or publication ran.
+
+### Approved choice-count-dependent expected credit (2026-11-01)
+
+The user explicitly requested replacing the fixed 0.25 missing-choice credit
+with `1 / len(doc.choices)` for single-choice tasks. Prototype: native
+`ExactMatches.compute` and the private `RWKVExactMatches` comparator. Compute
+expected credit where the current Doc is available, without mutable grader
+state or a new configuration field. Native `AvgAtN` still averages individual
+rollout scores; a k-rollout item with c correct and f missing predictions scores
+`(c + f / N) / k` for N choices. Correct/wrong predictions remain 1/0, and
+failed details retain their raw response, failure classification, `answer="-"`
+and `is_passed=false`.
+
+GPQA is currently the registered generative choice family using this private
+comparator. Its native incorrect-answer fields plus correct answer give N=4,
+so its existing 0.25 credit and scores remain unchanged. Preserve its variants,
+dataset fields, queries, gold indices, metrics, CoT/GENERATIVE chat requests,
+bot template, stops, 24576 budget and registered sampling described below.
+Do not change NoCoT LOGPROBS, mathematical verification or native non-RWKV
+metrics. Test one shared grader across N=4/5/8/10, mixed/missing rollout means,
+native pipeline metric binding and detail classification. The existing remote
+two-model smoke and populated test-score acceptance gate remains in force.
+
+Local validation passed 109 tests and 590 subtests. One reused grader handles
+N=4/5/8/10 and then N=4 again, with correct/wrong/missing scores 1/0/1/N.
+The real private GPQA average metric retains `[1, 0, 1/N, 1/N]` and produces
+`(1 + 2/N) / 4`; all-missing averages are 1/N. Failed/truncated details retain
+their raw responses and failure buckets without becoming passed. Existing
+four-choice GPQA, native metrics, mathematical grading and NoCoT checks pass.
+Ruff, formatting and diff checks passed. No remote evaluation or publication
+ran; the shared LiteLLM adapter and public LCB extractor remain upstream-identical.
+
+### Approved GPQA average metric semantics (2026-11-01)
+
+The user clarified that averaging individual choice scores is avg@k, and must
+not be implemented as a conditional override of pass@k. Remove the private
+`RWKVPassAtK` class and its special cases. GPQA's private task table replaces
+the generative native pass metric with native `Metrics.avg_at_n`/`AvgAtN`;
+the upstream `n` is the number of rollouts called k in the Scoreboard contract.
+Single-response extractive comparators remain single-response comparators and
+are wrapped by the existing average metric after rollout counts are selected.
+Keep sampling counts unchanged, including no-upload automatic sampling.
+
+Keep GPQA's native variants, dataset fields, shuffled query/choices and gold
+index described below, CoT/GENERATIVE through `/v1/chat/completions`, bot/open
+think, no newline stop and 24576 generated tokens. Score each rollout 1 for
+correct, 0 for wrong and the approved 0.25 for failed extraction, then use
+`sum(scores) / k`. Failed details remain failed and publish `"-"`. Preserve raw
+responses, rendered prompts, finish reasons, registered k, publication averaging
+and all non-RWKV metrics. Prototypes are native `AvgAtN`, `Metrics.avg_at_n`,
+`ExactMatches` and the existing GPQA private task table. Metric changes create
+new task hashes; preserve existing results and caches without identity aliases.
+Verify binary/mixed/missing rollout means, actual registry/pipeline wiring,
+sampling policy and native isolation locally. Required two-model smoke scores
+and populated detail acceptance remain the gate before publication.
+
+Local validation passed 108 tests and 585 subtests. Real GPQA Diamond/Main/
+Extended registry tasks produce 0.375 from `[1, 0, 0.25, 0.25]`, retain the
+individual detail scores, and have no private pass metric. Tests verify native
+`AvgAtN` binding, binary and missing-answer means, unchanged failed details,
+streaming/non-streaming execution and automatic sampling. Native GPQA pass
+metrics and the NoCoT LOGPROBS variant remain unchanged. Ruff, formatting and
+diff checks passed. No remote inference or score publication ran.
+
+### Approved prompt ownership and boxed-answer restoration (2026-11-01)
+
+The user requested moving the remaining benchmark prompt logic out of the entry
+point and restoring boxed final answers for GSM and related mathematical
+generation tasks. Prototypes are each native formatter, the existing private
+ASDiv/BBH formatters, `extract_math_answer`, and AIME's boxed
+`MATH_PROMPT_TEMPLATE`. Native `TASKS_TABLE` prompts remain unchanged.
+
+GSM8K and GSM-Plus use their native `record_to_sample` targets and reasoning
+metadata, preserving the native scalar targets and the GSM-Plus critical
+thinking exclusion. `####` is solely the GSM8K dataset's target delimiter;
+generated answers are requested in `\\boxed{...}`. GSM8K, GSM-Plus, MATH,
+MATH-500 and AIMO private formatters apply the existing AIME boxed template to
+the actual `Doc.query`, with matching private solver templates. Increment only
+these copied task versions. Gold normalization, OlympiadBench's ordered
+multi-answer targets, CommonsenseQA's instruction removal and ASDiv/BBH private
+formatter selection move into their own benchmark modules. Call the existing mathematical extractor directly in each private formatter,
+without benchmark dispatch in the entry point.
+
+Keep the datasets/fields/expanded selectors, choices, gold indices, metrics,
+registered k, answer extraction, modes, templates, stops, 4096/24576 budgets and
+truncation contracts recorded below. NoCoT's completion cue and generation's
+answer-cue removal are shared private task-configuration behavior. Requests
+remain LOGPROBS `/v1/completions` or GENERATIVE `/v1/chat/completions`; generated
+details retain the server-rendered prompt. Failed extraction remains None for
+grading and `"-"` in publication. Preserve native models, old results and caches;
+changed prompts require new task identities. Validate actual HTTP request
+messages and native/RWKV isolation locally, then complete the required two-model
+ten-question smoke and populated test-score/detail acceptance before publication.
+
+Local validation passed 107 tests and 580 subtests. The request test loads real
+private tasks, formats fixture dataset rows through native `get_docs`, and calls
+`RWKVClient.greedy_until` for both 1.5B and 2.9B aliases with mocked LiteLLM
+transport. GSM8K/GSM-Plus, MATH/MATH-500, AIME24 and AIMO each send the boxed
+instruction once in the actual user message, preserve scalar golds and captured
+rendered prompts, omit reference solutions/target delimiters from the question,
+and retain their request budgets and empty reasoning stop list. Existing tests
+cover percentages, grouped mathematical golds, ASDiv, BBH and NoCoT boundaries.
+All 247 configured native tasks remain unchanged before/after RWKV loading.
+Ruff, formatting and diff checks passed; shared LiteLLM and public LCB extraction
+remain identical to upstream. Remote inference and populated test-database
+acceptance remain pending.
+
+### Approved task-owned RWKV execution policy (2026-11-01)
+
+The user approved removing entry-point benchmark lists and keyword inference.
+Prototypes are native `TASKS_TABLE`, `LightevalTaskConfig`, Registry task-table
+loading and selector expansion, task `sampling_methods`, and `GenerationParameters`.
+Each benchmark module declares its private `RWKV_TASKS_TABLE` overrides. Native
+models continue to load `TASKS_TABLE`; RWKV copies receive the overrides before
+native selector/few-shot/metric-parameter expansion. Derive NoCoT from actual
+LOGPROBS metrics, retaining private multiple-choice solver/scorer wiring.
+
+Keep every configured benchmark's dataset, fields, query, choices, gold index,
+metric, extractor, aggregation, sampling count, stop and truncation contracts
+recorded below. ASDiv and Arithmetic declare FakeCoT/4096/assistant. GPQA
+generative variants, MATH, MATH-500, AIME24/25, OlympiadBench and LCB declare
+CoT/24576/bot; AIMO declares CoT/24576/assistant. Other generation defaults to
+CoT/4096/assistant. Actual LOGPROBS tasks use NoCoT and `/v1/completions`;
+generation uses `/v1/chat/completions` and captures the rendered prompt.
+The native `gpqa:mc` LOGPROBS variant stays NoCoT rather than inheriting a family
+CoT label. Explicit template arguments override task defaults, including
+`assistant`. Native selectors with `|few_shot` use the same expanded task policy.
+
+RWKV decoding/request construction belongs in `rwkv_model.py`; the entry point
+consumes resolved task policy. No new files or production publication are part
+of this refactor. Validate native isolation, all configured task expansions,
+actual request routing, selector suffixes, template overrides and pending cache
+identity. Required 1.5B/2.9B ten-question test uploads and populated detail review
+remain the publication acceptance gate.
+
+The configured 32 selectors expand to 247 tasks: 212 LOGPROBS/NoCoT tasks,
+11 FakeCoT/4096/assistant tasks, five CoT/4096/assistant tasks, one
+CoT/24576/assistant task and 18 CoT/24576/bot tasks. Their default request
+policies and model hashes match the pre-refactor snapshot; native task
+configurations loaded before and after RWKV remain identical. Task hashes
+change where `generation_size` now records the actual RWKV budget instead of
+the original generic task budget. Keep existing caches and pending files;
+exact-identity recovery rejects incompatible records without modifying them.
+
+Local validation passed 106 tests and 568 subtests, including native Registry
+and model tests, real private-table loading, selector expansion, explicit
+template overrides, LOGPROBS requests for both model aliases, generated-token
+budgets and pending recovery. Ruff, formatting and diff checks passed. The
+shared LiteLLM adapter and public LCB extractor remain identical to upstream.
+Remote ten-question inference and test-database acceptance were not run in
+this refactor and remain pending before publication.
+
+### Approved Arithmetic builder parity and LCB/MathQA refactor (2026-11-01)
+
+The user explicitly approved restoring Arithmetic's original builder cleanup,
+removing duplicate LCB code extraction, simplifying MathQA gold mapping, and
+removing one-use wrappers in those paths. Prototypes are the original
+`EleutherAI/arithmetic` builder's `_generate_examples`, native
+`arithmetic_prompt`/`record_to_sample`, `CodegenMetric.compute`, and
+`mathqa_prompt`.
+
+- Arithmetic expands to `arithmetic:1dc`, `2da`, `2dm`, `2ds`, `3da`, `3ds`,
+  `4da`, `4ds`, `5da`, and `5ds`. Keep the existing ten JSONL files,
+  `hf_repo="json"`, default subset, validation split, and `context`/`completion`
+  fields. Restore the builder's ordered strip, double-newline collapse,
+  `Q:` to `Question:`, and `A:` to `Answer:` conversion in the shared
+  Sample/Doc formatting path. `Doc.choices=[completion]`, `gold_index=[0]`,
+  `generate(cache=True)`/`math_scorer()`, exact-match metric, few-shot behavior,
+  and completion whitespace stay unchanged. Increment all ten task versions
+  because the completion inputs change. RWKV remains FakeCoT/GENERATIVE via
+  `/v1/chat/completions`, assistant/fake-think template, no newline stop, and
+  4096 generated tokens with declared context metadata 32768. The native task
+  budget remains 256. Old unnormalized requests cannot resume as normalized
+  ones; preserve their original caches and results.
+- MathQA keeps `allenai/math_qa`, default/test, native `Problem`, `options`,
+  and `correct` fields and legacy split-option support. Preserve `Doc.query`,
+  all five choice strings and their whitespace, and map the declared `a`-`e`
+  gold directly. Keep native multiple-choice/choice wiring, loglikelihood
+  accuracy, NoCoT/LOGPROBS through `/v1/completions` with `max_tokens=0`, the
+  retained `Answer:` cue in RWKV completion inputs, and registered `avg_k=1`.
+  Verify exact formatter equivalence on all 37,297 cached rows before removing
+  the one-use parser wrapper; task/cache versions remain unchanged.
+- `lcb:codegeneration` keeps `lighteval/code_generation_lite`, v4_v5/test,
+  native problem/starter-code/test/metadata fields, its existing query,
+  `Doc.choices=[""]`, `gold_index=0`, and native pass@1 executor. RWKV remains
+  CoT/GENERATIVE through `/v1/chat/completions`, bot/open-think template,
+  no newline stop, and 24576 generated tokens. The shared response extractor
+  retains only the final fenced program once. The private scorer executes
+  that extracted program directly and retains every rollout result from the
+  same native executor call; the public extractor returns to upstream.
+
+The user also approved fixing the subsequent review finding: both private
+registry wiring and multi-rollout execution must cover all 23 registered LCB
+selectors. The default selects `v4_v5`; the other selectors use the
+`lcb:codegeneration_` prefix with subsets `release_v1` through `release_v6`,
+`release_latest`, `v1` through `v6`, `v1_v2`, `v1_v3`, `v1_v4`, `v1_v5`,
+`v2_v3`, `v2_v4`, `v2_v5`, `v3_v4`, and `v3_v5`. Each retains its native
+subset and test split with the LCB contract above. Follow the existing
+task-family wiring in `RWKVRegistry._update_task_configs`; the native pipeline
+calls the private scorer directly without a separate LCB execution branch.
+Test each real registry selector with one and multiple rollouts in streaming
+and non-streaming metric execution. Verify one extraction per completed
+program, one native executor invocation per question, retained per-rollout
+results/details, stable task/cache identities, and native/RWKV/native isolation.
+
+All three retain their existing concise detail golds/answers, failed extraction
+as `None` internally and `"-"` in publication, captured rendered prompts or
+exact completion inputs, registered rollout averages, and finish-reason
+truncation. Hermetic checks, the required 1.5B/2.9B ten-question test scores,
+request logs, and populated correct/wrong/failed detail review are acceptance
+requirements before publishing affected production results.
+
+Local verification passed 95 tests and 494 subtests, including extraction-once,
+native extractor isolation, direct gold mapping, and Arithmetic cache-version
+invalidation. All 20,000 cached Arithmetic rows match the original builder's
+query and completion. All 37,297 MathQA rows retain identical queries, choices,
+and gold indices; the formatter corpus SHA-256 is
+`6f919d3a2d192d2d021ddaeb7120dc6eb700941933fcb6051cd213b8405c3645`.
+All 23 registered LCB selectors passed one- and four-rollout checks in streaming
+and non-streaming execution; native tasks loaded before and after retain their
+configurations and fenced-code scoring. The real native LCB executor graded
+correct, wrong, and empty programs as `[1, 0, 0]`, with average score `1/3`.
+The same result was verified through `RWKVRegistry` and pipeline extraction for
+`lcb:codegeneration_v5`, using a correct program, wrong program, and unfinished
+response. The public LCB extractor and shared LiteLLM adapter both match
+`upstream/main` exactly, and their blob hashes match the current GitHub files.
+
+The repair follows AGENTS.md's explicit scoring-change approval, native
+prototype, private-extension and non-interference rules. Its only runtime
+changes are the two LCB family conditions in the existing private registry and
+pipeline; it adds no source/test files, wrapper functions, configuration,
+fallbacks or task-version changes. The required remote smoke and populated
+test-database acceptance remain incomplete, so production publication is gated.
+
+Remote acceptance remains pending. Read-only inspection found that the active
+producers use separate snapshot working directories. Automatic approval review
+rejected overwriting the main remote deployment's existing source files because
+that directory mutation requires explicit user authorization; no source sync or
+new remote evaluation ran. The fresh test manifest lists Arithmetic and MathQA
+as pending for both release models. Existing release LCB scores 284 (1.5B) and
+285 (2.9B) had no per-score `evaluation` metadata at that inspection. Their
+historical contract still needs separate publication review. Routine producer
+execution no longer reconciles historical scores or requires that metadata
+before processing the server's pending tasks; preserve those historical rows.
 
 ### 1. Record the benchmark contract before implementation
 
@@ -183,10 +494,12 @@ request for the specific change is approval; otherwise ask before editing.
 ### 2. Keep RWKV policy private
 
 Follow `Registry._update_task_configs` and `Pipeline` as implementation
-prototypes. `RWKVRegistry`/`RWKVPipeline` in `src/rwkv_eval/main.py` wire RWKV
-policy through the registry's deep-copied configurations. Benchmark-specific
-checker and metric implementations belong with their benchmark modules, not
-the evaluation entry point; install them only on private RWKV configurations.
+prototypes. `RWKVRegistry` loads and expands deep-copied task configurations;
+benchmark modules declare their private checker/metric selection and offline
+data-file behavior in `RWKV_TASKS_TABLE`. Shared private task configuration binds
+explicitly supplied scoring functions, and `RWKVPipeline` executes them through
+native interfaces. Keep benchmark-specific implementations out of the entry point
+and install them only on private RWKV configurations.
 Do not mutate `TASKS_TABLE`, metric singletons, native prompt functions, or
 process-wide registries. Shared optional response fields must have neutral
 defaults and survive indexing, caching and serialization. Demonstrate that a
@@ -279,7 +592,7 @@ output-limit truncation. Both live and parquet publication use `get_detail` in
   their last number. Preserve commas in intervals and multi-part expressions.
   Failed extraction stays `None` internally and `"-"` in details; an unclosed
   thinking trace remains failed even if it mentions the correct answer.
-  For MATH, `rwkv_prompt` has already reduced each native solution to its
+  For MATH, `rwkv_math_prompt` has already reduced each native solution to its
   balanced boxed gold. Live and parquet publication must retain that exact
   metric gold rather than running the response fallback extractor again.
   Re-extraction rejects `\\mbox{Saturday}` and multiline text-unit expressions,
@@ -291,10 +604,12 @@ output-limit truncation. Both live and parquet publication use `get_detail` in
 ### Approved RWKV expected-score restoration
 
 The user explicitly approved restoring the rule introduced in `59b3974f`.
-Prototypes: `ExactMatches.compute_one_item`, `PassAtK.pass_at_k` and the original
-RWKV missing-choice branches. `RWKVRegistry` installs private
-`RWKVExactMatches(choice=True)` and `RWKVPassAtK` on generative choice metrics;
-native metric singletons and non-RWKV registry copies remain unchanged.
+Prototypes: `ExactMatches.compute_one_item`, native `AvgAtN` and the original
+RWKV missing-choice branches. The private GPQA table selects
+`RWKVExactMatches(choice=True)` as the individual choice comparator. The private
+GPQA table replaces its generative pass metric with `Metrics.avg_at_n`; the
+producer binds native averaging after rollout counts are selected. Native metric
+singletons and non-RWKV registry copies remain unchanged.
 
 Affected registered selectors are GPQA `diamond`/`main` (and `extended` when
 selected): dataset `Idavidrein/gpqa`, matching native `gpqa_*` subset, `train`
@@ -305,11 +620,11 @@ IDs and `gold_index`. CoT remains actual `GENERATIVE` through
 24576-generated-token budget. NoCoT `LOGPROBS` scoring is unchanged.
 
 An extracted correct letter scores 1, a wrong letter scores 0 and extraction
-failure scores 0.25. This restores the fixed historical value, not a new
-choice-count-dependent rule. For the historical pass@1 case with no score-1
-rollout, `n == len(scores)` and `missing > 0`, return `1 - 0.75**missing`;
-otherwise retain native aggregation. Main/extended retain their single-response
-aggregation; math and short-answer failures remain unchanged.
+failure scores 0.25. Average all k individual scores as avg@k. On 2026-11-01
+the user clarified this naming and aggregation: remove the private pass@k
+override rather than conditionally averaging only lists containing 0.25.
+Main/extended keep their single-response comparators as the inputs to the
+producer's existing average. Math and short-answer failures remain unchanged.
 
 Extraction failure remains `None` internally, empty only in native metric input,
 and `"-"` in publication. Raw output and the captured prompt are retained;
@@ -334,11 +649,11 @@ CoT/GENERATIVE through `/v1/chat/completions`, captured assistant/open-think
 prompts, no newline stop, and 4096 generated tokens.
 
 The user approved fixing an `IndexError` when a punctuation-only sentence
-fragment becomes empty before character indexing. `RWKVRegistry` installs
-`RWKVIFBench` in `src/lighteval/tasks/tasks/ifbench/main.py` with a private
+fragment becomes empty before character indexing. IFBench's private task table
+selects `RWKVIFBench` in `src/lighteval/tasks/tasks/ifbench/main.py` with a private
 instruction dictionary, replacing only `EmojiSentenceChecker` with
-`RWKVEmojiSentenceChecker` in the adjacent `instructions.py`. The entry point
-only imports and installs the private metric. Preserve its serialized checker
+`RWKVEmojiSentenceChecker` in the adjacent `instructions.py`. The private task
+table installs the metric. Preserve its serialized checker
 identity in task hashing so moving the implementation does not invalidate
 retained response caches. The neutral default must also preserve the native
 `IFBench()` identity. Empty cleaned fragments return False; ordinary sentence checks and all eight native loose variants are
@@ -349,6 +664,69 @@ sample's instruction results with zeroes. Regrade retained responses without
 changing prompts, budgets, task versions or cache inputs, prove unchanged
 results for previously successful grading, and complete both required model
 smoke tests before resuming the held production pair.
+
+### Approved RWKV IFBench last-word boundary repair
+
+The user approved fixing `words:last_first` after retained G1j 1.5B
+`ifbench_multiturn|0` document `187` raised `IndexError`: a sentence containing
+only punctuation has no first or last word after native stripping. Prototypes
+are `LastWordFirstNextChecker` and the private `RWKVEmojiSentenceChecker`.
+Install `RWKVLastWordFirstNextChecker` only in `RWKVIFBench`'s copied instruction
+dictionary. An empty adjacent word boundary returns False for that instruction;
+ordinary comparisons, other instructions, and all native strict/loose variants
+remain unchanged. Native `IFBench` and the global instruction registry retain
+their original behavior.
+
+Keep the existing IFBench dataset fields, queries, empty textual choices,
+gold indices, four metrics and aggregation described above. Requests remain
+CoT/GENERATIVE via `/v1/chat/completions`, with captured assistant/open-think
+prompts, no newline stop, and 4096 generated tokens. Preserve the native checker
+name in private metric serialization so the response-cache identity is unchanged.
+Regrade the 1387 retained outputs rather than regenerating them. Verify that
+previously successful grading is unchanged, complete populated ten-question
+1.5B/2.9B test samples, then publish the missing production pair without expiring
+any of the 48 already completed corrections.
+
+### Approved RWKV IFBench character-trigram boundary repair
+
+The user approved fixing `ratio:overlap` after retained G1l 1.5B
+`ifbench_test|0` document `148` completed with `D`: the native
+`NGramOverlapChecker` divides by the size of an empty character-trigram set.
+Prototype: `NGramOverlapChecker` and the private `RWKVLastWordFirstNextChecker`.
+Install `RWKVNGramOverlapChecker` only in `RWKVIFBench`'s copied dictionary.
+Responses shorter than three characters fail that instruction; longer responses
+delegate to the native character-trigram computation. Keep all strict/loose
+response variants and other instruction results, and preserve the native checker
+identity in serialized task configurations so cached requests remain reusable.
+
+Keep the IFBench selectors, dataset revisions, fields, `Doc.query`, empty textual
+choices, `gold_index=0`, native solver/scorer, four metrics and aggregation
+described above. CoT/GENERATIVE still uses `/v1/chat/completions`, captured
+assistant/open-think prompts, no newline stop and 4096 generated tokens.
+Regrade all 300 retained 1.5B test responses and prove unchanged results for
+previously successful grading; complete populated ten-question 1.5B/2.9B test
+scores/details before publishing the missing production score. Audit the already
+published IFBench pairs without expiring unchanged scores. Extraction failure,
+failure placeholders and finish-reason truncation remain unchanged.
+
+### Approved RWKV unfinished-response grading contract
+
+Prototype: `RWKVPipeline._run_model_for_docs` and the finish-reason check in
+`get_detail`. For every private RWKV generative task, a rollout ending with
+`length` or `max_tokens` has an empty metric prediction before the native
+scorer runs. Keep the raw response, captured server prompt and extracted answer
+in audit details; it remains failed even if a repeated or partial response
+contains the gold value. Completed sibling rollouts retain their own predictions.
+The private GPQA missing-choice expectation applies to empty predictions,
+without marking a detail passed. Pass@1 averages the individual rollout scores.
+NoCoT and native non-RWKV pipelines are unchanged.
+
+Dataset fields, task selectors, golds, native metric aggregation, prompts,
+templates, request paths, stops, budgets and truncation accounting stay as
+recorded in the individual contracts. Validate mixed completion reasons in the
+existing hermetic pipeline tests, regrade retained responses, run the required
+two-model ten-question generative smoke evaluations and inspect populated test
+scores/details. Replace only production pairs whose scores or details change.
 
 ### Approved RWKV five-second mathematical verification contract
 
@@ -361,7 +739,7 @@ failure, compare the complete stripped extracted strings; differing strings
 score zero. Do not search for a matching substring or change extraction,
 missing-answer handling, aggregation or request budgets.
 
-Prototype: native timeout's process isolation and LCB's `Popen` sandbox.
+Prototype: native timeout's process isolation and LCB's `Popen` worker.
 Only the private verifier uses a reusable clean-interpreter worker with bounded
 virtual allocation headroom; terminate/join a timed-out worker before fallback and
 recreate it for the next comparison. Worker initialization is separate from the
@@ -383,13 +761,35 @@ and regrade identical requests rather than regenerating valid rollouts.
 
 ### RWKV HTTP and completion-journal ownership
 
-RWKV generated requests retain LiteLLM's native request normalization, but each
-rollout explicitly owns its OpenAI SDK/httpx client through response consumption
-and retry completion. Close it in the requesting thread, never through a shared
-client-cache lifetime. Prototype: `BaseOpenAILLM._get_sync_http_client` and the
-existing native completion call. Non-RWKV requests keep their original client
-and provider-cache behavior; do not change concurrency, prompts, seeds, stop
-sequences or budgets for this transport fix.
+`RWKVModelConfig` and `RWKVClient` in `src/rwkv_eval/rwkv_model.py` inherit the native
+`LiteLLMModelConfig` and `LiteLLMClient`. `RWKVPipeline._init_model` selects them
+for the RWKV producer. The shared
+`src/lighteval/models/endpoints/litellm_model.py` remains byte-for-byte identical
+to `upstream/main`; native `Pipeline` model loading retains its upstream path.
+Moving these extensions preserves serialized model configuration, cache hashes,
+task versions, dataset fields, prompts, metrics, sampling, stops and budgets.
+The user approved this model-only split; private registry/pipeline and scheduling
+remain in `src/rwkv_eval/main.py`. The model methods and their completion-template
+helper move unchanged, using the existing LiteLLM adapter as their prototype.
+Validation confirmed identical ASTs for those three definitions and identical
+serialized configurations/model-cache hashes for 1.5B and 2.9B across NoCoT,
+FakeCoT and CoT. The model module imports without loading the evaluation entry
+point. The existing regression suite passed 95 tests and 494 subtests.
+
+RWKV generated requests use the upstream `LiteLLMClient.__call_api` prototype:
+call `litellm.completion` without supplying a client. LiteLLM manages SDK client
+creation, connection reuse, proxy routing and lifetime. Do not introduce an
+adapter-owned generation client or close LiteLLM's clients during task cleanup.
+Non-RWKV requests keep their original client and provider-cache behavior;
+concurrency, prompts, seeds, stop sequences and budgets remain unchanged.
+
+Task metrics select the native `SamplingMethod`, not a model-wide top-logprob
+setting or a NoCoT label. Only `LOGPROBS` requests enter sequence scoring through
+`/v1/completions`. Request `prompt_logprobs=0` there to obtain each actual
+candidate token's probability without additional top-k alternatives, following
+vLLM's `Sampler.gather_logprobs`. Sum every candidate token's conditional
+logprob. Generative tasks use `/v1/chat/completions` without enabling top-logprob
+collection; native non-RWKV `Doc.use_logits` behavior remains unchanged.
 
 Optional rollout journals must be opened read-only by readers. Ignore an
 interrupted final line without truncation: another reader may observe an active
@@ -443,10 +843,22 @@ process-worker prototype. Each pool owns its full benchmark queue, native random
 state, grader and publication; neither serial models nor a cross-model benchmark
 barrier may idle the other pools. Production uses one transient producer unit per
 model so retries/resumption are independent. Measure running/waiting requests and
-token-rate deltas for all four pools at `https://vllm.rwkvos.com/metrics?model=...`;
-configured request limits alone do not establish inference saturation. Both RWKV
-LOGPROBS and generation use an explicit 14400-second HTTP request timeout;
-LOGPROBS retries transient TLS/connection/read failures and upstream 5xx at most
+token-rate deltas for all four pools through the inference service's metrics endpoint;
+configured request limits alone do not establish inference saturation. RWKV
+LOGPROBS uses a 300-second HTTP response waiting timeout. For non-streaming
+generation, the read timeout is the smaller of the configured timeout and
+`max(1800, max_new_tokens / 2)` seconds (2048 seconds for a 4096-token budget
+and 12288 seconds for a 24576-token budget). A timeout retries the same request
+and seed without changing its output budget. The connection timeout is 30 seconds.
+RWKV generation uses native `httpx.Timeout` to separately bound TCP/TLS
+establishment to 30 seconds, without shortening inference reads or changing
+model/task cache identities. LiteLLM manages generation clients and their
+connections through its native completion path. The `X-Litellm-Timeout` request header gives a
+LiteLLM gateway the same upstream read limit; it does not change the request
+body or decoding parameters. The gateway's outer reverse proxy must also allow
+the configured generation duration. Temporary dataset-download proxies must not route
+inference or Scoreboard traffic; scope `NO_PROXY` to the configured endpoint
+hosts while retaining the HF download route. LOGPROBS retries transient TLS/connection/read failures and upstream 5xx at most
 six times, following the native generation retry prototype. Retries preserve the
 exact original request, candidate span and token budget, and never fabricate a
 response. Prompt, metric, sampling count and generated-token budgets remain
@@ -461,6 +873,32 @@ budget evidence may be regraded for corrections, but must not be represented
 as having newly verified budgets. Live acceptance checks the outgoing completion
 limit, captured rendered prompt, returned usage and finish reason; never
 reconstruct prompt evidence or invent request metadata.
+
+### RWKV release identity in Scoreboard publication
+
+Prototype: Scoreboard's `RwkvModel` and `get_tasks` model/benchmark pairing.
+The producer requires an explicit `is_preview` on every configured endpoint and
+includes it in the uploaded model, pending-task key, cache path and saved score path. A
+preview and a release with the same architecture, data version, parameter size
+and context are separate models. Retained result files require an explicit
+preview flag when loaded for publication; do not infer it from a short alias.
+Use the gateway's short model alias consistently as `model_name` in LightEval
+configuration, requests, caches and saved scores. Exact weight provenance is
+owned by the external endpoint manifest rather than a second LightEval name.
+On replay, an explicitly recorded `scoreboard_ctx_len` remains authoritative
+for the Scoreboard model key even when the full weight name carries a different
+declared context suffix; retain both values without treating either as a
+measured server limit.
+Scoreboard registers a new model on its first real score upload. When a model
+is absent from both pending tasks and active scores, its configured benchmark
+pairs are pending only when each benchmark is visible in that fresh manifest;
+otherwise the server's pending tasks remain authoritative.
+Do not create placeholder scores. Before a release run, verify the routed
+weight's complete version and provenance, and use a fresh output/cache path.
+This identity change preserves every benchmark's native data fields, document,
+solver, metric, mode, request, prompt, token budget, extractor and truncation
+contract above. The required two-model smoke and populated test-database
+inspection below apply before production publication.
 
 ### 5. Regression and publication gate
 
@@ -489,3 +927,330 @@ confirmation before adding files. For corrections, preserve audit history and
 expire only exact affected score IDs after fetching a fresh manifest; never
 clear the database or rerun unrelated model/benchmark pairs. Do not change
 inference or Scoreboard implementation from this repository.
+
+
+### Approved GSM, ASDiv, unfinished and BBH correction (2026-10-22)
+
+The user explicitly requested the GSM8K/GSM Plus gold and prediction fixes,
+ASDiv extraction fixes, historical unfinished-response regrading, BBH duplicate
+and option-position repairs, retained-rollout reuse, two-model ten-question
+acceptance, exact affected-score replacement, and an updated regression audit.
+Prototypes are `gsm8k.record_to_sample`, `rwkv_prompt`, `extract_math_answer`,
+`_ordered_named_answers`, `bbh_prompt`, `RWKVPipeline` and `get_detail`.
+
+- `gsm8k|0`: `openai/gsm8k`, main/test, 1319 rows; `question` remains the query
+  and `answer.rsplit("####", 1)[1]` supplies its scalar gold. Never run a
+  response heuristic over the worked gold solution. `gsm_plus|0` keeps
+  `qintongli/GSM-Plus`, default/test, original row IDs and the native critical
+  thinking exclusion (9233 evaluated rows); its `answer` is already the target.
+  Both retain `choices=[gold]`, `gold_index=0`, CoT/GENERATIVE, assistant/open
+  think, `/v1/chat/completions`, no newline stop and 4096 generated tokens.
+  Predictions use the committed mathematical extractor with complete boxed
+  expressions and native mathematical verification. Metric gold and uploaded
+  gold are the same canonical value.
+- `asdiv|0` retains its native body/question fields and unit-stripped ordered
+  target components. Use the committed short-answer extractor and native text
+  or mathematical verification, without formula-derived candidates or manual
+  corrections to source annotations.
+- Every private generative task retains the unfinished contract above, also
+  when replaying G1j/G1k. Length/max_tokens blanks metric predictions before
+  native aggregation; raw output and concise extracted audit values remain.
+  GPQA missing-choice expectation is unchanged.
+- `bigbench_hard` expands to the native 18 selectors. Seventeen retain
+  `lighteval/bbh` fields (`input`, `choices`, `target_idx`, optional prefixes).
+  Its erroneous tracking-three split repeats logical-deduction-three; only the
+  copied RWKV tracking-three config uses `lukaemon/bbh`, revision
+  `982bb89fd79532a8ac676a61fc42eb1aeec63f99`, tracking_shuffled_objects_three_objects/test.
+  All 250 mirror records exactly match official BIG-Bench-Hard JSON. Adapt
+  its `input` Options block and `target` letter to the native formatter fields.
+  All private BBH subtasks cyclically rotate options so the correct position
+  is `__index % len(choices)`, update `target_idx`, and retain option content.
+  The formatter produces the actual scored query and letter choices; upload
+  never reconstructs it. Keep NoCoT/LOGPROBS, `/v1/completions`, native
+  multiple_choice/choice wiring and sequence-loglikelihood scoring. Increment
+  private BBH versions. Old logprobs are reusable only when every retained
+  candidate input exactly equals the new prefix plus candidate. Changed
+  questions/options need fresh inference, including the replacement 250 rows.
+
+The historical RWKV backend sampling policy from `59b3974f` is restored:
+4096 target completions, range 3000–6000, power-of-two k nearest the target,
+only for generation and native sampling metrics. AIME 30 selects k=128 (3840
+responses); ten-question/max_samples runs keep k=1. Regrading old runs must
+preserve their actual rollout counts. Existing single-response AIME records
+cannot be relabelled avg@128; missing rollouts require a later inference run.
+All non-RWKV task definitions and metric singletons stay unchanged.
+
+For this correction the user explicitly requested skipping new 1.5B inference
+because that GPU is being used for kernel work. Retained 1.5B responses remain
+available for offline regrading. BBH's changed inputs are tested on 2.9B and
+rerun on currently available pools; the 1.5B BBH replacement stays deferred.
+
+### G1l Open Think sampling audit (2026-11-01)
+
+The user approved `temperature=0.96`, `top_p=0.90`, `top_k=0`,
+`presence_penalty=1.0`, `frequency_penalty=0.09`, and `penalty_decay=0.994`
+for Open Think. NoCoT and FakeCoT retain their previous sampling. The existing
+`_sampling_config`, `RWKVRegistry`, native formatters, solvers and scorers are
+the prototypes. Sampling is part of `SampleCache`'s model hash, so new Open
+Think rollouts use a separate cache identity; existing caches remain auditable.
+
+All selectors below use zero-shot native tasks, `GENERATIVE`,
+`/v1/chat/completions`, the captured server-rendered prompt, and the native
+metric/aggregation. Thinking generation has no single-answer newline stop.
+The context field records declared metadata, while the budget is the requested
+completion length. An unfinished reasoning trace or a response reaching its
+output limit without a completed answer is a failure; failed extraction is
+`None` internally and `"-"` in uploaded details.
+
+| Selector | Native dataset, subset and evaluation split | Document and answer contract | Template; generated tokens |
+| --- | --- | --- | --- |
+| `gpqa:diamond`, `gpqa:main` | `Idavidrein/gpqa`, `gpqa_diamond` or `gpqa_main`, train | `Question`, three `Incorrect Answer` fields and `Correct Answer`; native shuffled A–D choices and gold index; approved choice expectation for extraction failures | `bot`; 24576 |
+| `gsm8k` | `openai/gsm8k`, main/test | `question` and `answer`; query is the native question, choices contain the scalar after `####`, gold index 0 | `assistant`; 4096 |
+| `gsm_plus` | `qintongli/GSM-Plus`, default/test | `question`, `answer`, `solution` and `perturbation_type`; native critical-thinking exclusion; choices contain the scalar answer, gold index 0 | `assistant`; 4096 |
+| `math_500` | `HuggingFaceH4/MATH-500`, default/test | `problem`, `solution` and `answer`; native prompt and solution-derived concise gold, choices index 0; native sampling metric | `bot`; 24576 |
+| `math` | `DigitalLearningGmbH/MATH-lighteval`, seven subject subsets/test | `problem` and `solution`; native question and balanced boxed gold, choices index 0; preserve native multiple-rollout aggregation | `bot`; 24576 |
+| `aime24`, `aime25` | `HuggingFaceH4/aime_2024` or `yentinglin/aime_2025`, default/train | `problem` and `answer`; native question, scalar gold, choices index 0; native sampling metric | `bot`; 24576 |
+| `aimo_progress_prize_1` | `lighteval/aimo_progress_prize_1`, default/train | `problem` and `answer`; native question, scalar gold, choices index 0; native sampling metric | `assistant`; 24576 |
+| `olympiad_bench` | `Hothan/OlympiadBench`, five text-only open-ended subsets/train | `question`, `final_answer`, `answer_type`, `is_multiple_answer` and unit metadata; native question/instructions and gold, choices index 0; preserve multi-answer order | `bot`; 24576 |
+| `lcb:codegeneration` | `lighteval/code_generation_lite`, v4_v5/test | `question_content`, `starter_code`, public/private tests and `metadata`; native program prompt, `choices=[""]`, gold index 0, pass@1 and fenced-program extraction | `bot`; 24576 |
+| `ifeval`, `ifbench_test`, `ifbench_multiturn` | `google/IFEval` default/train; `allenai/IFBench_test` default/train; `allenai/IFBench_multi-turn` ifbench_constraints/test | Native prompt and instruction IDs/arguments; `choices=[""]`, gold index 0; native instruction-following checks | `assistant`; 4096 |
+
+`math` expands to algebra, counting_and_probability, geometry,
+intermediate_algebra, number_theory, prealgebra and precalculus.
+`olympiad_bench` expands to `OE_TO_maths_en_COMP`, `OE_TO_maths_zh_CEE`,
+`OE_TO_maths_zh_COMP`, `OE_TO_physics_en_COMP` and `OE_TO_physics_zh_CEE`.
+These tasks use their configured default dataset revisions. Each selector's
+required 1.5B/2.9B ten-question test uploads, request-log verification and
+review of populated details must be completed before that selector is
+published with this sampling change.
+
+On 2026-11-01, the test Scoreboard received and the producer rechecked the
+1.5B ten-question scores for `arc:easy` (ID 258), `gpqa:diamond` (260),
+`gpqa:main` (261), `gsm8k` (262), `gsm_plus` (263), `math_500` (265),
+`math` (266), `aime24` (267), `aime25` (269), `aimo_progress_prize_1`
+(272), `olympiad_bench` (274), `ifeval` (286), `ifbench_test` (276), and
+`ifbench_multiturn` (277). All 140 retained details matched their actual
+completion inputs or server-rendered prompts and responses; their truncation
+rates matched the journalled finish reasons. The sampled GPQA truncation rates were
+0.6 and 0.8; AIME 2024/2025 were 0.7 and 0.8. The remaining 2.9B MATH and
+OlympiadBench samples require their separate acceptance checks.
+
+The 2.9B test Scoreboard has `arc:easy` (ID 259), `gpqa:diamond` (264),
+`gpqa:main` (268), `gsm8k` (270), `gsm_plus` (271), `math_500` (273), and
+`ifeval` (278). All 70 local details matched the uploaded details and the
+actual cached request inputs or server-rendered prompts and responses; the
+reported truncation rates matched the recorded finish reasons. GPQA diamond
+and main had truncation rates of 0.7 and 0.8. Spot checks of correct, incorrect
+and failed GPQA, GSM and MATH-500 answers matched their displayed gold values.
+For 2.9B IFEval, the four passing and five wrong responses matched their
+native instruction checks; the remaining response reached its output limit
+with an unfinished answer and was classified as truncated.
+The 2.9B `ifbench_test` (ID 279) and `ifbench_multiturn` (280) uploads also
+matched all 20 cached prompts/responses and their finish reasons. Their
+truncation rates were 0.3 and 0.7; spot checks of passing and wrong examples
+matched the individual instruction checks.
+The 2.9B `aime24` (ID 287) and `aime25` (282) uploads matched all 20 cached
+prompts/responses and finish reasons. Both had a 0.9 truncation rate; the
+remaining completed answer in each sample was incorrect. One truncated
+`aime24` response was uploaded with the isolated delimiter `\[` as its answer;
+the user approved treating that delimiter as an RWKV extraction failure. A
+cached replay changed only that detail to `"-"`; score 281 was expired by ID
+and replacement 287 was verified with its populated details.
+The 2.9B `aimo_progress_prize_1` upload (ID 283) likewise matched all ten
+cached prompts/responses and finish reasons, with a 0.4 truncation rate; spot
+checks of its passing, wrong and failed answers matched their gold values.
+
+The ten LiveCodeBench responses for each model were graded by the native
+executor without publication credentials, then uploaded separately and
+verified as test scores 284 (1.5B) and 285 (2.9B). Both scores were zero;
+their truncation rates were 0.7 and 0.6. Every completed wrong answer matched
+the fenced program extracted from its response, and failed answers used `"-"`.
+For example, the 1.5B product-equivalent-subarray solution tested an index
+against the array length inside a loop where that condition cannot hold; the
+2.9B bag solution used a set despite the input allowing duplicate balls.
+
+Review of the IFEval details found a grading anomaly in score 275: one answer
+follows the postscript and all-uppercase English instructions, but native
+`CapitalLettersEnglishChecker` sends the uppercase text to `langdetect`, which
+identified it as German in repeated checks. The same text lowercased was
+identified as English. The other two wrong examples fail their stated native
+constraints. The user approved a private RWKV checker that keeps the uppercase
+test on the original response and detects language from the lowercased response,
+followed by cached-response regrading before production publication. The
+1.5B replay changed that one detail from wrong to passed and the score from
+0.6 to 0.7; score 275 was expired by ID and replacement 286 was verified.
+The 2.9B replay was unchanged, so score 278 was retained. The prototype is
+`CapitalLettersEnglishChecker`; the remaining native IFEval checkers and
+metrics are unchanged.
+
+Live gateway-to-backend checks on both 1.5B and 2.9B confirmed that all six
+approved Open Think sampling values, including `top_k=0`, reached the backend.
+On 129, two short 1.5B requests through the production gateway reused the same
+HTTP/1.1 connection with the approved sampling and `X-Litellm-Timeout` header.
+The Scoreboard `num_samples` and `avg_k` fields describe the benchmark registry,
+so use the per-run score snapshot for the actual sample count and rollout average.
+
+The currently running G1l inference services on 129 and 115 explicitly configure
+`mamba-ssm-cache-dtype=float16`; the RWKV state layer uses `torch.float16` for
+that setting. This differs from the project's default `fp32io16` state. The
+user chose to continue this G1l evaluation with the current FP16 state. The new
+Open Think test scores and partially completed production rollouts use that
+setting. If the backend is later switched to FP32, preserve FP16 rollouts
+separately so different state precisions cannot share a cache.
+
+### G1l sampling and publication audit (2026-11-01)
+
+The production Scoreboard stores `num_samples` and `avg_k` on a shared
+benchmark record, not on each score. The producer sends its actual values in
+the upload payload, but the score upload contract does not persist them per
+score. For example, production GPQA Diamond score 1159 is displayed as
+`n=198, avg@1`, while its local score and journal contain 198 questions with
+16 rollouts each. GPQA Main score 1160 is `n=448, avg@1` both remotely and
+locally; MATH-500 score 1163 is `n=500, avg@8` in both places. Historical
+scores require their own run evidence before their sample counts can be
+reconstructed.
+
+The automatic 3,000–6,000 completion policy currently changes `n` only for
+sampling metrics with an `n` attribute. With the full offline datasets,
+AIME24 and AIME25 each use 30 questions and 128 rollouts per question, and
+AIMO uses 10 questions and 512 rollouts per question. GPQA Main, IFBench
+Test, and LiveCodeBench use one rollout per question because their current
+native scorers do not expose that attribute. LiveCodeBench's native metric
+is named `codegen_pass@1:16`, but its `CodegenMetric` does not configure 16
+generations in this pipeline. No G1l production LiveCodeBench score has been
+published.
+
+The approved historical `RWKVPassAtK` missing-choice formula was replayed
+against all 3,168 cached rollouts of score 1159 and reproduced its score of
+0.637549320239. On 49 of the 198 questions all 16 rollouts failed extraction;
+the historical formula assigns each of those questions `1 - 0.75**16`.
+Using the approved 0.25 missing-choice expectation for each rollout and
+averaging the 16 values gives approximately 0.264994 for this run. On
+2026-11-01 the user approved fixing this inflated multi-rollout aggregation.
+After verifying the old score and a fresh manifest, score 1159 was expired by
+its exact ID and replacement 1165 was uploaded and checked with its unchanged
+sampling configuration, truncation rate and populated details.
+
+The missing-rollout branch originated in `59b3974f` on 2026-09-27 and was
+moved into the private `RWKVPassAtK` in `0cd2f859` on 2026-10-09. The
+automatic generation-count settings were removed from the RWKV endpoint
+configuration in `e95a6be7` and later restored in the current working tree.
+The older G1l 1.5B preview GPQA Diamond score 829 is 0.270202: its production
+cache contains 198 questions, each with one generated response, and its 53
+published detail responses all match that cache. The current G1l release
+score 1159 used 16 responses per question. This change in rollout count
+exposes the historical branch's behavior for multiple missing responses;
+the two scores also use different model releases and sampling parameters.
+
+The corrected native pipeline was replayed offline against the retained
+ten-question GPQA Diamond caches for both models. The full publication payloads
+still match the populated test scores and details: 1.5B score 260 is 0.25 with
+0.6 truncation; 2.9B score 264 is 0.375 with 0.7 truncation. Both use one
+rollout per question. A separate offline replay of all 3,168 production
+rollouts produced 0.26499368686868685 for 198 questions at 16 rollouts each;
+compared with score 1159, its publication payload differs only in the score.
+
+The current MATH selector expands to seven native majority-vote tasks: three
+use four rollouts per question and four use eight. Their 5,000 questions
+therefore request 28,156 rollouts, or 5.6312 per question. The current
+selector aggregation weights each subtask's question-level majority score by
+its number of rollouts rather than its number of questions: the eight-rollout
+subtasks contain 40.78% of questions but receive 57.93% of score weight.
+No G1l production MATH score has been published.
+
+### Scoreboard avg@k publication contract (2026-11-01)
+
+The Scoreboard producer reads the registered integer `avg_k` from benchmark
+metadata and requests exactly that many generations for every evaluated
+question. NoCoT/LOGPROBS has one deterministic choice evaluation per question
+and requires registered `avg_k=1`. Test question limits do not change k.
+The existing benchmark contracts, fields, expanded selectors, modes, request
+paths, prompts, stops, budgets, extractors and truncation rules above continue
+to apply. Prototypes are `Pipeline._configure_sampling_counts`,
+`SamplingMetric`, `AvgAtN`, the native per-sample scorers and
+`CodegenMetric`/`codegen_metrics`.
+
+For Scoreboard, compute the first declared native primary metric independently
+for each rollout, average the k values for each question, and average questions
+across the benchmark. For GPQA, preserve the approved 0.25 missing-choice
+expectation and keep failed details failed. MATH's native majority result and
+other native aggregate metrics remain available in LightEval results, while
+Scoreboard receives the independently computed average. Expanded subtasks have
+the same k and are weighted by question count; mixed-k aggregates are rejected.
+Instruction-following uses the first declared prompt-level metric. The private
+LiveCodeBench scorer retains each result of the native code executor in a
+single invocation, so its per-rollout scores and details use those same test
+executions. Non-RWKV metrics and executor behavior remain unchanged.
+
+Uploads declare `metric_type="average"` and send equal `avg_k` and `metric_k`.
+The top-level score response fields remain benchmark metadata. A local pending
+snapshot needs the explicit `rwkv_avg_at_k_v1` contract and an exact current
+run identity; incompatible snapshots remain untouched and report an error.
+Historical sampling identities are not reconstructed and files are not
+renamed automatically. The pending-task manifest determines current work;
+historical score metadata and populated details are inspected separately at
+publication acceptance, not reconciled by each producer run.
+
+Changing k changes rollout IDs: k=1 uses `doc.id`, while k>1 uses
+`doc.id#rwkv-0` for the first rollout. Task hashes may also differ when the
+native sampling metric changes. Do not automatically alias these IDs or infer
+an old aggregate from a completion count. A later migration may consider the
+first rollout only after independently matching the exact captured request,
+model and task identity, sampling parameters, seed, generated-token budget and
+response; otherwise it needs a fresh rollout. Preserve the old scores and
+cache files. A change from k=1 to k>1 requires the remaining verified
+rollouts; applying the registered k to all subtasks may substantially change
+the number of requests. Review current registrations and calculate that cost
+before deployment.
+
+The historical production snapshot above includes GPQA Diamond score 1165
+with 16 verified rollouts per question while its registered `avg_k` is 1.
+That score cannot be confirmed as avg@1. Other historical scores also need
+per-question response and metric evidence before their evaluation metadata can
+be populated. Coordinate the Scoreboard API upgrade, registration decisions,
+exact-ID score corrections and any cache migration separately. The required
+1.5B/2.9B smoke evaluations and populated test-database detail review remain
+publication blockers for this contract change.
+
+
+### Approved removal of duplicate scoring and publication reconciliation (2026-11-01)
+
+The user approved this scoped cleanup and chose to stop on HTTP 409 while
+preserving the failed upload. Prototypes are native `AvgAtN`, `SampleLevelMetric`,
+metric corpus aggregation, `SampleCache` and the existing Scoreboard upload
+endpoint. All benchmark dataset fields, selectors, queries, choices, golds,
+request modes, extraction, stop behavior, budgets and truncation semantics
+recorded above remain unchanged. Native majority/pass metrics remain available;
+Scoreboard still publishes the question-weighted average with registered k.
+
+Private `RWKVAvgAtN` delegates averaging to native `AvgAtN` and records each
+score through a question-local callback for details. Existing average metrics
+are reused; other generative tasks add an average metric while preserving
+their native metrics. Bind averages after sampling counts are selected so
+no-upload runs retain their original native sampling policy. LCB retains the
+average and per-rollout results from its single executor call. The pipeline
+has no second scoring loop or running-average dictionaries.
+
+The producer reads the pending manifest and one scores response for new-model
+registration and benchmark k. Uploads use POST /upload without acknowledgement
+queries or end-of-run scores/details audits. Retry only transport failures,
+HTTP 429 and 5xx; a definite rejection stops the pool and leaves the local
+upload marked failed. Current pending files resume only under an exact current
+identity, recorded from the actual pipeline cache; remove historical identity
+fallbacks and unused legacy result readers. Model configuration hashes and
+requests stay unchanged. Metric wiring can change task hashes; no legacy alias
+or automatic cache/result migration is introduced.
+
+No new files, remote deployment, producer restart or Scoreboard data changes
+are part of this cleanup. Hermetic validation checks score/detail equivalence,
+native average execution count, concurrent detail isolation, unchanged sampling,
+LCB's single execution, exact pending recovery, untouched incompatible records,
+and bounded uploads without reconciliation. Required two-model smoke evaluation
+and populated test-database inspection remain the gate before publication.
+
+Local validation passed 95 tests and 520 subtests. The native-average fixture
+scores four rollouts exactly four times; concurrent callbacks retain separate
+details, and the final Score selects the average while retaining native majority
+results. Fresh processes produced identical task hashes for NoCoT, native-average,
+majority and instruction-following tasks. Ruff and diff checks passed; the shared
+LiteLLM adapter and LCB extractor remain identical to upstream.

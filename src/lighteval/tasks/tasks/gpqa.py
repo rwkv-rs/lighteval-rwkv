@@ -34,8 +34,10 @@ from inspect_ai.scorer import choice
 from inspect_ai.solver import multiple_choice
 
 from lighteval.metrics.metrics import Metrics
+from lighteval.metrics.metrics_sample import PassAtK
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
-from lighteval.tasks.requests import Doc
+from lighteval.tasks.requests import Doc, SamplingMethod
+from src.rwkv_eval.configs import RWKVExactMatches, RWKVLightevalTaskConfig
 
 
 def record_to_sample(record):
@@ -186,4 +188,20 @@ TASKS_TABLE = [
     gpqa_diamond_instruct,
     gpqa_extended_instruct,
     gpqa_main_instruct,
+]
+
+
+# Private RWKV overrides; native models retain TASKS_TABLE.
+RWKV_TASKS_TABLE = [
+    RWKVLightevalTaskConfig(
+        task,
+        sample_scoring_function=RWKVExactMatches(choice=True),
+        generation_size=24576,
+        prompt_template="bot",
+        metrics=[Metrics.avg_at_n(sample_params={"n": 1})]
+        if isinstance(task.metrics[0].sample_level_fn, PassAtK)
+        else task.metrics,
+    )
+    for task in TASKS_TABLE
+    if any(metric.category == SamplingMethod.GENERATIVE for metric in task.metrics)
 ]

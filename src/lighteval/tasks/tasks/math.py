@@ -17,10 +17,15 @@ paper:
 https://arxiv.org/abs/2305.20050
 """
 
+from inspect_ai.solver import generate, prompt_template
+
 from lighteval.metrics.metrics import Metrics
 from lighteval.metrics.normalizations import math_normalizer
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
+from lighteval.tasks.tasks.aime import MATH_PROMPT_TEMPLATE
+from src.rwkv_eval.answer_extract.free_response import extract_math_answer
+from src.rwkv_eval.configs import RWKVExactMatches, RWKVLightevalTaskConfig
 
 
 def math_prompt(line, task_name: str = None):
@@ -30,6 +35,15 @@ def math_prompt(line, task_name: str = None):
         choices=[f" {line['solution']}"],
         gold_index=0,
     )
+
+
+def rwkv_math_prompt(line, task_name: str = None):
+    doc = math_prompt(line, task_name)
+    doc.query = MATH_PROMPT_TEMPLATE.format(prompt=line["problem"])
+    doc.choices = [extract_math_answer(str(gold)) for gold in doc.choices]
+    if any(gold is None for gold in doc.get_golds()):
+        raise RuntimeError("RWKV task has an unextractable gold answer")
+    return doc
 
 
 math_algebra = LightevalTaskConfig(
@@ -208,4 +222,19 @@ TASKS_TABLE = [
     math_number_theory,
     math_prealgebra,
     math_precalculus,
+]
+
+
+# Private RWKV overrides; native models retain TASKS_TABLE.
+RWKV_TASKS_TABLE = [
+    RWKVLightevalTaskConfig(
+        task,
+        sample_scoring_function=RWKVExactMatches(),
+        prompt_function=rwkv_math_prompt,
+        version=task.version + 1,
+        solver=[prompt_template(MATH_PROMPT_TEMPLATE), generate(cache=True)],
+        generation_size=24576,
+        prompt_template="bot",
+    )
+    for task in TASKS_TABLE
 ]

@@ -154,7 +154,7 @@ class Registry:
         self._load_multilingual = load_multilingual
         self._custom_tasks = custom_tasks
 
-        self._task_registry = Registry.load_all_task_configs(
+        self._task_registry = self.load_all_task_configs(
             custom_tasks=custom_tasks, load_multilingual=load_multilingual
         )
         self.task_to_configs = self._update_task_configs()
@@ -323,27 +323,27 @@ class Registry:
                 configs[f"{config.name}"] = config
         return configs
 
-    @staticmethod
-    def _load_from_files(files: list[Path], module_prefix: str) -> dict[str, LightevalTaskConfig]:
+    @classmethod
+    def _load_from_files(cls, files: list[Path], module_prefix: str) -> dict[str, LightevalTaskConfig]:
         configs = {}
         for task_file in files:
             module_name = task_file.stem
             module = importlib.import_module(f"{module_prefix}.{module_name}")
-            configs.update(Registry._extract_configs(module))
+            configs.update(cls._extract_configs(module))
         return configs
 
-    @staticmethod
-    def _load_from_subdirs(subdirs: list[Path]) -> dict[str, LightevalTaskConfig]:
+    @classmethod
+    def _load_from_subdirs(cls, subdirs: list[Path]) -> dict[str, LightevalTaskConfig]:
         configs = {}
         for task_dir in subdirs:
             module_name = task_dir.name
             module = importlib.import_module(f"lighteval.tasks.tasks.{module_name}.main")
-            configs.update(Registry._extract_configs(module))
+            configs.update(cls._extract_configs(module))
         return configs
 
-    @staticmethod
+    @classmethod
     def load_all_task_configs(
-        custom_tasks: str | Path | None = None, load_multilingual: bool = False
+        cls, custom_tasks: str | Path | None = None, load_multilingual: bool = False
     ) -> dict[str, LightevalTaskConfig]:
         """Load all LightevalTaskConfig objects from all Python files in the tasks/ directory."""
         time_start = time.perf_counter()
@@ -359,16 +359,14 @@ class Registry:
         # Also get all subdirectories with main.py files
         task_subdirs = [d for d in TASKS_DIR.iterdir() if d.is_dir() and (d / "main.py").exists()]
 
-        loaded_configs.update(Registry._load_from_files(task_files, "lighteval.tasks.tasks"))
+        loaded_configs.update(cls._load_from_files(task_files, "lighteval.tasks.tasks"))
         if load_multilingual:
-            loaded_configs.update(
-                Registry._load_from_files(task_files_multilingual, "lighteval.tasks.multilingual.tasks")
-            )
-        loaded_configs.update(Registry._load_from_subdirs(task_subdirs))
+            loaded_configs.update(cls._load_from_files(task_files_multilingual, "lighteval.tasks.multilingual.tasks"))
+        loaded_configs.update(cls._load_from_subdirs(task_subdirs))
 
         if custom_tasks is not None:
             custom_tasks_module = Registry.create_custom_tasks_module(custom_tasks)
-            custom_tasks_configs = Registry._extract_configs(custom_tasks_module)
+            custom_tasks_configs = cls._extract_configs(custom_tasks_module)
             if set(custom_tasks_configs.keys()) & set(loaded_configs.keys()):
                 raise ValueError(
                     f"Custom tasks {custom_tasks} conflict with built-in tasks, please use a different name. Conflicting tasks: {set(custom_tasks_configs.keys()) & set(loaded_configs.keys())}"

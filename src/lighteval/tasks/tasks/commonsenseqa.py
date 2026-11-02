@@ -32,6 +32,7 @@ from inspect_ai.solver import multiple_choice
 from lighteval.metrics.metrics import Metrics
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
+from src.rwkv_eval.configs import RWKVLightevalTaskConfig
 
 
 def commonsenseqa_prompt(line, task_name: str = None):
@@ -48,6 +49,13 @@ def commonsenseqa_prompt(line, task_name: str = None):
         gold_index=list(ascii_uppercase).index(line["answerKey"].strip()),
         instruction="The following are multiple choice questions (with answers) about common sense.\n",
     )
+
+
+def rwkv_commonsenseqa_prompt(line, task_name: str = None):
+    doc = commonsenseqa_prompt(line, task_name)
+    doc.query = doc.query.removeprefix(doc.instruction or "")
+    doc.instruction = ""
+    return doc
 
 
 def record_to_sample(record):
@@ -77,4 +85,11 @@ commonsenseqa = LightevalTaskConfig(
 
 TASKS_TABLE = [
     commonsenseqa,
+]
+
+
+# Private RWKV overrides; native models retain TASKS_TABLE.
+RWKV_TASKS_TABLE = [
+    RWKVLightevalTaskConfig(task, prompt_function=rwkv_commonsenseqa_prompt, metrics=[Metrics.loglikelihood_acc])
+    for task in TASKS_TABLE
 ]

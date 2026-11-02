@@ -29,6 +29,9 @@ from inspect_ai.solver import generate, prompt_template
 from lighteval.metrics.metrics import Metrics
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
+from lighteval.tasks.tasks.aime import MATH_PROMPT_TEMPLATE as RWKV_MATH_PROMPT_TEMPLATE
+from src.rwkv_eval.answer_extract.free_response import extract_math_answer
+from src.rwkv_eval.configs import RWKVExactMatches, RWKVLightevalTaskConfig
 
 
 MATH_QUERY_TEMPLATE = """
@@ -55,6 +58,15 @@ def record_to_sample(record):
     return Sample(input=query, target=target)
 
 
+def rwkv_math_500_prompt(line, task_name: str = None):
+    doc = math_500_prompt(line, task_name)
+    doc.query = RWKV_MATH_PROMPT_TEMPLATE.format(prompt=line["problem"])
+    doc.choices = [extract_math_answer(str(gold)) for gold in doc.choices]
+    if any(gold is None for gold in doc.get_golds()):
+        raise RuntimeError("RWKV task has an unextractable gold answer")
+    return doc
+
+
 math_500 = LightevalTaskConfig(
     name="math_500",
     prompt_function=math_500_prompt,
@@ -76,4 +88,20 @@ math_500 = LightevalTaskConfig(
 
 TASKS_TABLE = [
     math_500,
+]
+
+
+# Private RWKV overrides; native models retain TASKS_TABLE.
+RWKV_TASKS_TABLE = [
+    RWKVLightevalTaskConfig(
+        task,
+        sample_scoring_function=RWKVExactMatches(),
+        prompt_function=rwkv_math_500_prompt,
+        version=task.version + 1,
+        solver=[prompt_template(RWKV_MATH_PROMPT_TEMPLATE), generate(cache=True)],
+        generation_size=24576,
+        prompt_template="bot",
+        metrics=[Metrics.avg_at_n_math(sample_params={"n": 1})],
+    )
+    for task in TASKS_TABLE
 ]

@@ -106,11 +106,15 @@ This repository needs to periodically sync with the upstream LightEval repositor
 
 ## Env
 Use uv to manage the local and remote dedicated environment ./.venv. This project is strictly prohibited from using other environments, and other projects are strictly prohibited from using this project's environment, to avoid environment pollution issues.
+Use `rwkv-szx-4090x4-ip129` for evaluation.
 If need to clear the database, ssh rwkv-rs-server.
 
 ## Inference API
-url: vllm.rwkvos.com
-1.5B: bsz1024
-2.9B: bsz1024
-7.2B: bsz512
-13.3B: bsz1280
+url: https://i.rwkvos.com
+
+Resident pool (115): 1.5B_bsz128, 2.9B_bsz512, 7.2B_bsz384, 13.3B_bsz448 (PP2).
+Extra pool (129, one model at a time): DP4 for 1.5B_bsz512, 2.9B_bsz512 and 7.2B_bsz384; DP2 + PP2 for 13.3B_bsz448. bsz is per serving replica.
+
+Set request concurrency slightly above the sum of active resident and extra pool `max-num-seqs`; count DP replicas, with PP stages sharing capacity. Recalculate both affected models when the extra pool moves, and balance traffic using actual load.
+
+Switch 129 through the irwkv project: `GET /model/info` to identify its old deployment, `POST /model/delete` with its `id`, switch `irwkv-129@<size>.service`, verify weights and health, then `POST /model/new` to join the matching `rwkv7-g1l-<size>` group. Confirm gateway worker refresh and update concurrency; keep 115 resident entries unchanged.

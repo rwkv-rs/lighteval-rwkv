@@ -23,6 +23,7 @@ from string import ascii_uppercase
 from lighteval.metrics.metrics import Metrics
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
+from src.rwkv_eval.configs import RWKVLightevalTaskConfig
 
 
 def mmlu_prompt(line, task_name: str = None):
@@ -957,3 +958,7 @@ TASKS_TABLE = [
     mmlu_virology,
     mmlu_world_religions,
 ]
+
+
+# Private RWKV overrides; native models retain TASKS_TABLE.
+RWKV_TASKS_TABLE = [RWKVLightevalTaskConfig(task, metrics=[Metrics.loglikelihood_acc]) for task in TASKS_TABLE]

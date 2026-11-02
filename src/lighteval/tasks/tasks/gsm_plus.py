@@ -29,6 +29,8 @@ from inspect_ai.solver import generate, prompt_template
 from lighteval.metrics.metrics import Metrics, math_scorer
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
+from lighteval.tasks.tasks.aime import MATH_PROMPT_TEMPLATE as RWKV_MATH_PROMPT_TEMPLATE
+from src.rwkv_eval.configs import RWKVExactMatches, RWKVLightevalTaskConfig
 
 
 # setup for problem + instructions for providing answer
@@ -70,6 +72,16 @@ def gsm_plus_prompt(line, task_name: str = None):
     )
 
 
+def rwkv_gsm_plus_prompt(line, task_name: str = None):
+    doc = gsm_plus_prompt(line, task_name)
+    if doc is None:
+        return None
+    sample = record_to_sample(line)
+    doc.query = RWKV_MATH_PROMPT_TEMPLATE.format(prompt=sample.input)
+    doc.choices = [str(sample.target).strip()]
+    return doc
+
+
 gsm_plus = LightevalTaskConfig(
     name="gsm_plus",
     prompt_function=gsm_plus_prompt,
@@ -91,4 +103,15 @@ gsm_plus = LightevalTaskConfig(
 
 TASKS_TABLE = [
     gsm_plus,
+]
+
+
+RWKV_TASKS_TABLE = [
+    RWKVLightevalTaskConfig(
+        gsm_plus,
+        sample_scoring_function=RWKVExactMatches(),
+        prompt_function=rwkv_gsm_plus_prompt,
+        solver=[prompt_template(RWKV_MATH_PROMPT_TEMPLATE), generate(cache=True)],
+        version=gsm_plus.version + 1,
+    )
 ]
