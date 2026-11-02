@@ -178,52 +178,58 @@ def get_score(file_path: str | Path) -> Score:
     path = Path(file_path)
     record = json.loads(path.read_text(encoding="utf-8"))
     task_names = [name for name in record["results"] if name != "all" and ":_average|" not in name]
-    if not task_names or set(record["config_tasks"]) != set(task_names):
-        raise ValueError(f"{path}: results and config_tasks must contain the same evaluated tasks")
+    if len(task_names) != 1:
+        raise ValueError(f"{path}: expected exactly one benchmark, found {len(task_names)}: {task_names}")
+    (task_name,) = task_names
+    if set(record["config_tasks"]) != {task_name}:
+        raise ValueError(f"{path}: results and config_tasks must contain the same single benchmark")
+    task_config, task_metrics = record["config_tasks"][task_name], record["results"][task_name]
+    truncation_rate = task_metrics.get("truncation_rate")
+    if (
+        isinstance(truncation_rate, bool)
+        or not isinstance(truncation_rate, (int, float))
+        or not math.isfinite(truncation_rate)
+        or not 0 <= truncation_rate <= 1
+    ):
+        raise ValueError(f"{path}: results must contain a finite truncation_rate in [0, 1]")
+    metric_names = [
+        name
+        for name in task_metrics
+        if not name.endswith("_stderr")
+        and name not in {"n_samples", "n_completions", "n_truncated", "truncation_rate"}
+    ]
+    if metric_names != ["avg@n"]:
+        raise ValueError(f"{path}: expected only the avg@n metric")
+    (metric_name,) = metric_names
+    num_samples = task_config["effective_num_docs"]
+    summary = record["summary_tasks"][task_name]
+    avg_k = summary["n_completions"] / num_samples if summary["n_completions"] else 1
+    if avg_k < 1 or not float(avg_k).is_integer():
+        raise ValueError(f"{path}: avg_k must be a positive integer")
     results_root = next(parent for parent in path.parents if parent.name == "results")
     date_id = path.stem.removeprefix("results_")
-    rows, buckets = [], ([], [], [])
-    for task_name in task_names:
-        task_config, task_metrics = record["config_tasks"][task_name], record["results"][task_name]
-        metric_names = [
-            name
-            for name in task_metrics
-            if not name.endswith("_stderr")
-            and name not in {"n_samples", "n_completions", "n_truncated", "truncation_rate"}
-        ]
-        if metric_names != ["avg@n"]:
-            raise ValueError(f"{path}: {task_name} must contain only the avg@n metric")
-        num_samples = task_config["effective_num_docs"]
-        avg_k = record["summary_tasks"][task_name]["n_completions"] / num_samples
-        if avg_k < 1 or not float(avg_k).is_integer():
-            raise ValueError(f"{path}: avg_k must be a positive integer")
-        truncation_rate = task_metrics["truncation_rate"]
-        if not math.isfinite(truncation_rate) or not 0 <= truncation_rate <= 1:
-            raise ValueError(f"{path}: results must contain a finite truncation_rate in [0, 1]")
-        rows.append((num_samples, avg_k, float(task_metrics["avg@n"]), truncation_rate))
-        detail_path = (
-            results_root.parent
-            / "details"
-            / path.parent.relative_to(results_root)
-            / date_id
-            / f"details_{task_name}_{date_id}.parquet"
-        )
-        for target, source in zip(
-            buckets,
-            get_eg_details(detail_path, no_cot=record["cot_mode"] == "NoCoT", task_name=task_name),
-        ):
-            target.extend(source[: 20 - len(target)])
-    if any(row[1] != rows[0][1] for row in rows):
-        raise ValueError(f"{path}: subtasks must have the same avg_k")
-    total = sum(row[0] for row in rows)
+    detail_path = (
+        results_root.parent
+        / "details"
+        / path.parent.relative_to(results_root)
+        / date_id
+        / f"details_{task_name}_{date_id}.parquet"
+    )
+    passed, wrong, failed = get_eg_details(
+        detail_path,
+        no_cot=record.get("cot_mode") == "NoCoT",
+        task_name=task_name,
+    )
     return Score(
         _parse_stored_model(record),
-        record["benchmark_name"],
-        total,
-        float(rows[0][1]),
-        sum(count * score for count, _, score, _ in rows) / total,
-        sum(count * rate for count, _, _, rate in rows) / total,
-        *buckets,
+        task_config["name"],
+        num_samples,
+        float(avg_k),
+        float(task_metrics[metric_name]),
+        float(truncation_rate),
+        passed,
+        wrong,
+        failed,
     )
 
 

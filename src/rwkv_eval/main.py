@@ -26,7 +26,7 @@ from dataclasses import asdict, fields
 from functools import partial
 from multiprocessing import get_context
 from pathlib import Path
-from typing import Literal, Sequence
+from typing import Any, Literal, Sequence
 
 import httpx
 
@@ -50,7 +50,7 @@ from src.rwkv_eval.configs import (
     read_models,
 )
 from src.rwkv_eval.rwkv_model import RWKVClient, _litelm_model, _sampling_config
-from src.rwkv_eval.upload import Detail, Score, get_score
+from src.rwkv_eval.upload import Detail, Score, get_detail
 from src.rwkv_eval.upload import upload as upload_score
 
 
@@ -227,6 +227,51 @@ class RWKVPipeline(Pipeline):
                 copy.deepcopy(doc), copy.deepcopy(response), copy.deepcopy(output)
             )
         )
+
+
+def _make_score(  # noqa: C901
+    pipeline: Any,
+    task_name: str,
+    metrics: dict[str, Any],
+    sampling: SamplingConfig,
+    *,
+    cot_mode: CotMode,
+    is_preview: bool,
+) -> Score:
+    native_details = pipeline.get_details().get(task_name, [])
+    buckets = ([], [], [])
+    truncated = total = 0
+    for native in native_details:
+        doc, response = native.doc, native.model_response
+        count = 1 if cot_mode == "NoCoT" else max(len(response.text), 1)
+        for index in range(count):
+            detail, bucket = get_detail(doc, response, sampling, native.metric, index, no_cot=cot_mode == "NoCoT")
+            finish = response.finish_reasons[index] if index < len(response.finish_reasons) else "stop"
+            truncated += int(finish.lower() in {"length", "max_tokens"})
+            total += 1
+            if len(buckets[bucket]) < 20:
+                buckets[bucket].append(detail)
+    passed, wrong, failed = buckets
+
+    completions = pipeline.task_completion_counts.get(task_name, total)
+    avg_k = 1.0 if cot_mode == "NoCoT" else pipeline.task_avg_k.get(task_name, 1)
+    return Score(
+        model=RwkvModel.from_model_name(
+            pipeline.model.config.model_name,
+            pipeline.model.config.scoreboard_ctx_len or pipeline.model.config.max_model_length,
+            is_preview,
+        ),
+        benchmark_name=task_name.split("|", 1)[0],
+        num_samples=pipeline.task_sample_counts.get(task_name, len(native_details)),
+        avg_k=float(avg_k),
+        score=float(metrics["avg@n"]),
+        truncation_rate=pipeline.task_truncation_counts.get(task_name, truncated) / completions
+        if completions
+        else 0.0,
+        passed_details=passed,
+        wrong_details=wrong,
+        failed_details=failed,
+    )
 
 
 def _persist_score(score: Score, path: Path, metadata: dict) -> None:
@@ -513,38 +558,31 @@ def evaluate(  # noqa: C901
                         if payload.get("run_identity") != identity:
                             raise ValueError(f"stored score has a different run identity: {path}")
                     else:
-                        tracker = pipeline.evaluation_tracker
-                        tracker.details_logger.details = pipeline.get_details()
-                        tracker.should_save_details = True
-                        pipeline.save_and_push_results()
-                        date_id = tracker._streaming_date_id
-                        model_name = tracker.general_config_logger.model_name.strip("/")
-                        result_path = Path(output_dir) / "results" / model_name / f"results_{date_id}.json"
-                        record = json.loads(result_path.read_text(encoding="utf-8"))
-                        names = [name for name, count in pipeline.task_sample_counts.items() if count]
-                        record["results"] = {
-                            name: {
-                                **record["results"][name],
-                                "truncation_rate": pipeline.task_truncation_counts[name]
-                                / pipeline.task_completion_counts[name]
-                                if pipeline.task_completion_counts[name]
-                                else 0.0,
-                            }
-                            for name in names
-                        }
-                        record["config_tasks"] = {name: record["config_tasks"][name] for name in names}
-                        for name in names:
-                            record["config_tasks"][name]["effective_num_docs"] = pipeline.task_sample_counts[name]
-                            record["summary_tasks"][name] = {
-                                "n_completions": pipeline.task_sample_counts[name] * pipeline.task_avg_k[name]
-                            }
-                        record.update(benchmark_name=spec.selector, cot_mode=mode, is_preview=endpoint.is_preview)
-                        tracker.save_results(date_id, record)
-                        sampling_path = result_path.with_name(f"sampling_config_{date_id}.json")
-                        sampling_path.write_text(
-                            json.dumps(asdict(_sampling_config(mode, budget, seed))), encoding="utf-8"
-                        )
-                        score = get_score(result_path)
+                        rows = [
+                            _make_score(
+                                pipeline,
+                                name,
+                                pipeline.evaluation_tracker.metrics_logger.metric_aggregated[name],
+                                _sampling_config(mode, budget, seed),
+                                cot_mode=mode,
+                                is_preview=endpoint.is_preview,
+                            )
+                            for name, count in pipeline.task_sample_counts.items()
+                            if count
+                        ]
+                        score = rows[0]
+                        score.benchmark_name = spec.selector
+                        if len(rows) > 1:
+                            if any(row.avg_k != score.avg_k for row in rows):
+                                raise ValueError(f"{spec.selector}: subtasks must have the same avg_k")
+                            total_samples = sum(row.num_samples for row in rows)
+                            score.score = sum(row.score * row.num_samples for row in rows) / total_samples
+                            score.truncation_rate = (
+                                sum(row.truncation_rate * row.num_samples for row in rows) / total_samples
+                            )
+                            score.num_samples = total_samples
+                            for name in ("passed_details", "wrong_details", "failed_details"):
+                                setattr(score, name, [detail for row in rows for detail in getattr(row, name)][:20])
                         if registered_k[pair] is not None and score.avg_k != registered_k[pair]:
                             raise RuntimeError(f"{spec.selector}: actual avg_k differs from registered avg_k")
                         payload = {
@@ -559,6 +597,7 @@ def evaluate(  # noqa: C901
                             payload["prompt_template"] = template
                         _persist_score(score, path, payload)
                         successful.append(score)
+                        pipeline.save_and_push_results()
                     pending_pairs.discard(pair)
                     if no_upload:
                         continue
