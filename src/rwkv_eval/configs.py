@@ -189,7 +189,7 @@ class ModelEndpoint:
     url: str
     api_key: str
     model_name: str
-    max_num_seqs: int
+    max_num_seqs: int = 0  # Omitted: discover concurrency from LiteLLM deployment capacity.
     ctx_len: int = 4096
     is_preview: bool = dataclass_field(kw_only=True)
 
@@ -272,7 +272,7 @@ def read_models(path: str | Path, *, resolve_api_keys: bool = True) -> tuple[Mod
                     _url(entry["url"]),
                     _api_key(entry["api_key"], resolve=resolve_api_keys),
                     _string(entry["model_name"], "model_name"),
-                    _positive_int(entry["max_num_seqs"], "max_num_seqs"),
+                    _positive_int(entry["max_num_seqs"], "max_num_seqs") if "max_num_seqs" in entry else 0,
                     _positive_int(entry.get("ctx_len", 4096), "ctx_len"),
                     is_preview=_boolean(entry["is_preview"], "is_preview"),
                 )

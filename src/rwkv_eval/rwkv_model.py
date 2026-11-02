@@ -122,6 +122,8 @@ def _litelm_model(
 
     if any(item.url != endpoint.url for item in replicas):
         raise ValueError("LiteLLM endpoint pooling requires replicas to share one base URL")
+    if any(item.max_num_seqs == 0 for item in replicas) and any(item.max_num_seqs != 0 for item in replicas):
+        raise ValueError("LiteLLM endpoint pooling cannot mix automatic and explicit concurrency")
     sampling = _sampling_config(cot_mode, max_tokens, seed)
     generation_prompt = {"FakeCoT": "fake_think", "CoT": "open_think"}.get(cot_mode)
     extra_body: dict[str, Any] = {"penalty_decay": sampling.penalty_decay}
@@ -181,9 +183,55 @@ class RWKVModelConfig(LiteLLMModelConfig):
 class RWKVClient(LiteLLMClient):
     """RWKV requests and rollout persistence, following LiteLLMClient."""
 
+    def _get_concurrent_requests(self):
+        """Prototype: Scoreboard manifest requests; use LiteLLM deployment capacities."""
+        url = f"{self.base_url.rstrip('/').removesuffix('/v1')}/model/info"
+        with httpx.Client(verify=get_ssl_configuration(), timeout=30.0, follow_redirects=True) as client:
+            for attempt in range(self.API_MAX_RETRY):
+                try:
+                    response = client.get(url, headers={"Authorization": f"Bearer {self.api_key}"})
+                    response.raise_for_status()
+                    deployments = response.json()["data"]
+                    if not isinstance(deployments, list):
+                        raise ValueError("LiteLLM model/info data must be a list")
+                    capacity = 0
+                    for deployment in deployments:
+                        if deployment["model_name"] != self.model or deployment.get("model_info", {}).get("blocked"):
+                            continue
+                        value = deployment["litellm_params"].get("max_parallel_requests")
+                        if value is None:
+                            value = deployment.get("model_info", {}).get("max_parallel_requests")
+                        if type(value) is not int or value <= 0:
+                            raise ValueError(f"LiteLLM deployment for {self.model} must declare max_parallel_requests")
+                        capacity += value
+                    if not capacity:
+                        raise ValueError(f"LiteLLM has no active deployment capacity for {self.model}")
+                    concurrency = (capacity * 105 + 99) // 100
+                    LOGGER.info(
+                        "RWKV deployment capacity: model=%s capacity=%d concurrency=%d",
+                        self.model,
+                        capacity,
+                        concurrency,
+                    )
+                    return concurrency
+                except Exception as error:
+                    retryable = _is_retryable_error(error)
+                    error.rwkv_request_error = True
+                    error.rwkv_retry_rounds = attempt + 1
+                    error.rwkv_retry_exhausted = retryable and attempt + 1 == self.API_MAX_RETRY
+                    if not retryable or error.rwkv_retry_exhausted:
+                        raise
+                    wait_time = min(64, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER**attempt))
+                    LOGGER.warning(
+                        "RWKV capacity request failed (%s); retrying in %ss", type(error).__name__, wait_time
+                    )
+                    time.sleep(wait_time)
+
     @contextmanager
     def _http_client(self):
         """Yield a batch's shared client, following BaseOpenAILLM/HTTPHandler."""
+        if self.config.concurrent_requests == 0:
+            self.concurrent_requests = self._get_concurrent_requests()
         limits = httpx.Limits(
             max_connections=self.concurrent_requests, max_keepalive_connections=self.concurrent_requests
         )
@@ -398,7 +446,11 @@ class RWKVClient(LiteLLMClient):
                     )
                 )
         jobs, errors = {}, []
-        with self._http_client(), ThreadPoolExecutor(self.concurrent_requests) as executor:
+        missing_rollouts = len(cached) < sum(len(children) for children in rollout_docs)
+        with (
+            self._http_client() if missing_rollouts else nullcontext(),
+            ThreadPoolExecutor(max(1, self.concurrent_requests)) as executor,
+        ):
             for doc_index, (doc, children) in enumerate(zip(docs, rollout_docs, strict=True)):
                 context = self.prompt_manager.prepare_prompt_api(doc)
                 for index, rollout_doc in enumerate(children):
