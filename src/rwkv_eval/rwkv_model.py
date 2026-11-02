@@ -28,7 +28,6 @@ import logging
 import time
 import uuid
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
-from contextlib import nullcontext
 from dataclasses import replace
 from typing import Any, Sequence
 
@@ -38,7 +37,6 @@ import requests
 from lighteval.models.endpoints.litellm_model import (
     LiteLLMClient,
     LiteLLMModelConfig,
-    LitellmModelResponse,
     litellm,
 )
 from lighteval.models.model_output import ModelResponse
@@ -48,36 +46,6 @@ from src.rwkv_eval.configs import ModelEndpoint, SamplingConfig
 
 
 LOGGER = logging.getLogger(__name__)
-
-
-def _strip_question_answer_completion_template(prompt: Any) -> Any:
-    """Remove a completion-only wrapper before applying an RWKV chat template.
-
-    LightEval completion tasks commonly wrap the entire user request as
-    ``Question: ... Answer:``.  In generated RWKV modes the server adds its own
-    User/Assistant boundary, so retaining both wrappers gives the model two
-    competing answer cues.  Only rewrite a user message when both exact edge
-    markers are present; embedded labels and all other prompts stay unchanged.
-    """
-    if not isinstance(prompt, (list, tuple)):
-        return prompt
-
-    messages = list(prompt)
-    for index in range(len(messages) - 1, -1, -1):
-        message = messages[index]
-        if not isinstance(message, dict) or message.get("role") != "user":
-            continue
-        content = message.get("content")
-        if not isinstance(content, str):
-            continue
-        stripped = content.strip()
-        prefix, suffix = "Question: ", "Answer:"
-        if not stripped.startswith(prefix) or not stripped.endswith(suffix):
-            break
-        cleaned = stripped[len(prefix) : -len(suffix)].strip()
-        messages[index] = {**message, "content": cleaned}
-        break
-    return messages
 
 
 def _sampling_config(cot_mode: str, max_tokens: int, seed: int) -> SamplingConfig:
@@ -164,107 +132,55 @@ class RWKVModelConfig(LiteLLMModelConfig):
 class RWKVClient(LiteLLMClient):
     """RWKV requests and rollout persistence, following LiteLLMClient."""
 
-    def __call_api(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence, seed_offset=0):  # noqa: C901
-        """Make API call with retries."""
-        response = LitellmModelResponse()
-        stop_sequence = self._prepare_stop_sequence(stop_sequence)
-        if isinstance(self.config.extra_body, dict):
-            chat_template_kwargs = self.config.extra_body.get("chat_template_kwargs", {})
-        else:
-            chat_template_kwargs = {}
-        rwkv_generation_prompt = (
-            chat_template_kwargs.get("rwkv_generation_prompt") if isinstance(chat_template_kwargs, dict) else None
-        )
-        if rwkv_generation_prompt in {"fake_think", "open_think"}:
-            prompt = _strip_question_answer_completion_template(prompt)
-            # A task's newline stop sequence is valid for a one-token answer,
-            # but it terminates the RWKV reasoning trace before the answer.
-            stop_sequence = []
-        if rwkv_generation_prompt not in {"fake_think", "open_think"}:
-            max_new_tokens = self._prepare_max_new_tokens(max_new_tokens)
-        # RWKV budgets limit generated tokens, not prompt + completion.
-        # The inference backend owns its independently configured context.
-
-        if return_logits and not self.provider == "openai":
-            LOGGER.warning("Returning logits is not supported for this provider, ignoring.")
-
-        # Prepare kwargs for completion call
+    def __call_api(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence, seed_offset=0):
+        """Send an RWKV thinking rollout through LiteLLM's managed client."""
+        # Thinking requests finish through the backend's stop/EOS protocol.
+        stop_sequence = []
+        extra_body = dict(self.config.extra_body)
+        extra_body.setdefault("return_prompt_text", True)
+        rwkv_generation_prompt = extra_body["chat_template_kwargs"]["rwkv_generation_prompt"]
         kwargs = {
             "model": self.model,
-            # A bare model name cannot be routed by LiteLLM.  The provider is
-            # deliberately kept in the LightEval config (rather than baked
-            # into model_name), so forward it on every request.
             "custom_llm_provider": self.provider,
             "messages": prompt,
             "response_format": {"type": "text"},
-            "max_tokens": max_new_tokens,
-            "logprobs": return_logits if self.provider == "openai" else None,
-            "stop": stop_sequence,
+            "logprobs": return_logits,
             "base_url": self.base_url,
             "api_key": self.api_key,
             "n": num_samples,
-            "caching": True,
-            "timeout": self.timeout,
+            "extra_body": extra_body,
         }
-
-        if "o1" in self.model:
-            LOGGER.warning("O1 models do not support temperature, top_p, stop sequence. Disabling.")
-        else:
-            kwargs.update(self.generation_parameters.to_litellm_dict())
-        request_id = None
-        if rwkv_generation_prompt in {"fake_think", "open_think"}:
-            # SampleCache already persists RWKV responses with the complete
-            # model-config key.  Disable only this request's redundant provider
-            # cache instead of changing LiteLLM's global cache-key policy.
-            kwargs["caching"] = False
-            # LiteLLM's synchronous post-call handler can still write when
-            # caching=False; no-store prevents a SQLite connection per rollout.
-            kwargs["cache"] = {"no-store": True}
-            # Native vLLM ParentRequest seeds child i with parent seed + i.
-            # Separate HTTP rollouts retain that sampling contract on resume.
-            if kwargs.get("seed") is not None:
-                kwargs["seed"] += seed_offset
-            # Prototype: OpenAI's httpx.Timeout support. Bound a non-streaming
-            # read by the requested output budget so a lost gateway response
-            # cannot leave an otherwise idle pool waiting for four hours.
-            timeout = self.timeout or 14400
-            read_timeout = min(timeout, max(1800, max_new_tokens / 2))
-            kwargs["timeout"] = httpx.Timeout(timeout, connect=30.0, read=read_timeout)
-            kwargs["max_tokens"] = max_new_tokens
-            kwargs["max_completion_tokens"] = max_new_tokens
-            kwargs["stop"] = stop_sequence
-            request_id = uuid.uuid4().hex
-            # LiteLLM proxies have their own upstream timeout; direct OpenAI-compatible
-            # backends ignore this header. Keep it aligned with the SDK read timeout.
-            kwargs["extra_headers"] = {
-                "X-Request-ID": request_id,
-                "X-Litellm-Timeout": str(read_timeout),
-            }
-            LOGGER.info(
-                "RWKV request: model=%s request_id=%s endpoint=%s/chat/completions request_type=GENERATIVE mode=%s max_new_tokens=%s seed=%s timeout=%s stop=%r",
-                self.model,
-                request_id,
-                self.base_url,
-                rwkv_generation_prompt,
-                max_new_tokens,
-                kwargs.get("seed"),
-                kwargs["timeout"],
-                stop_sequence,
-            )
-        elif kwargs.get("max_completion_tokens") is None:
-            kwargs["max_completion_tokens"] = max_new_tokens
-        if self.config.extra_body:
-            extra_body = dict(self.config.extra_body)
-            chat_template_kwargs = extra_body.get("chat_template_kwargs")
-            if isinstance(chat_template_kwargs, dict) and (
-                "rwkv_prompt_template" in chat_template_kwargs or "rwkv_generation_prompt" in chat_template_kwargs
-            ):
-                # vLLM's RWKV endpoint exposes the exact post-template text
-                # through this provider-specific flag.  Preserve an explicit
-                # caller value, while making RWKV configs self-describing for
-                # details saved by the LightEval tracker.
-                extra_body.setdefault("return_prompt_text", True)
-            kwargs["extra_body"] = extra_body
+        kwargs.update(self.generation_parameters.to_litellm_dict())
+        # SampleCache persists each rollout; no-store also prevents LiteLLM's
+        # synchronous post-call handler from opening a SQLite connection.
+        kwargs["caching"] = False
+        kwargs["cache"] = {"no-store": True}
+        if kwargs.get("seed") is not None:
+            kwargs["seed"] += seed_offset
+        # Budgets count generated tokens. Preserve the existing read deadline
+        # and align the gateway timeout with the SDK timeout.
+        timeout = self.timeout or 14400
+        read_timeout = min(timeout, max(1800, max_new_tokens / 2))
+        kwargs["timeout"] = httpx.Timeout(timeout, connect=30.0, read=read_timeout)
+        kwargs["max_tokens"] = max_new_tokens
+        kwargs["max_completion_tokens"] = max_new_tokens
+        kwargs["stop"] = stop_sequence
+        request_id = uuid.uuid4().hex
+        kwargs["extra_headers"] = {
+            "X-Request-ID": request_id,
+            "X-Litellm-Timeout": str(read_timeout),
+        }
+        LOGGER.info(
+            "RWKV request: model=%s request_id=%s endpoint=%s/chat/completions request_type=GENERATIVE mode=%s max_new_tokens=%s seed=%s timeout=%s stop=%r",
+            self.model,
+            request_id,
+            self.base_url,
+            rwkv_generation_prompt,
+            max_new_tokens,
+            kwargs.get("seed"),
+            kwargs["timeout"],
+            stop_sequence,
+        )
 
         last_error: BaseException | None = None
         for attempt in range(self.API_MAX_RETRY):
@@ -272,86 +188,54 @@ class RWKVClient(LiteLLMClient):
             try:
                 response = litellm.completion(**kwargs)
                 content = response.choices[0].message.content
-
-                # If response is empty, retry without caching (maybe the error is recoverable and solved with a retry)
                 if not content:
                     LOGGER.info("Response is empty, retrying without caching")
-                    kwargs["caching"] = False
                     response = litellm.completion(**kwargs)
                     content = response.choices[0].message.content
-
-                if rwkv_generation_prompt in {"fake_think", "open_think"}:
-                    response._hidden_params["rwkv_prompt_token_count"] = response.usage.prompt_tokens
-                    response._hidden_params["rwkv_effective_max_new_tokens"] = max_new_tokens
-                    response._hidden_params["rwkv_seed"] = kwargs.get("seed")
-                    gateway_id = (response._hidden_params.get("additional_headers") or {}).get(
-                        "llm_provider-x-litellm-call-id"
-                    )
-                    LOGGER.info(
-                        "RWKV GENERATIVE response: model=%s request_id=%s gateway_call_id=%s elapsed=%.2fs",
-                        self.model,
-                        request_id,
-                        gateway_id,
-                        time.monotonic() - started,
-                    )
+                response._hidden_params["rwkv_prompt_token_count"] = response.usage.prompt_tokens
+                response._hidden_params["rwkv_effective_max_new_tokens"] = max_new_tokens
+                response._hidden_params["rwkv_seed"] = kwargs.get("seed")
+                gateway_id = (response._hidden_params.get("additional_headers") or {}).get(
+                    "llm_provider-x-litellm-call-id"
+                )
+                LOGGER.info(
+                    "RWKV GENERATIVE response: model=%s request_id=%s gateway_call_id=%s elapsed=%.2fs",
+                    self.model,
+                    request_id,
+                    gateway_id,
+                    time.monotonic() - started,
+                )
                 return response
-            except litellm.BadRequestError as e:
-                if rwkv_generation_prompt in {"fake_think", "open_think"}:
-                    raise
-                if "message" in e.__dict__:
-                    error_string = (
-                        "The response was filtered due to the prompt triggering Microsoft's content management policy"
-                    )
-                    if error_string in e.__dict__["message"]:
-                        LOGGER.warning(f"{error_string}. Returning empty response.")
-                        return LitellmModelResponse()
+            except litellm.BadRequestError:
+                raise
             except Exception as e:
-                if rwkv_generation_prompt in {"fake_think", "open_think"} and getattr(e, "status_code", None) in {
-                    401,
-                    403,
-                }:
+                if getattr(e, "status_code", None) in {401, 403}:
                     raise
                 last_error = e
-                wait_time = min(
-                    64, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER**attempt)
-                )  # Exponential backoff with max 64s
-                if request_id:
-                    headers = getattr(getattr(e, "response", None), "headers", {}) or {}
-                    LOGGER.warning(
-                        "RWKV GENERATIVE transport failure: model=%s request_id=%s gateway_call_id=%s attempt=%d elapsed=%.2fs error=%s status=%s retry_in=%s",
-                        self.model,
-                        request_id,
-                        headers.get("x-litellm-call-id"),
-                        attempt + 1,
-                        time.monotonic() - started,
-                        type(e).__name__,
-                        getattr(e, "status_code", None),
-                        wait_time,
-                    )
-                else:
-                    LOGGER.warning(
-                        f"Error in API call: {e}, waiting {wait_time} seconds before retry {attempt + 1}/{self.API_MAX_RETRY}"
-                    )
+                wait_time = min(64, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER**attempt))
+                headers = getattr(getattr(e, "response", None), "headers", {}) or {}
+                LOGGER.warning(
+                    "RWKV GENERATIVE transport failure: model=%s request_id=%s gateway_call_id=%s attempt=%d elapsed=%.2fs error=%s status=%s retry_in=%s",
+                    self.model,
+                    request_id,
+                    headers.get("x-litellm-call-id"),
+                    attempt + 1,
+                    time.monotonic() - started,
+                    type(e).__name__,
+                    getattr(e, "status_code", None),
+                    wait_time,
+                )
                 time.sleep(wait_time)
 
         message = f"API call failed after {self.API_MAX_RETRY} attempts"
         LOGGER.error(message)
-        if self.config.generation_only or rwkv_generation_prompt in {"fake_think", "open_think"}:
-            raise RuntimeError(message) from last_error
-        return LitellmModelResponse()
+        raise RuntimeError(message) from last_error
 
     def greedy_until(
         self,
         docs: list[Doc],
     ) -> list[ModelResponse]:
-        """Generates responses using a greedy decoding strategy until certain ending conditions are met.
-
-        Args:
-            docs (list[Doc]): List of documents containing the context for generation.
-
-        Returns:
-            list[ModelResponse]: list of generated responses.
-        """
+        """Persist RWKV thinking rollouts; use native generation otherwise."""
         template_kwargs = (self.config.extra_body or {}).get("chat_template_kwargs", {})
         if isinstance(template_kwargs, dict) and template_kwargs.get("rwkv_generation_prompt") in {
             "fake_think",
@@ -506,9 +390,8 @@ class RWKVClient(LiteLLMClient):
             len(prompt) if isinstance(prompt, list) else 1,
         )
         request_headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-        request_id = uuid.uuid4().hex if self.model.startswith("rwkv7") else None
-        if request_id:
-            request_headers["X-Request-ID"] = request_id
+        request_id = uuid.uuid4().hex
+        request_headers["X-Request-ID"] = request_id
         request_body = {
             "model": self.model,
             "prompt": prompt,
@@ -527,7 +410,7 @@ class RWKVClient(LiteLLMClient):
                     request_url,
                     headers=request_headers,
                     json=request_body,
-                    timeout=300.0 if self.model.startswith("rwkv7") else self.timeout or 120.0,
+                    timeout=300.0,
                 )
             except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as error:
                 LOGGER.warning(
@@ -596,7 +479,7 @@ class RWKVClient(LiteLLMClient):
         """Score each choice with native prompt logprobs; never generate a fallback answer."""
         # Prototype: _greedy_until_rwkv. Checkpoint each completed RWKV
         # sequence score before a slow/failed peer; restore document order.
-        if self._cache is not None and self.model.startswith("rwkv7"):
+        if self._cache is not None:
             results = [None] * len(docs)
             errors = []
             with ThreadPoolExecutor(self.concurrent_requests) as executor:
@@ -632,7 +515,6 @@ class RWKVClient(LiteLLMClient):
             if errors:
                 raise errors[0]
             return results
-        # Native non-RWKV requests retain their existing batching behavior.
         with ThreadPoolExecutor(self.concurrent_requests) as executor:
             return list(executor.map(self._loglikelihood, docs))
 
@@ -640,7 +522,7 @@ class RWKVClient(LiteLLMClient):
         if not isinstance(doc.choices, list) or not doc.choices:
             raise ValueError("RWKV loglikelihood requires a non-empty choice list")
         prefix = doc.query
-        with requests.Session() if self.model.startswith("rwkv7") else nullcontext() as session:
+        with requests.Session() as session:
             prefix_choice = self._prompt_logprobs_request(prefix, session=session)[0]
             prefix_token_ids = prefix_choice.get("prompt_token_ids")
             if not isinstance(prefix_token_ids, list):
