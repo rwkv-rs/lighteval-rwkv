@@ -127,6 +127,8 @@ def _litelm_model(
                 },
             }
         )
+        if cot_mode == "FakeCoT":
+            extra_body["chat_template_kwargs"]["fake_cot_mode"] = True
     return RWKVModelConfig(
         model_name=endpoint.model_name,
         provider="openai",
