@@ -25,6 +25,7 @@ from inspect_ai.solver import generate
 from lighteval.metrics.metrics import Metrics, math_scorer
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
+from src.rwkv_eval.configs import RWKVExactMatches, RWKVLightevalTaskConfig
 
 
 def asdiv_prompt(line, task_name: str = None):
@@ -34,6 +35,13 @@ def asdiv_prompt(line, task_name: str = None):
         choices=line["answer"].split(" (")[0],
         gold_index=[0],
     )
+
+
+def rwkv_asdiv_prompt(line, task_name: str = None):
+    """Prototype: asdiv_prompt; preserve native target components."""
+    doc = asdiv_prompt(line, task_name)
+    doc.choices = ["; ".join(part.split(" (")[0].strip() for part in line["answer"].split(";"))]
+    return doc
 
 
 def record_to_sample(record):
@@ -61,3 +69,15 @@ asdiv = LightevalTaskConfig(
 )
 
 TASKS_TABLE = [asdiv]
+
+
+# Private RWKV overrides; native models retain TASKS_TABLE.
+RWKV_TASKS_TABLE = [
+    RWKVLightevalTaskConfig(
+        task,
+        sample_scoring_function=RWKVExactMatches(allow_text=True),
+        prompt_function=rwkv_asdiv_prompt,
+        cot_mode="FakeCoT",
+    )
+    for task in TASKS_TABLE
+]

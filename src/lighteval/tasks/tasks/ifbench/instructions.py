@@ -454,6 +454,15 @@ class NGramOverlapChecker(Instruction):
         return self._percentage - 2 <= overlap * 100 <= self._percentage + 2
 
 
+class RWKVNGramOverlapChecker(NGramOverlapChecker):
+    """Prototype: NGramOverlapChecker; an empty character-trigram set fails."""
+
+    def check_following(self, value):
+        if len(value) < 3:
+            return False
+        return super().check_following(value)
+
+
 class NumbersCountChecker(Instruction):
     """Include exactly {N} numbers in the response."""
 
@@ -1243,6 +1252,21 @@ class LastWordFirstNextChecker(Instruction):
             last_word = sentences[i].rstrip("".join(string.punctuation) + " ").split()[-1]
             first_word = sentences[i + 1].lstrip("".join(string.punctuation) + " ").split()[0]
             if last_word.lower() != first_word.lower():
+                return False
+        return True
+
+
+class RWKVLastWordFirstNextChecker(LastWordFirstNextChecker):
+    """Prototype: LastWordFirstNextChecker; empty word boundaries fail."""
+
+    def check_following(self, value):
+        sentences = instructions_util.split_into_sentences(value)
+        for i in range(len(sentences) - 1):
+            last_word = sentences[i].rstrip("".join(string.punctuation) + " ").split()
+            first_word = sentences[i + 1].lstrip("".join(string.punctuation) + " ").split()
+            if not last_word or not first_word:
+                return False
+            if last_word[-1].lower() != first_word[0].lower():
                 return False
         return True
 

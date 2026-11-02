@@ -22,11 +22,8 @@
 
 import logging
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import nullcontext
-from dataclasses import replace
+from concurrent.futures import ThreadPoolExecutor
 from json import JSONDecodeError
-from typing import Any
 
 import requests
 from pydantic import SecretStr
@@ -43,46 +40,12 @@ from lighteval.utils.imports import is_package_available, requires
 
 logger = logging.getLogger(__name__)
 
-
-def _strip_question_answer_completion_template(prompt: Any) -> Any:
-    """Remove a completion-only wrapper before applying an RWKV chat template.
-
-    LightEval completion tasks commonly wrap the entire user request as
-    ``Question: ... Answer:``.  In generated RWKV modes the server adds its own
-    User/Assistant boundary, so retaining both wrappers gives the model two
-    competing answer cues.  Only rewrite a user message when both exact edge
-    markers are present; embedded labels and all other prompts stay unchanged.
-    """
-    if not isinstance(prompt, (list, tuple)):
-        return prompt
-
-    messages = list(prompt)
-    for index in range(len(messages) - 1, -1, -1):
-        message = messages[index]
-        if not isinstance(message, dict) or message.get("role") != "user":
-            continue
-        content = message.get("content")
-        if not isinstance(content, str):
-            continue
-        stripped = content.strip()
-        prefix, suffix = "Question: ", "Answer:"
-        if not stripped.startswith(prefix) or not stripped.endswith(suffix):
-            break
-        cleaned = stripped[len(prefix) : -len(suffix)].strip()
-        messages[index] = {**message, "content": cleaned}
-        break
-    return messages
-
-
 if is_package_available("litellm"):
-    import httpx
     import litellm
     from litellm import encode, supports_reasoning
     from litellm.caching.caching import Cache, LiteLLMCacheType
-    from litellm.llms.custom_httpx.http_handler import get_ssl_configuration
     from litellm.utils import ModelResponse as LitellmModelResponse
     from litellm.utils import get_max_tokens
-    from openai import OpenAI
 
     logging.getLogger("LiteLLM").setLevel(logging.WARNING)
     logging.getLogger("LiteLLM").handlers.clear()
@@ -164,19 +127,11 @@ class LiteLLMModelConfig(ModelConfig):
     concurrent_requests: int = 10
     verbose: bool = False
     max_model_length: int | None = None
-    scoreboard_ctx_len: int | None = None
 
     api_max_retry: int = 8
     api_retry_sleep: float = 1.0
     api_retry_multiplier: float = 2.0
     timeout: float | None = None
-    # Parameters accepted by an OpenAI-compatible server but not normalized by
-    # LiteLLM are forwarded through the provider's extra_body mechanism.
-    extra_body: dict[str, Any] | None = None
-    generation_only: bool = False
-    target_completions: int = 0
-    minimum_completions: int = 0
-    maximum_completions: int = 0
 
 
 @requires("litellm")
@@ -220,49 +175,26 @@ class LiteLLMClient(LightevalModel):
                 stop_sequence = [s for s in stop_sequence if s and s.strip()]
         return stop_sequence
 
-    def _prepare_max_new_tokens(self, max_new_tokens, prompt: Any = None) -> int | None:
-        """Fit the requested completion budget inside the configured context."""
+    def _prepare_max_new_tokens(self, max_new_tokens) -> int | None:
+        """Calculate completion tokens based on max_new_tokens."""
         if not max_new_tokens or max_new_tokens <= 0:
             return None
 
         if supports_reasoning(self.model):
+            # We need to allow more tokens to include reasoning tokens
             max_new_tokens = min(max_new_tokens * 10, self.max_length)
+
             logger.warning(
                 f"Reasoning model detected, increasing max_new_tokens to {max_new_tokens} to allow for reasoning tokens",
             )
 
-        if self.max_length and prompt is not None and max_new_tokens >= self.max_length:
-            messages = prompt if isinstance(prompt, (list, tuple)) else [prompt]
-            text = "\n".join(
-                message.get("content", "")
-                if isinstance(message, dict) and isinstance(message.get("content"), str)
-                else str(message)
-                for message in messages
-            )
-            prompt_tokens = len(self.tokenizer(model=self.model, text=text))
-            max_new_tokens = min(max_new_tokens, max(1, self.max_length - prompt_tokens - 512))
         return max_new_tokens
 
-    def __call_api(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence, seed_offset=0):  # noqa: C901
+    def __call_api(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence):  # noqa: C901
         """Make API call with retries."""
         response = LitellmModelResponse()
         stop_sequence = self._prepare_stop_sequence(stop_sequence)
-        if isinstance(self.config.extra_body, dict):
-            chat_template_kwargs = self.config.extra_body.get("chat_template_kwargs", {})
-        else:
-            chat_template_kwargs = {}
-        rwkv_generation_prompt = (
-            chat_template_kwargs.get("rwkv_generation_prompt") if isinstance(chat_template_kwargs, dict) else None
-        )
-        if rwkv_generation_prompt in {"fake_think", "open_think"}:
-            prompt = _strip_question_answer_completion_template(prompt)
-            # A task's newline stop sequence is valid for a one-token answer,
-            # but it terminates the RWKV reasoning trace before the answer.
-            stop_sequence = []
-        if rwkv_generation_prompt not in {"fake_think", "open_think"}:
-            max_new_tokens = self._prepare_max_new_tokens(max_new_tokens, prompt)
-        # RWKV budgets limit generated tokens, not prompt + completion.
-        # The inference backend owns its independently configured context.
+        max_new_tokens = self._prepare_max_new_tokens(max_new_tokens)
 
         if return_logits and not self.provider == "openai":
             logger.warning("Returning logits is not supported for this provider, ignoring.")
@@ -270,10 +202,6 @@ class LiteLLMClient(LightevalModel):
         # Prepare kwargs for completion call
         kwargs = {
             "model": self.model,
-            # A bare model name cannot be routed by LiteLLM.  The provider is
-            # deliberately kept in the LightEval config (rather than baked
-            # into model_name), so forward it on every request.
-            "custom_llm_provider": self.provider,
             "messages": prompt,
             "response_format": {"type": "text"},
             "max_tokens": max_new_tokens,
@@ -290,102 +218,41 @@ class LiteLLMClient(LightevalModel):
             logger.warning("O1 models do not support temperature, top_p, stop sequence. Disabling.")
         else:
             kwargs.update(self.generation_parameters.to_litellm_dict())
-        if rwkv_generation_prompt in {"fake_think", "open_think"}:
-            # SampleCache already persists RWKV responses with the complete
-            # model-config key.  Disable only this request's redundant provider
-            # cache instead of changing LiteLLM's global cache-key policy.
-            kwargs["caching"] = False
-            # Native vLLM ParentRequest seeds child i with parent seed + i.
-            # Separate HTTP rollouts retain that sampling contract on resume.
-            if kwargs.get("seed") is not None:
-                kwargs["seed"] += seed_offset
-            kwargs["timeout"] = self.timeout or 14400
-            kwargs["max_tokens"] = max_new_tokens
-            kwargs["max_completion_tokens"] = max_new_tokens
-            kwargs["stop"] = stop_sequence
-            logger.info(
-                "RWKV request: model=%s endpoint=%s/chat/completions request_type=GENERATIVE mode=%s max_new_tokens=%s seed=%s timeout=%s stop=%r",
-                self.model,
-                self.base_url,
-                rwkv_generation_prompt,
-                max_new_tokens,
-                kwargs.get("seed"),
-                kwargs["timeout"],
-                stop_sequence,
-            )
-        elif kwargs.get("max_completion_tokens") is None:
-            kwargs["max_completion_tokens"] = max_new_tokens
-        if self.config.extra_body:
-            extra_body = dict(self.config.extra_body)
-            chat_template_kwargs = extra_body.get("chat_template_kwargs")
-            if isinstance(chat_template_kwargs, dict) and (
-                "rwkv_prompt_template" in chat_template_kwargs or "rwkv_generation_prompt" in chat_template_kwargs
-            ):
-                # vLLM's RWKV endpoint exposes the exact post-template text
-                # through this provider-specific flag.  Preserve an explicit
-                # caller value, while making RWKV configs self-describing for
-                # details saved by the LightEval tracker.
-                extra_body.setdefault("return_prompt_text", True)
-            kwargs["extra_body"] = extra_body
 
-        # Prototype: BaseOpenAILLM._get_sync_http_client and the native
-        # completion call. Each RWKV rollout owns its SDK/transport through
-        # response consumption and retries, then closes it in the requesting
-        # thread. LiteLLM retains its native request normalization; other
-        # providers retain their shared client-cache behavior.
-        client_context = (
-            OpenAI(
-                api_key=self.api_key or "EMPTY",
-                base_url=self.base_url,
-                timeout=kwargs["timeout"],
-                http_client=httpx.Client(verify=get_ssl_configuration(), follow_redirects=True),
-            )
-            if rwkv_generation_prompt in {"fake_think", "open_think"}
-            else nullcontext()
-        )
-        last_error: BaseException | None = None
-        with client_context as client:
-            if rwkv_generation_prompt in {"fake_think", "open_think"}:
-                kwargs["client"] = client
-            for attempt in range(self.API_MAX_RETRY):
-                try:
+        if kwargs.get("max_completion_tokens", None) is None:
+            kwargs["max_completion_tokens"] = max_new_tokens
+
+        for attempt in range(self.API_MAX_RETRY):
+            try:
+                response = litellm.completion(**kwargs)
+                content = response.choices[0].message.content
+
+                # If response is empty, retry without caching (maybe the error is recoverable and solved with a retry)
+                if not content:
+                    logger.info("Response is empty, retrying without caching")
+                    kwargs["caching"] = False
                     response = litellm.completion(**kwargs)
                     content = response.choices[0].message.content
 
-                    # If response is empty, retry without caching (maybe the error is recoverable and solved with a retry)
-                    if not content:
-                        logger.info("Response is empty, retrying without caching")
-                        kwargs["caching"] = False
-                        response = litellm.completion(**kwargs)
-                        content = response.choices[0].message.content
-
-                    if rwkv_generation_prompt in {"fake_think", "open_think"}:
-                        response._hidden_params["rwkv_prompt_token_count"] = response.usage.prompt_tokens
-                        response._hidden_params["rwkv_effective_max_new_tokens"] = max_new_tokens
-                        response._hidden_params["rwkv_seed"] = kwargs.get("seed")
-                    return response
-                except litellm.BadRequestError as e:
-                    if rwkv_generation_prompt in {"fake_think", "open_think"}:
-                        raise
-                    if "message" in e.__dict__:
-                        error_string = "The response was filtered due to the prompt triggering Microsoft's content management policy"
-                        if error_string in e.__dict__["message"]:
-                            logger.warning(f"{error_string}. Returning empty response.")
-                            return LitellmModelResponse()
-                except Exception as e:
-                    last_error = e
-                    wait_time = min(
-                        64, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER**attempt)
-                    )  # Exponential backoff with max 64s
-                    logger.warning(
-                        f"Error in API call: {e}, waiting {wait_time} seconds before retry {attempt + 1}/{self.API_MAX_RETRY}"
+                return response
+            except litellm.BadRequestError as e:
+                if "message" in e.__dict__:
+                    error_string = (
+                        "The response was filtered due to the prompt triggering Microsoft's content management policy"
                     )
-                    time.sleep(wait_time)
+                    if error_string in e.__dict__["message"]:
+                        logger.warning(f"{error_string}. Returning empty response.")
+                        return LitellmModelResponse()
+            except Exception as e:
+                wait_time = min(
+                    64, self.API_RETRY_SLEEP * (self.API_RETRY_MULTIPLIER**attempt)
+                )  # Exponential backoff with max 64s
+                logger.warning(
+                    f"Error in API call: {e}, waiting {wait_time} seconds before retry {attempt + 1}/{self.API_MAX_RETRY}"
+                )
+                time.sleep(wait_time)
 
-        message = f"API call failed after {self.API_MAX_RETRY} attempts"
-        logger.error(message)
-        if self.config.generation_only or rwkv_generation_prompt in {"fake_think", "open_think"}:
-            raise RuntimeError(message) from last_error
+        logger.error(f"API call failed after {self.API_MAX_RETRY} attempts, returning empty response.")
         return LitellmModelResponse()
 
     def __call_api_parallel(
@@ -472,12 +339,6 @@ class LiteLLMClient(LightevalModel):
         Returns:
             list[ModelResponse]: list of generated responses.
         """
-        template_kwargs = (self.config.extra_body or {}).get("chat_template_kwargs", {})
-        if isinstance(template_kwargs, dict) and template_kwargs.get("rwkv_generation_prompt") in {
-            "fake_think",
-            "open_think",
-        }:
-            return self._greedy_until_rwkv(docs)
         dataset = GenerativeTaskDataset(requests=docs, num_dataset_splits=self.DATASET_SPLITS)
         results = []
 
@@ -489,7 +350,7 @@ class LiteLLMClient(LightevalModel):
             disable=self.disable_tqdm,
         ):
             contexts = [self.prompt_manager.prepare_prompt_api(doc) for doc in dataset]
-            max_new_tokens = self.generation_parameters.max_new_tokens or split[0].generation_size
+            max_new_tokens = split[0].generation_size  # could be none
             return_logits = split[0].use_logits
             num_samples = split[0].num_samples
             stop_sequence = split[0].stop_sequences
@@ -502,121 +363,20 @@ class LiteLLMClient(LightevalModel):
             responses = self.__call_api_parallel(contexts, return_logits, max_new_tokens, num_samples, stop_sequence)
 
             for response, context in zip(responses, contexts):
-                results.append(self._generation_response(response, context))
+                result: list[str] = [choice.message.content for choice in response.choices]
+                reasonings: list[str | None] = [
+                    getattr(choice.message, "reasoning_content", None) for choice in response.choices
+                ]
+
+                cur_response = ModelResponse(
+                    # In empty responses, the model should return an empty string instead of None
+                    text=result if result[0] else [""],
+                    reasonings=reasonings,
+                    input=context,
+                )
+                results.append(cur_response)
 
         return dataset.get_original_order(results)
-
-    @staticmethod
-    def _generation_response(response, context):
-        """Prototype: greedy_until's native response conversion."""
-        candidates: list[Any] = [response]
-        if callable(model_dump := getattr(response, "model_dump", None)):
-            dumped = model_dump()
-            if isinstance(dumped, dict):
-                candidates.append(dumped)
-        hidden = getattr(response, "_hidden_params", {})
-        if isinstance(hidden, dict):
-            candidates.append(hidden)
-        rendered_prompt = next(
-            (
-                value
-                for candidate in candidates
-                for name in ("prompt_text", "rendered_prompt")
-                if isinstance(
-                    value := candidate.get(name) if isinstance(candidate, dict) else getattr(candidate, name, None),
-                    str,
-                )
-            ),
-            None,
-        )
-        effective_budget = hidden.get("rwkv_effective_max_new_tokens")
-        if effective_budget is not None and rendered_prompt is None:
-            raise RuntimeError("RWKV generation is missing its captured server-rendered prompt")
-        texts = [choice.message.content for choice in response.choices]
-        return ModelResponse(
-            text=texts if texts and texts[0] else [""],
-            rendered_prompt=rendered_prompt,
-            effective_max_new_tokens=effective_budget,
-            seeds=[hidden["rwkv_seed"]] if "rwkv_seed" in hidden else [],
-            prompt_token_count=hidden.get("rwkv_prompt_token_count"),
-            reasonings=[getattr(choice.message, "reasoning_content", None) for choice in response.choices],
-            finish_reasons=[getattr(choice, "finish_reason", "stop") or "stop" for choice in response.choices],
-            input=rendered_prompt if rendered_prompt is not None else context,
-        )
-
-    def _greedy_until_rwkv(self, docs):
-        """Prototype: __call_api_parallel and native SampleCache.
-
-        Harvest independent HTTP rollouts in completion order and fsync each
-        before awaiting another. Original document/rollout order is restored
-        for native metrics; vLLM's seed + child-index policy is unchanged.
-        """
-        outputs = [[None] * doc.num_samples for doc in docs]
-        jobs, errors = {}, []
-        with ThreadPoolExecutor(self.concurrent_requests) as executor:
-            for doc_index, doc in enumerate(docs):
-                context = self.prompt_manager.prepare_prompt_api(doc)
-                rollout_docs = [
-                    replace(doc, id=doc.id if doc.num_samples == 1 else f"{doc.id}#rwkv-{i}", num_samples=1)
-                    for i in range(doc.num_samples)
-                ]
-                cached = {}
-                if self._cache is not None:
-                    missing, task_ids = self._cache.get_samples_to_process_and_cache(
-                        rollout_docs, SamplingMethod.GENERATIVE
-                    )
-                    missing_ids = {item.id for item in missing}
-                    present = [item for item in rollout_docs if item.id not in missing_ids]
-                    cached = dict(
-                        zip(
-                            (item.id for item in present),
-                            self._cache.get_samples_from_cache(present, task_ids, SamplingMethod.GENERATIVE),
-                            strict=True,
-                        )
-                    )
-                for index, rollout_doc in enumerate(rollout_docs):
-                    if rollout_doc.id in cached:
-                        outputs[doc_index][index] = cached[rollout_doc.id]
-                        continue
-                    future = executor.submit(
-                        self.__call_api,
-                        context,
-                        doc.use_logits,
-                        self.generation_parameters.max_new_tokens or doc.generation_size,
-                        1,
-                        doc.stop_sequences,
-                        index,
-                    )
-                    jobs[future] = (doc_index, index, rollout_doc, context)
-            for future in as_completed(jobs):
-                doc_index, index, rollout_doc, context = jobs[future]
-                try:
-                    response = self._generation_response(future.result(), context)
-                except Exception as error:
-                    errors.append(error)
-                    continue
-                if self._cache is not None:
-                    self._cache.cache_sample(rollout_doc, response, SamplingMethod.GENERATIVE)
-                outputs[doc_index][index] = response
-        if errors:
-            raise errors[0]
-        results = []
-        for responses in outputs:
-            first = responses[0]
-            results.append(
-                ModelResponse(
-                    text=[response.text[0] for response in responses],
-                    input=first.input,
-                    rendered_prompt=first.rendered_prompt,
-                    input_tokens=first.input_tokens,
-                    prompt_token_count=first.prompt_token_count,
-                    effective_max_new_tokens=first.effective_max_new_tokens,
-                    reasonings=[response.reasonings[0] for response in responses],
-                    finish_reasons=[response.finish_reasons[0] for response in responses],
-                    seeds=[response.seeds[0] for response in responses],
-                )
-            )
-        return results
 
     @property
     def tokenizer(self):
@@ -645,147 +405,12 @@ class LiteLLMClient(LightevalModel):
 
         return max_tokens
 
-    def _prompt_logprobs_request(self, prompt: str | list[str], *, top_logprobs: int) -> list[dict[str, Any]]:
-        """Request prompt token logprobs from the OpenAI-compatible completions API."""
-        request_url = f"{self.base_url.rstrip('/')}/completions"
-        logger.info(
-            "RWKV request: model=%s endpoint=%s request_type=LOGPROBS prompts=%d",
-            self.model,
-            request_url,
-            len(prompt) if isinstance(prompt, list) else 1,
-        )
-        request_headers = {"Authorization": f"Bearer {self.api_key}"} if self.api_key else {}
-        request_body = {
-            "model": self.model,
-            "prompt": prompt,
-            "max_tokens": 0,
-            "echo": True,
-            "prompt_logprobs": top_logprobs,
-            "return_token_ids": True,
-        }
-        # Prototype: __call_api. Retry transient transport failures as well
-        # as upstream 5xx, without changing the scoring request or its budget.
-        for attempt in range(6):
-            try:
-                response = requests.post(
-                    request_url,
-                    headers=request_headers,
-                    json=request_body,
-                    timeout=self.timeout or 120.0,
-                )
-            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-                if attempt == 5:
-                    raise
-                logger.warning("RWKV LOGPROBS transport retry: model=%s attempt=%d", self.model, attempt + 1)
-            else:
-                if response.status_code < 500 or attempt == 5:
-                    break
-            time.sleep(min(2**attempt, 16))
-        response.raise_for_status()
-        payload = response.json()
-        choices = payload.get("choices")
-        if not isinstance(choices, list) or not all(isinstance(choice, dict) for choice in choices):
-            raise RuntimeError("RWKV prompt_logprobs response did not contain choices")
-        return choices
-
-    @staticmethod
-    def _candidate_logprob(choice: dict[str, Any], prefix_token_ids: list[int]) -> float:
-        token_ids = choice.get("prompt_token_ids")
-        prompt_logprobs = choice.get("prompt_logprobs")
-        if not isinstance(token_ids, list) or not isinstance(prompt_logprobs, list):
-            raise RuntimeError("RWKV prompt_logprobs response did not contain token ids and logprobs")
-        if len(prompt_logprobs) != len(token_ids):
-            raise RuntimeError("RWKV prompt_logprobs response has an invalid candidate span")
-        # Tokenizers may merge the final prefix token with the first candidate
-        # bytes.  The candidate span therefore starts at the longest common
-        # token prefix, not necessarily len(tokenize(prefix)).
-        candidate_start = 0
-        for prefix_id, token_id in zip(prefix_token_ids, token_ids):
-            if prefix_id != token_id:
-                break
-            candidate_start += 1
-        if candidate_start >= len(token_ids):
-            raise RuntimeError("RWKV prompt_logprobs response contains no candidate tokens")
-        score = 0.0
-        for index in range(candidate_start, len(token_ids)):
-            entries = prompt_logprobs[index]
-            if not isinstance(entries, dict):
-                raise RuntimeError(f"RWKV prompt logprob is missing at token position {index}")
-            value = entries.get(str(token_ids[index]))
-            if not isinstance(value, dict) or not isinstance(value.get("logprob"), (int, float)):
-                raise RuntimeError(
-                    "RWKV prompt_logprobs did not return the selected candidate token; "
-                    "increase the server prompt_logprobs limit"
-                )
-            score += float(value["logprob"])
-        return score
-
     @cached(SamplingMethod.LOGPROBS)
     def loglikelihood(self, docs: list[Doc]) -> list[ModelResponse]:
-        """Score each choice with native prompt logprobs; never generate a fallback answer."""
-        # Prototype: _greedy_until_rwkv. Checkpoint each completed RWKV
-        # sequence score before a slow/failed peer; restore document order.
-        if self._cache is not None and self.model.startswith("rwkv7"):
-            results = [None] * len(docs)
-            errors = []
-            with ThreadPoolExecutor(self.concurrent_requests) as executor:
-                requests_to_process = iter(enumerate(docs))
-                next_doc = next(requests_to_process, None)
-                jobs = {}
-                in_flight = 0
-                while jobs or next_doc is not None:
-                    while next_doc is not None:
-                        index, doc = next_doc
-                        # One candidate is one backend completion sequence.
-                        # Oversized documents occupy the entire pool alone.
-                        weight = max(1, min(len(doc.choices), self.concurrent_requests))
-                        if in_flight + weight > self.concurrent_requests:
-                            break
-                        jobs[executor.submit(self._loglikelihood, doc)] = (index, weight)
-                        in_flight += weight
-                        next_doc = next(requests_to_process, None)
-                    for future in as_completed(jobs):
-                        index, weight = jobs.pop(future)
-                        in_flight -= weight
-                        try:
-                            response = future.result()
-                            self._cache.cache_sample(docs[index], response, SamplingMethod.LOGPROBS)
-                            results[index] = response
-                        except Exception as error:
-                            errors.append(error)
-                        # Refill immediately, not after a slow batch barrier.
-                        break
-            if errors:
-                raise errors[0]
-            return results
-        # Native non-RWKV requests retain their existing batching behavior.
-        with ThreadPoolExecutor(self.concurrent_requests) as executor:
-            return list(executor.map(self._loglikelihood, docs))
-
-    def _loglikelihood(self, doc: Doc) -> ModelResponse:
-        if not isinstance(doc.choices, list) or not doc.choices:
-            raise ValueError("RWKV loglikelihood requires a non-empty choice list")
-        prefix = doc.query
-        prefix_choice = self._prompt_logprobs_request(prefix, top_logprobs=1)[0]
-        prefix_token_ids = prefix_choice.get("prompt_token_ids")
-        if not isinstance(prefix_token_ids, list):
-            raise RuntimeError("RWKV prompt_logprobs response did not contain prefix token ids")
-        prompts = [prefix + str(choice) for choice in doc.choices]
-        candidate_choices = self._prompt_logprobs_request(prompts, top_logprobs=20)
-        if len(candidate_choices) != len(prompts):
-            raise RuntimeError("RWKV prompt_logprobs response count did not match choices")
-        scores = [self._candidate_logprob(choice, prefix_token_ids) for choice in candidate_choices]
-        return ModelResponse(
-            text=[""],
-            input=prefix,
-            # Preserve exact /v1/completions inputs; publication never recreates
-            # options or an answer wrapper independently from these requests.
-            candidate_inputs=prompts,
-            input_tokens=prefix_token_ids,
-            logprobs=scores,
-            output_tokens=[[] for _ in scores],
-            finish_reasons=["stop"],
-        )
+        """Tokenize the context and continuation and compute the log likelihood of those
+        tokenized sequences.
+        """
+        raise NotImplementedError
 
     @cached(SamplingMethod.PERPLEXITY)
     def loglikelihood_rolling(self, docs: list[Doc]) -> list[ModelResponse]:

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import json
 import math
-import re
+import os
+import time
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
@@ -18,7 +19,7 @@ from src.rwkv_eval.answer_extract.free_response import (
     extract_math_answer,
     verify_math_answer,
 )
-from src.rwkv_eval.configs import RwkvModel, SamplingConfig
+from src.rwkv_eval.configs import RWKVAvgAtN, RwkvModel, SamplingConfig
 
 
 def _message_dict(message: Any) -> dict[str, Any] | None:
@@ -105,52 +106,6 @@ def build_uploaded_messages(
     return messages
 
 
-def _stored_model_config(record: dict[str, Any]) -> Any:
-    config = record.get("config_general")
-    return config.get("model_config") if isinstance(config, dict) else None
-
-
-def _stored_model_name(record: dict[str, Any]) -> str:
-    config = _stored_model_config(record)
-    if isinstance(config, dict) and isinstance(config.get("model_name"), str):
-        return config["model_name"]
-    if isinstance(config, str) and (
-        match := re.search(r"(?:['\"])?model_name(?:['\"])?\s*[:=]\s*['\"]([^'\"]+)", config)
-    ):
-        return match.group(1)
-    if isinstance(name := record.get("model_name"), str):
-        return name
-    raise ValueError("results metadata does not contain a model_name")
-
-
-def _stored_context_length(record: dict[str, Any]) -> int:
-    config = _stored_model_config(record)
-    if isinstance(config, dict):
-        for key in ("max_model_length", "ctx_len"):
-            if isinstance(value := config.get(key), int) and not isinstance(value, bool) and value > 0:
-                return value
-    elif isinstance(config, str) and (
-        match := re.search(r"(?:['\"])?(?:max_model_length|ctx_len)(?:['\"])?\s*[:=]\s*(\d+)", config)
-    ):
-        return int(match.group(1))
-    return record.get("ctx_len", 4096) if isinstance(record.get("ctx_len", 4096), int) else 4096
-
-
-def _parse_stored_model(record: dict[str, Any]) -> RwkvModel:
-    model_name = Path(_stored_model_name(record)).name.removesuffix(".pth").lower()
-    parts = model_name.split("-")
-    if len(parts) < 3 or parts[0] not in {"rwkv7", "rwkv7a", "rwkv7b"}:
-        raise ValueError(f"cannot parse RWKV model name: {model_name}")
-    if not re.fullmatch(r"g1[a-z0-9]*", parts[1]) or parts[2] not in {"1.5b", "2.9b", "7.2b", "13.3b"}:
-        raise ValueError(f"invalid RWKV model name: {model_name}")
-    context_length = _stored_context_length(record)
-    for part in parts[3:]:
-        if match := re.fullmatch(r"ctx(\d+)", part):
-            context_length = int(match.group(1))
-            break
-    return RwkvModel(parts[0], parts[1].capitalize(), parts[2], context_length)
-
-
 @dataclass
 class Score:
     model: RwkvModel
@@ -162,6 +117,77 @@ class Score:
     passed_details: list["Detail"]
     wrong_details: list["Detail"]
     failed_details: list["Detail"]
+    metric_type: Literal["average"] = "average"
+
+    @classmethod
+    def from_pipeline(
+        cls, pipeline, benchmark_name: str, sampling: SamplingConfig, *, cot_mode: str, is_preview: bool
+    ):
+        """Convert native task aggregates and retained details into one benchmark result."""
+        rows = []
+        buckets = ([], [], [])
+        details = pipeline.get_details()
+        for name, count in pipeline.task_sample_counts.items():
+            if not count:
+                continue
+            task = pipeline.tasks_dict[name]
+            metric = next(
+                (metric for metric in task.metrics if isinstance(metric.sample_level_fn, RWKVAvgAtN)), task.metrics[0]
+            )
+            metric_name = metric.metric_name[0] if isinstance(metric.metric_name, list) else metric.metric_name
+            score = float(pipeline.evaluation_tracker.metrics_logger.metric_aggregated[name][metric_name])
+            truncated = total = 0
+            task_buckets = ([], [], [])
+            for native in details.get(name, []):
+                response = native.model_response
+                for index in range(1 if cot_mode == "NoCoT" else max(len(response.text), 1)):
+                    detail, bucket = get_detail(
+                        native.doc, response, sampling, native.metric, index, no_cot=cot_mode == "NoCoT"
+                    )
+                    finish = response.finish_reasons[index] if index < len(response.finish_reasons) else "stop"
+                    truncated += int(finish.lower() in {"length", "max_tokens"})
+                    total += 1
+                    if len(task_buckets[bucket]) < 20:
+                        task_buckets[bucket].append(detail)
+            for target, source in zip(buckets, task_buckets):
+                target.extend(source[: 20 - len(target)])
+            completions = pipeline.task_completion_counts.get(name, total)
+            truncation = pipeline.task_truncation_counts.get(name, truncated) / completions if completions else 0.0
+            rows.append((count, pipeline.task_avg_k[name], score, truncation))
+        if not rows:
+            raise RuntimeError(f"{benchmark_name}: no evaluated subtasks")
+        if any(row[1] != rows[0][1] for row in rows):
+            raise RuntimeError(f"{benchmark_name}: inconsistent subtask rollout counts")
+        total = sum(row[0] for row in rows)
+        config = pipeline.model.config
+        return cls(
+            model=RwkvModel.from_model_name(
+                config.model_name, config.scoreboard_ctx_len or config.max_model_length, is_preview
+            ),
+            benchmark_name=benchmark_name,
+            num_samples=total,
+            avg_k=float(rows[0][1]),
+            score=sum(count * score for count, _, score, _ in rows) / total,
+            truncation_rate=sum(count * rate for count, _, _, rate in rows) / total,
+            passed_details=buckets[0],
+            wrong_details=buckets[1],
+            failed_details=buckets[2],
+        )
+
+    def save(self, path: Path, metadata: dict) -> None:
+        """Serialize the result atomically, retaining its publication metadata."""
+        payload = {**metadata, **asdict(self)}
+        temporary = path.with_suffix(".json.tmp")
+        with temporary.open("w", encoding="utf-8") as stream:
+            json.dump(payload, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        temporary.replace(path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
 
 @dataclass
@@ -173,64 +199,9 @@ class Detail:
     is_passed: bool
 
 
-def get_score(file_path: str | Path) -> Score:
-    """Read one LightEval result and its representative details."""
-    path = Path(file_path)
-    record = json.loads(path.read_text(encoding="utf-8"))
-    task_names = [name for name in record["results"] if name != "all" and ":_average|" not in name]
-    if len(task_names) != 1:
-        raise ValueError(f"{path}: expected exactly one benchmark, found {len(task_names)}: {task_names}")
-    (task_name,) = task_names
-    if set(record["config_tasks"]) != {task_name}:
-        raise ValueError(f"{path}: results and config_tasks must contain the same single benchmark")
-    task_config, task_metrics = record["config_tasks"][task_name], record["results"][task_name]
-    truncation_rate = task_metrics.get("truncation_rate")
-    if (
-        isinstance(truncation_rate, bool)
-        or not isinstance(truncation_rate, (int, float))
-        or not math.isfinite(truncation_rate)
-        or not 0 <= truncation_rate <= 1
-    ):
-        raise ValueError(f"{path}: results must contain a finite truncation_rate in [0, 1]")
-    metric_name = next(
-        name
-        for name in task_metrics
-        if not name.endswith("_stderr")
-        and name not in {"n_samples", "n_completions", "n_truncated", "truncation_rate"}
-    )
-    num_samples = task_config["effective_num_docs"]
-    summary = record["summary_tasks"][task_name]
-    avg_k = summary["n_completions"] / num_samples if summary["n_completions"] else 1
-    results_root = next(parent for parent in path.parents if parent.name == "results")
-    date_id = path.stem.removeprefix("results_")
-    detail_path = (
-        results_root.parent
-        / "details"
-        / path.parent.relative_to(results_root)
-        / date_id
-        / f"details_{task_name}_{date_id}.parquet"
-    )
-    passed, wrong, failed = get_eg_details(
-        detail_path,
-        no_cot=record.get("cot_mode") == "NoCoT",
-        task_name=task_name,
-    )
-    return Score(
-        _parse_stored_model(record),
-        task_config["name"],
-        num_samples,
-        float(avg_k),
-        float(task_metrics[metric_name]),
-        float(truncation_rate),
-        passed,
-        wrong,
-        failed,
-    )
-
-
 def _stored_metric_score(metric: Any) -> float:
-    # Prototype: main._native_score. Native grouped metrics retain their
-    # declared order, including NumPy boolean MC1 values before MC2 floats.
+    # Native grouped metrics retain their declared order, including NumPy
+    # boolean MC1 values before MC2 floats.
     return float(next(iter(metric.values()), 0.0)) if isinstance(metric, dict) else 0.0
 
 
@@ -277,13 +248,18 @@ def get_detail(  # noqa: C901
             else sampling.max_generated_tokens,
         )
         raw_answer = response.text[index] if response.text else ""
-        answer = extract_answer(raw_answer, extractor, len(doc.choices), rendered_prompt=response.rendered_prompt)
+        answer = extract_answer(
+            raw_answer,
+            extractor,
+            len(doc.choices),
+            rendered_prompt=response.rendered_prompt,
+        )
         if extractor in {"math", "short_answer"}:
-            # Prototype: rwkv_prompt already extracts MATH's balanced gold box.
+            # rwkv_math_prompt already extracts MATH's balanced gold box.
             # Re-extracting that concise value can reject text/multiline LaTeX
             # or turn a complete expression into its last numeric token. Keep
             # the exact gold used by the native metric, also on parquet replay.
-            if doc.task_name.split("|", 1)[0].split(":", 1)[0] != "math":
+            if doc.task_name.split("|", 1)[0].split(":", 1)[0] not in {"math", "gsm8k", "gsm_plus"}:
                 golds = [gold if extractor == "short_answer" else extract_math_answer(gold) for gold in golds]
             if any(gold is None for gold in golds):
                 raise ValueError("RWKV detail contains an unextractable gold answer")
@@ -379,6 +355,20 @@ def upload(
     sampling_config: SamplingConfig | None = None,
 ) -> dict[str, Any]:
     """Register a score and upload it to Scoreboard."""
+    if (
+        score.metric_type != "average"
+        or isinstance(score.num_samples, bool)
+        or not isinstance(score.num_samples, int)
+        or score.num_samples < 1
+        or isinstance(score.avg_k, bool)
+        or not isinstance(score.avg_k, (int, float))
+        or not math.isfinite(score.avg_k)
+        or score.avg_k < 1
+        or not float(score.avg_k).is_integer()
+    ):
+        raise ValueError("Scoreboard requires an average metric with positive integer sample and avg_k counts")
+    if not math.isfinite(score.score) or not 0 <= score.score <= 1:
+        raise ValueError("Scoreboard requires a finite average score in [0, 1]")
     details = score.passed_details + score.wrong_details + score.failed_details
     # Scoreboard has one sampling config per score. Its budget is the
     # ceiling across actual requests; each prompt-dependent value remains in
@@ -407,7 +397,9 @@ def upload(
         "benchmark_name": score.benchmark_name,
         "field": field,
         "num_samples": score.num_samples,
-        "avg_k": score.avg_k,
+        "avg_k": int(score.avg_k),
+        "metric_type": score.metric_type,
+        "metric_k": int(score.avg_k),
         **{
             name: [
                 {
@@ -424,6 +416,16 @@ def upload(
     with httpx.Client(
         base_url=f"{api_url.rstrip('/')}/", headers={"Authorization": f"Bearer {token}"}, timeout=30.0
     ) as client:
-        response = client.post("upload", json=payload)
-        response.raise_for_status()
-        return response.json()
+        for attempt in range(6):
+            try:
+                response = client.post("upload", json=payload)
+                response.raise_for_status()
+                return response.json()
+            except (httpx.HTTPStatusError, httpx.TransportError) as error:
+                if (
+                    isinstance(error, httpx.HTTPStatusError)
+                    and error.response.status_code != 429
+                    and error.response.status_code < 500
+                ) or attempt == 5:
+                    raise
+                time.sleep(2**attempt)

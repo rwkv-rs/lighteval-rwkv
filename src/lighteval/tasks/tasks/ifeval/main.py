@@ -22,6 +22,8 @@ starred:
 true
 """
 
+from dataclasses import replace
+
 import numpy as np
 from inspect_ai.dataset import Sample
 from inspect_ai.scorer import Score, Target, accuracy, scorer, stderr
@@ -36,6 +38,7 @@ from lighteval.models.model_output import ModelResponse
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc, SamplingMethod
 from lighteval.utils.imports import requires
+from src.rwkv_eval.configs import RWKVLightevalTaskConfig
 
 
 # Very specific task where there are no precise outputs but instead we test if the format obeys rules
@@ -87,6 +90,9 @@ def _preprocess_response(response: str) -> str:
 
 
 class IFEvalMetrics(SampleLevelComputation):
+    # The native metric continues to use the global registry by default.
+    instruction_dict = None
+
     def compute(self, doc: Doc, model_response: ModelResponse, **kwargs) -> dict:
         response = model_response.final_text[0]
 
@@ -102,7 +108,7 @@ class IFEvalMetrics(SampleLevelComputation):
         is_following_list_loose = []
 
         for index, instruction_id in enumerate(instruction_list):
-            instruction_cls = instructions_registry.INSTRUCTION_DICT[instruction_id]
+            instruction_cls = (self.instruction_dict or instructions_registry.INSTRUCTION_DICT)[instruction_id]
             instruction = instruction_cls(instruction_id)
 
             # Remove None values from kwargs to avoid unexpected keyword argument errors in build_description method.
@@ -132,6 +138,21 @@ class IFEvalMetrics(SampleLevelComputation):
             "inst_level_strict_acc": is_following_list_strict,
             "prompt_level_loose_acc": int(all(is_following_list_loose)),
             "inst_level_loose_acc": is_following_list_loose,
+        }
+
+
+class RWKVIFEvalMetrics(IFEvalMetrics):
+    """Prototype: IFEvalMetrics; replace one checker without mutating the registry."""
+
+    def __init__(self):
+        from lighteval.tasks.tasks.ifeval.instructions import (
+            CapitalLettersEnglishChecker,
+            RWKVCapitalLettersEnglishChecker,
+        )
+
+        self.instruction_dict = {
+            key: RWKVCapitalLettersEnglishChecker if checker is CapitalLettersEnglishChecker else checker
+            for key, checker in instructions_registry.INSTRUCTION_DICT.items()
         }
 
 
@@ -237,3 +258,9 @@ ifeval = LightevalTaskConfig(
 
 
 TASKS_TABLE = [ifeval]
+
+
+RWKV_TASKS_TABLE = [
+    RWKVLightevalTaskConfig(task, metrics=[replace(ifeval_metrics, sample_level_fn=RWKVIFEvalMetrics())])
+    for task in TASKS_TABLE
+]

@@ -257,7 +257,11 @@ class EvaluationTracker:
     def save(self) -> None:
         """Saves the experiment information and results to files, and to the hub if requested."""
         logger.info("Saving experiment tracker")
-        date_id = self._streaming_date_id if self.save_streaming_completions else datetime.now().isoformat().replace(":", "-")
+        date_id = (
+            self._streaming_date_id
+            if self.save_streaming_completions
+            else datetime.now().isoformat().replace(":", "-")
+        )
 
         results_dict = self.results
 

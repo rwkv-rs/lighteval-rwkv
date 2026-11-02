@@ -23,6 +23,7 @@ from string import ascii_uppercase as LETTERS
 from lighteval.metrics.metrics import Metrics
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
+from src.rwkv_eval.configs import RWKVLightevalTaskConfig
 
 
 def __mmlu_redux_2_prompt(line, topic, task_name: str = None):
@@ -127,4 +128,12 @@ TASKS_TABLE = [
         version=0,
     )
     for subset in _MMLU_REDUX_2_SUBSETS
+]
+
+
+# Private RWKV overrides; native models retain TASKS_TABLE.
+RWKV_TASKS_TABLE = [
+    RWKVLightevalTaskConfig(task, metrics=[Metrics.loglikelihood_acc])
+    for task in TASKS_TABLE
+    if task.name.startswith("mmlu_redux_2:")
 ]

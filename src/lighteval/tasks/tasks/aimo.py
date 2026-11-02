@@ -18,12 +18,15 @@ paper:
 """
 
 from inspect_ai.dataset import Sample
-from inspect_ai.solver import generate
+from inspect_ai.solver import generate, prompt_template
 
 from lighteval.metrics.metrics import Metrics, math_scorer
 from lighteval.metrics.normalizations import math_normalizer
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
+from lighteval.tasks.tasks.aime import MATH_PROMPT_TEMPLATE as RWKV_MATH_PROMPT_TEMPLATE
+from src.rwkv_eval.answer_extract.free_response import extract_math_answer
+from src.rwkv_eval.configs import RWKVExactMatches, RWKVLightevalTaskConfig
 
 
 def aimo_prompt(line, task_name: str = None):
@@ -37,6 +40,15 @@ def aimo_prompt(line, task_name: str = None):
 
 def record_to_sample(record):
     return Sample(input=record["problem"], target=str(record["answer"]))
+
+
+def rwkv_aimo_prompt(line, task_name: str = None):
+    doc = aimo_prompt(line, task_name)
+    doc.query = RWKV_MATH_PROMPT_TEMPLATE.format(prompt=line["problem"])
+    doc.choices = [extract_math_answer(str(gold)) for gold in doc.choices]
+    if any(gold is None for gold in doc.get_golds()):
+        raise RuntimeError("RWKV task has an unextractable gold answer")
+    return doc
 
 
 task = LightevalTaskConfig(
@@ -60,3 +72,18 @@ task = LightevalTaskConfig(
 
 # STORE YOUR EVALS
 TASKS_TABLE = [task]
+
+
+# Private RWKV overrides; native models retain TASKS_TABLE.
+RWKV_TASKS_TABLE = [
+    RWKVLightevalTaskConfig(
+        task,
+        sample_scoring_function=RWKVExactMatches(),
+        prompt_function=rwkv_aimo_prompt,
+        version=task.version + 1,
+        solver=[prompt_template(RWKV_MATH_PROMPT_TEMPLATE), generate(cache=True)],
+        generation_size=24576,
+        metrics=[Metrics.avg_at_n_math(sample_params={"n": 1})],
+    )
+    for task in TASKS_TABLE
+]

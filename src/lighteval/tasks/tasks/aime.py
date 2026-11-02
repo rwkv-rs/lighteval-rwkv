@@ -35,6 +35,8 @@ from inspect_ai.solver import generate, prompt_template
 from lighteval.metrics.metrics import Metrics, math_scorer
 from lighteval.tasks.lighteval_task import LightevalTaskConfig
 from lighteval.tasks.requests import Doc
+from src.rwkv_eval.answer_extract.free_response import extract_math_answer
+from src.rwkv_eval.configs import RWKVExactMatches, RWKVLightevalTaskConfig
 
 
 # Prompt template adapted from
@@ -59,6 +61,14 @@ def aime_prompt(line, task_name: str = None):
         choices=[line["answer"]],
         gold_index=0,
     )
+
+
+def rwkv_aime_prompt(line, task_name: str = None):
+    doc = aime_prompt(line, task_name)
+    doc.choices = [extract_math_answer(str(gold)) for gold in doc.choices]
+    if any(gold is None for gold in doc.get_golds()):
+        raise RuntimeError("RWKV task has an unextractable gold answer")
+    return doc
 
 
 aime24 = LightevalTaskConfig(
@@ -162,4 +172,18 @@ TASKS_TABLE = [
     aime25,
     aime25_avg,
     aime25_gpassk,
+]
+
+
+# Private RWKV overrides; native models retain TASKS_TABLE.
+RWKV_TASKS_TABLE = [
+    RWKVLightevalTaskConfig(
+        task,
+        sample_scoring_function=RWKVExactMatches(),
+        prompt_function=rwkv_aime_prompt,
+        generation_size=24576,
+        prompt_template="bot",
+        metrics=[Metrics.avg_at_n_math(sample_params={"n": 1})],
+    )
+    for task in TASKS_TABLE
 ]

@@ -1396,6 +1396,18 @@ class CapitalLettersEnglishChecker(Instruction):
             return True
 
 
+class RWKVCapitalLettersEnglishChecker(CapitalLettersEnglishChecker):
+    """Prototype: CapitalLettersEnglishChecker, with case-normalized language detection."""
+
+    def check_following(self, value):
+        assert isinstance(value, str)
+        try:
+            return value.isupper() and langdetect.detect(value.lower()) == "en"
+        except langdetect.LangDetectException as e:
+            logging.error("Unable to detect language for text %s due to %s", value, e)
+            return True
+
+
 class LowercaseLettersEnglishChecker(Instruction):
     """Checks that the response is in english and is in all lowercase letters."""
 
