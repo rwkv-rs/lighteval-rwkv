@@ -25,15 +25,20 @@
 from __future__ import annotations
 
 import logging
+import socket
 import ssl
 import time
 import uuid
 from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from typing import Any, Sequence
 
 import httpx
 import requests
+from httpx._utils import get_environment_proxies
+from litellm.caching.in_memory_cache import InMemoryCache
+from litellm.llms.custom_httpx.http_handler import get_ssl_configuration
 
 from lighteval.models.endpoints.litellm_model import (
     LiteLLMClient,
@@ -172,6 +177,45 @@ class RWKVModelConfig(LiteLLMModelConfig):
 
 class RWKVClient(LiteLLMClient):
     """RWKV requests and rollout persistence, following LiteLLMClient."""
+
+    @contextmanager
+    def _http_client(self):
+        """Yield a batch's shared client, following BaseOpenAILLM/HTTPHandler."""
+        limits = httpx.Limits(
+            max_connections=self.concurrent_requests, max_keepalive_connections=self.concurrent_requests
+        )
+        transport_options = {
+            "limits": limits,
+            "verify": get_ssl_configuration(),
+            "local_address": "0.0.0.0" if litellm.force_ipv4 else None,
+            "socket_options": [
+                (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1),
+                (socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60),
+                (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 15),
+                (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 4),
+            ],
+        }
+        previous_client_session = litellm.client_session
+        previous_llm_clients_cache = litellm.in_memory_llm_clients_cache
+        with httpx.Client(
+            transport=httpx.HTTPTransport(**transport_options),
+            # Explicit transports disable httpx's automatic proxy mounts.
+            mounts={
+                pattern: httpx.HTTPTransport(proxy=proxy, **transport_options) if proxy else None
+                for pattern, proxy in get_environment_proxies().items()
+            },
+            timeout=14400.0,
+            follow_redirects=True,
+        ) as client:
+            litellm.client_session = client
+            # SDK cache keys omit client_session; scope them to this transport.
+            litellm.in_memory_llm_clients_cache = InMemoryCache()
+            LOGGER.info("RWKV shared HTTP pool: connections=%d TCP keepalive=60/15/4", self.concurrent_requests)
+            try:
+                yield client
+            finally:
+                litellm.client_session = previous_client_session
+                litellm.in_memory_llm_clients_cache = previous_llm_clients_cache
 
     def __call_api(self, prompt, return_logits, max_new_tokens, num_samples, stop_sequence, seed_offset=0):
         """Send an RWKV thinking rollout through LiteLLM's managed client."""
@@ -351,7 +395,7 @@ class RWKVClient(LiteLLMClient):
                     )
                 )
         jobs, errors = {}, []
-        with ThreadPoolExecutor(self.concurrent_requests) as executor:
+        with self._http_client(), ThreadPoolExecutor(self.concurrent_requests) as executor:
             for doc_index, (doc, children) in enumerate(zip(docs, rollout_docs, strict=True)):
                 context = self.prompt_manager.prepare_prompt_api(doc)
                 for index, rollout_doc in enumerate(children):
@@ -416,7 +460,7 @@ class RWKVClient(LiteLLMClient):
         return results
 
     def _prompt_logprobs_request(
-        self, prompt: str | list[str], *, session: requests.Session | None = None
+        self, prompt: str | list[str], *, session: requests.Session | httpx.Client | None = None
     ) -> list[dict[str, Any]]:
         """Request prompt token logprobs from the OpenAI-compatible completions API."""
         request_url = f"{self.base_url.rstrip('/')}/completions"
@@ -518,7 +562,7 @@ class RWKVClient(LiteLLMClient):
         if self._cache is not None:
             results = [None] * len(docs)
             errors = []
-            with ThreadPoolExecutor(self.concurrent_requests) as executor:
+            with self._http_client(), ThreadPoolExecutor(self.concurrent_requests) as executor:
                 requests_to_process = iter(enumerate(docs))
                 next_doc = next(requests_to_process, None)
                 jobs = {}
@@ -551,14 +595,19 @@ class RWKVClient(LiteLLMClient):
             if errors:
                 raise errors[0]
             return results
-        with ThreadPoolExecutor(self.concurrent_requests) as executor:
+        with self._http_client(), ThreadPoolExecutor(self.concurrent_requests) as executor:
             return list(executor.map(self._loglikelihood, docs))
 
     def _loglikelihood(self, doc: Doc) -> ModelResponse:
         if not isinstance(doc.choices, list) or not doc.choices:
             raise ValueError("RWKV loglikelihood requires a non-empty choice list")
         prefix = doc.query
-        with requests.Session() as session:
+        # Borrow the batch's shared pool; only standalone requests own a session.
+        with (
+            nullcontext(litellm.client_session)
+            if litellm.client_session is not None
+            else requests.Session() as session
+        ):
             prefix_choice = self._prompt_logprobs_request(prefix, session=session)[0]
             prefix_token_ids = prefix_choice.get("prompt_token_ids")
             if not isinstance(prefix_token_ids, list):
