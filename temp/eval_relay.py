@@ -203,7 +203,7 @@ def switch_backend(request):
     wait_for_backend(
         opener, base_url, data["served-model-name"], model, request["backend_unit_template"].format(size=size)
     )
-    return {"capacity": capacity, "weight_file": os.path.basename(model)}
+    return {"capacity": capacity, "weight_file": os.path.basename(model), "served_model": data["served-model-name"]}
 
 
 def add_deployment(api, models, extra, request):
@@ -219,7 +219,15 @@ def add_deployment(api, models, extra, request):
     resident_capacity = params.get("max_parallel_requests") or info.get("max_parallel_requests")
     if not isinstance(resident_capacity, int) or resident_capacity <= 0:
         raise RuntimeError("missing resident capacity")
+    credentials = dict(
+        word.split("=", 1)
+        for line in Path(request["backend_environment_file"]).read_text().splitlines()
+        for word in shlex.split(line, comments=True)
+        if "=" in word
+    )
     params.update(
+        model="openai/" + request["served_model"],
+        api_key=credentials["IRWKV_API_KEY"],
         api_base=request["extra_api_base"],
         max_parallel_requests=request["capacity"],
         weight=max(1, round(request["capacity"] / resident_capacity * params.get("weight", 1))),
@@ -367,7 +375,11 @@ def persist(path, state):
 
 
 def switch(args, state, target, pools):
-    gateway = {"extra_api_base": args.extra_api_base, "config": args.gateway_config}
+    gateway = {
+        "extra_api_base": args.extra_api_base,
+        "config": args.gateway_config,
+        "backend_environment_file": args.gateway_backend_environment_file,
+    }
     old = remote(args.gateway_host, "gateway", {**gateway, "action": "info"})
     old_size = old["model"].removeprefix("rwkv7-g1l-")
     if old_size not in SIZES:
@@ -404,7 +416,17 @@ def switch(args, state, target, pools):
     )
     state["phase"] = "registering_deployment"
     persist(args.state, state)
-    remote(args.gateway_host, "gateway", {**gateway, "action": "add", "size": target, "capacity": backend["capacity"]})
+    remote(
+        args.gateway_host,
+        "gateway",
+        {
+            **gateway,
+            "action": "add",
+            "size": target,
+            "capacity": backend["capacity"],
+            "served_model": backend["served_model"],
+        },
+    )
     state["phase"] = "resuming_producers"
     persist(args.state, state)
     for size, producer in affected.items():
@@ -427,6 +449,7 @@ def main():  # noqa: C901
     parser.add_argument("--eval-host", required=True)
     parser.add_argument("--gateway-host", required=True)
     parser.add_argument("--gateway-config", required=True)
+    parser.add_argument("--gateway-backend-environment-file", required=True)
     parser.add_argument("--backend-config-template", required=True)
     parser.add_argument("--backend-unit-template", required=True)
     parser.add_argument("--backend-environment-file", required=True)
