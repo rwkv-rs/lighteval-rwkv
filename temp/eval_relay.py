@@ -203,7 +203,7 @@ def switch_backend(request):
     wait_for_backend(
         opener, base_url, data["served-model-name"], model, request["backend_unit_template"].format(size=size)
     )
-    return {"capacity": capacity, "weight_file": os.path.basename(model), "served_model": data["served-model-name"]}
+    return {"capacity": capacity, "weight_file": os.path.basename(model)}
 
 
 def add_deployment(api, models, extra, request):
@@ -226,7 +226,6 @@ def add_deployment(api, models, extra, request):
         if "=" in word
     )
     params.update(
-        model="openai/" + request["served_model"],
         api_key=credentials["IRWKV_API_KEY"],
         api_base=request["extra_api_base"],
         max_parallel_requests=request["capacity"],
@@ -416,17 +415,7 @@ def switch(args, state, target, pools):
     )
     state["phase"] = "registering_deployment"
     persist(args.state, state)
-    remote(
-        args.gateway_host,
-        "gateway",
-        {
-            **gateway,
-            "action": "add",
-            "size": target,
-            "capacity": backend["capacity"],
-            "served_model": backend["served_model"],
-        },
-    )
+    remote(args.gateway_host, "gateway", {**gateway, "action": "add", "size": target, "capacity": backend["capacity"]})
     state["phase"] = "resuming_producers"
     persist(args.state, state)
     for size, producer in affected.items():
