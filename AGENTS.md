@@ -118,3 +118,7 @@ Extra pool (129, one model at a time): DP4 for 1.5B_bsz512, 2.9B_bsz512 and 7.2B
 Set request concurrency slightly above the sum of active resident and extra pool `max-num-seqs`; count DP replicas, with PP stages sharing capacity. Recalculate both affected models when the extra pool moves, and balance traffic using actual load.
 
 Switch 129 through the irwkv project: `GET /model/info` to identify its old deployment, `POST /model/delete` with its `id`, switch `irwkv-129@<size>.service`, verify weights and health, then `POST /model/new` to join the matching `rwkv7-g1l-<size>` group. Confirm gateway worker refresh and update concurrency; keep 115 resident entries unchanged.
+
+## Pull request review
+
+Before reviewing or re-reviewing a pull request, read the [pull request review guide](.github/PR_REVIEW.md) and follow its rules.
