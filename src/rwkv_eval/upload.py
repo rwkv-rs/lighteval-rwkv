@@ -137,18 +137,14 @@ def _stored_context_length(record: dict[str, Any]) -> int:
 
 
 def _parse_stored_model(record: dict[str, Any]) -> RwkvModel:
-    model_name = Path(_stored_model_name(record)).name.removesuffix(".pth").lower()
-    parts = model_name.split("-")
-    if len(parts) < 3 or parts[0] not in {"rwkv7", "rwkv7a", "rwkv7b"}:
-        raise ValueError(f"cannot parse RWKV model name: {model_name}")
-    if not re.fullmatch(r"g1[a-z0-9]*", parts[1]) or parts[2] not in {"1.5b", "2.9b", "7.2b", "13.3b"}:
-        raise ValueError(f"invalid RWKV model name: {model_name}")
+    model_name = _stored_model_name(record)
+    parts = Path(model_name).name.removesuffix(".pth").lower().split("-")
     context_length = _stored_context_length(record)
     for part in parts[3:]:
         if match := re.fullmatch(r"ctx(\d+)", part):
             context_length = int(match.group(1))
             break
-    return RwkvModel(parts[0], parts[1].capitalize(), parts[2], context_length, record["is_preview"])
+    return RwkvModel.from_model_name(model_name, context_length, record["is_preview"])
 
 
 @dataclass

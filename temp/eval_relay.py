@@ -2,6 +2,7 @@
 
 Run from the evaluation checkout whose SSH configuration reaches both hosts.
 The producer CLI owns evaluation; this entry point only coordinates deployment.
+Use the producer's --models, --output-dir, and --unit-prefix values.
 """
 
 from __future__ import annotations
@@ -37,29 +38,48 @@ def unit_properties(unit, *names):
 
 
 def snapshot_producers(request):
-    root = Path(request["root"])
-    if request.get("require_automatic"):
-        import tomllib
+    import tomllib
 
-        if hashlib.sha256((root / "src/rwkv_eval/rwkv_model.py").read_bytes()).hexdigest() != request["adapter_hash"]:
-            raise RuntimeError("deployed adapter does not match relay checkout")
-        if any(
-            item.get("max_num_seqs", 0) for item in tomllib.loads((root / "configs/models.toml").read_text())["model"]
-        ):
-            raise RuntimeError("deploy automatic concurrency before starting relay")
+    root = Path(request["root"])
+    models_path = (root / request["models"]).resolve()
+    config = tomllib.loads(models_path.read_text())
+    endpoints = config.get("model") or config["models"]
+    if request.get("require_automatic") and (
+        hashlib.sha256((root / "src/rwkv_eval/rwkv_model.py").read_bytes()).hexdigest() != request["adapter_hash"]
+        or any(item.get("max_num_seqs", 0) for item in endpoints)
+    ):
+        raise RuntimeError("relay requires a matching deployed adapter and automatic concurrency")
     units = run_command(
-        ["timeout", "10s", "systemctl", "list-units", "--all", "--no-legend", "--plain", "rwkv-eval-*.service"]
+        [
+            "timeout",
+            "10s",
+            "systemctl",
+            "list-units",
+            "--all",
+            "--no-legend",
+            "--plain",
+            f"{request['unit_prefix']}-*.service",
+        ]
     )
     result = {}
     for size in request["sizes"]:
-        model = "rwkv7-g1l-" + size
-        output = root / "results" / ("g1l-official-production-" + size)
-        files = sorted((output / "failures" / (model + "-ctx32768-release")).glob("*.json"))
+        backend = json.loads(Path(request["backend_config_template"].format(size=size)).read_text())
+        model = backend["served-model-name"]
+        identities = {(e.get("ctx_len", 4096), e["is_preview"]) for e in endpoints if e["model_name"] == model}
+        if len(identities) != 1:
+            raise RuntimeError(f"expected exactly one evaluation identity for {model} in {models_path}")
+        ((context, is_preview),) = identities
+        release = "preview" if is_preview else "release"
+        name = Path(model).name
+        report_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", name)
+        unit_name = re.sub(r"[^A-Za-z0-9_.-]", "_", name)[:100]
+        output = (root / request["output_dir"].replace("{param_size}", size)).resolve()
+        files = sorted((output / "failures" / f"{report_name}-ctx{context}-{release}").glob("*.json"))
         report = json.loads(files[-1].read_text()) if files else None
         names = [
             line.split()[0]
             for line in units.splitlines()
-            if line.split()[0].startswith("rwkv-eval-" + model + "-32768-release-")
+            if line.split()[0].startswith(f"{request['unit_prefix']}-{unit_name}-{context}-{release}-")
         ]
         if len(names) > 1:
             raise RuntimeError("ambiguous producer units")
@@ -68,6 +88,8 @@ def snapshot_producers(request):
             "report_path": str(files[-1]) if files else None,
             "unit": None,
             "output": str(output),
+            "model": model,
+            "checkpoint": backend["model"],
         }
         if names:
             props = unit_properties(
@@ -80,17 +102,24 @@ def snapshot_producers(request):
                 cgroup = Path("/proc/" + str(pid) + "/cgroup").read_text()
                 if (
                     "src.rwkv_eval.main" not in args
-                    or str(output) not in args
                     or props["ControlGroup"] not in cgroup
                     or (not props["Description"].startswith("rwkv-eval:"))
                 ):
                     raise RuntimeError("producer identity mismatch")
                 item["args"] = args[args.index("src.rwkv_eval.main") + 1 :]
-                if (
-                    "--scoreboard" not in item["args"]
-                    or item["args"][item["args"].index("--scoreboard") + 1] != "production"
+                expected = {
+                    "--scoreboard": "production",
+                    "--models": str(models_path),
+                    "--model-name": model,
+                    "--model-context": str(context),
+                    "--model-release": release,
+                    "--output-dir": str(output),
+                }
+                if any(
+                    flag not in item["args"] or item["args"][item["args"].index(flag) + 1] != value
+                    for flag, value in expected.items()
                 ):
-                    raise RuntimeError("expected production producer")
+                    raise RuntimeError(f"producer arguments differ from relay configuration for {model}")
                 item["running"] = True
             else:
                 item["running"] = False
@@ -163,7 +192,7 @@ def switch_backend(request):
     config = Path(request["backend_config_template"].format(size=size))
     data = json.loads(config.read_text())
     model = data["model"]
-    if "g1l" not in model.lower() or size not in model.lower():
+    if data["served-model-name"] != request["model"] or model != request["checkpoint"]:
         raise RuntimeError("extra-pool weight identity mismatch")
     capacity = data["max-num-seqs"] * data.get("data-parallel-size", 1)
     base_url = "http://" + data["host"] + ":" + str(data["port"])
@@ -209,7 +238,7 @@ def switch_backend(request):
 def add_deployment(api, models, extra, request):
     if extra:
         raise RuntimeError("extra endpoint already registered")
-    name = "rwkv7-g1l-" + request["size"]
+    name = request["model"]
     resident = [item for item in models if item["model_name"] == name and not item["model_info"].get("blocked")]
     if len(resident) != 1:
         raise RuntimeError("ambiguous resident deployment")
@@ -228,17 +257,19 @@ def add_deployment(api, models, extra, request):
     params.update(
         api_key=credentials["IRWKV_API_KEY"],
         api_base=request["extra_api_base"],
-        max_parallel_requests=request["capacity"],
         weight=max(1, round(request["capacity"] / resident_capacity * params.get("weight", 1))),
     )
+    model_info = {key: info[key] for key in ("max_tokens", "max_input_tokens", "max_output_tokens") if key in info}
+    if params.get("max_parallel_requests") is not None:
+        params["max_parallel_requests"] = request["capacity"]
+    if info.get("max_parallel_requests") is not None:
+        model_info["max_parallel_requests"] = request["capacity"]
     api(
         "model/new",
         {
             "model_name": name,
             "litellm_params": params,
-            "model_info": {
-                key: info[key] for key in ("max_tokens", "max_input_tokens", "max_output_tokens") if key in info
-            },
+            "model_info": model_info,
         },
     )
     matches = [
@@ -249,7 +280,11 @@ def add_deployment(api, models, extra, request):
     if (
         len(matches) != 1
         or matches[0]["model_name"] != name
-        or matches[0]["litellm_params"].get("max_parallel_requests") != request["capacity"]
+        or (
+            matches[0]["litellm_params"].get("max_parallel_requests")
+            or matches[0]["model_info"].get("max_parallel_requests")
+        )
+        != request["capacity"]
     ):
         raise RuntimeError("new extra deployment was not published")
     return {"id": matches[0]["model_info"]["id"], "model": name}
@@ -341,6 +376,10 @@ def snapshot(args):
             "action": "snapshot",
             "root": args.root,
             "sizes": SIZES,
+            "models": args.models,
+            "output_dir": args.output_dir,
+            "unit_prefix": args.unit_prefix,
+            "backend_config_template": args.backend_config_template,
             "require_automatic": not args.plan,
             "adapter_hash": hashlib.sha256((ROOT / "src/rwkv_eval/rwkv_model.py").read_bytes()).hexdigest(),
         },
@@ -380,8 +419,8 @@ def switch(args, state, target, pools):
         "backend_environment_file": args.gateway_backend_environment_file,
     }
     old = remote(args.gateway_host, "gateway", {**gateway, "action": "info"})
-    old_size = old["model"].removeprefix("rwkv7-g1l-")
-    if old_size not in SIZES:
+    old_size = next((size for size, item in pools.items() if item["model"] == old["model"]), None)
+    if old_size is None:
         raise RuntimeError("unexpected extra-pool model identity")
     if old_size == target:
         state["current"] = target
@@ -407,6 +446,8 @@ def switch(args, state, target, pools):
             "root": args.root,
             "size": target,
             "old_size": old_size,
+            "model": pools[target]["model"],
+            "checkpoint": pools[target]["checkpoint"],
             "backend_config_template": args.backend_config_template,
             "backend_unit_template": args.backend_unit_template,
             "backend_environment_file": args.backend_environment_file,
@@ -415,14 +456,24 @@ def switch(args, state, target, pools):
     )
     state["phase"] = "registering_deployment"
     persist(args.state, state)
-    remote(args.gateway_host, "gateway", {**gateway, "action": "add", "size": target, "capacity": backend["capacity"]})
+    remote(
+        args.gateway_host,
+        "gateway",
+        {**gateway, "action": "add", "model": pools[target]["model"], "capacity": backend["capacity"]},
+    )
     state["phase"] = "resuming_producers"
     persist(args.state, state)
     for size, producer in affected.items():
         remote(
             args.eval_host,
             "evaluation",
-            {"action": "resume", "root": args.root, "producer": producer, "service_user": args.service_user},
+            {
+                "action": "resume",
+                "root": args.root,
+                "producer": producer,
+                "service_user": args.service_user,
+                "unit_prefix": args.unit_prefix,
+            },
             timeout=85,
         )
     state.update(phase="monitoring", current=target)
@@ -444,6 +495,9 @@ def main():  # noqa: C901
     parser.add_argument("--backend-environment-file", required=True)
     parser.add_argument("--service-user", default=pwd.getpwuid(os.getuid()).pw_name)
     parser.add_argument("--root", default=str(ROOT))
+    parser.add_argument("--models", default="configs/models.toml")
+    parser.add_argument("--output-dir", required=True, help="the producer's output directory or {param_size} template")
+    parser.add_argument("--unit-prefix", default="rwkv-eval")
     parser.add_argument("--extra-api-base", required=True)
     parser.add_argument("--state", type=Path, default=ROOT / "results/extra-pool-relay.json")
     parser.add_argument("--interval", type=int, default=30)
@@ -453,15 +507,8 @@ def main():  # noqa: C901
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.interval <= 0:
         parser.error("--interval must be positive")
-    snapshot_request = {
-        "action": "snapshot",
-        "root": args.root,
-        "sizes": SIZES,
-        "require_automatic": not args.plan,
-        "adapter_hash": hashlib.sha256((ROOT / "src/rwkv_eval/rwkv_model.py").read_bytes()).hexdigest(),
-    }
     if args.plan:
-        pools = remote(args.eval_host, "evaluation", snapshot_request)
+        pools = snapshot(args)
         print(
             json.dumps(
                 {
@@ -508,7 +555,7 @@ def main():  # noqa: C901
             }
         try:
             while True:
-                pools = remote(args.eval_host, "evaluation", snapshot_request)
+                pools = snapshot(args)
                 state["reports"] = {size: item["report_path"] for size, item in pools.items()}
                 done = [size for size in SIZES if completed(pools[size])]
                 if any(size not in done for size in state["completed"]):
@@ -554,6 +601,8 @@ def worker_main():
             "--offline",
             "--service-user",
             request["service_user"],
+            "--unit-prefix",
+            request["unit_prefix"],
             *args,
         ]
         subprocess.run(command, check=True, cwd=root, stdout=subprocess.DEVNULL, timeout=65)

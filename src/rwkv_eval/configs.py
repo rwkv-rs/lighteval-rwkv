@@ -155,6 +155,10 @@ class RwkvModel:
     @classmethod
     def from_model_name(cls, name: str, ctx_len: int, is_preview: bool):
         parts = Path(name).name.removesuffix(".pth").lower().split("-")
+        if parts[2:3] == ["preview"]:
+            if not is_preview:
+                raise ValueError(f"preview model name requires is_preview=true: {name}")
+            del parts[2]
         if len(parts) < 3 or parts[0] not in {"rwkv7", "rwkv7a", "rwkv7b"}:
             raise ValueError(f"cannot parse RWKV model name: {name}")
         if not re.fullmatch(r"g1[a-z0-9]*", parts[1]) or parts[2] not in {"1.5b", "2.9b", "7.2b", "13.3b"}:
